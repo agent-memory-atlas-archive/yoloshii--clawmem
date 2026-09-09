@@ -10,28 +10,32 @@ ClawMem integrates with OpenClaw as a native memory plugin (`kind: memory`), giv
 clawmem setup openclaw
 ```
 
-`clawmem setup openclaw` chooses between two install paths:
+Setup has three ways of getting the plugin in front of OpenClaw. Which one runs depends on whether `openclaw` is on `PATH` and whether you pass `--link`.
 
-- **Delegated path (preferred, v0.10.4+).** When `openclaw` is on `PATH`, ClawMem delegates to `openclaw plugins install <pluginDir> --force`. OpenClaw owns destination resolution (which respects `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and any active `--profile`), runs manifest validation + security scans, persists install records, applies slot selection, and refreshes the registry. The plugin is auto-enabled — you do not need to run `openclaw plugins enable clawmem` separately.
-- **Direct-copy fallback.** When `openclaw` is not on `PATH`, ClawMem prints a warning and falls back to a recursive copy honoring `OPENCLAW_STATE_DIR` (or `~/.openclaw/extensions/clawmem` by default). You will need to run `openclaw plugins enable clawmem` afterwards to assign the memory slot.
+With `openclaw` on `PATH` and no `--link`, setup installs a compiled copy. It bundles the plugin into a Node-target `dist/index.js` in a temporary stage next to the manifest and a `package.json` whose `openclaw.extensions` points at that file, prints the capabilities the manifest declares and asks for consent (or takes `--accept-capabilities`), then runs `openclaw plugins install <stage> --force`. OpenClaw owns the destination (it honours `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH` and the active profile), validates the manifest, records the install and enables the plugin. Setup then writes the three config values a working install needs (the absolute `clawmemBin` of this checkout, `plugins.entries.clawmem.hooks.allowConversationAccess=true`, `plugins.slots.memory=clawmem`), reads each one back, and exits non-zero with "Installed but configuration incomplete" if any of them did not stick. The stage is deleted afterwards, whether the install succeeded or not. OpenClaw 2026.5.3 and later refuse a copied plugin whose entry is TypeScript, which is why the copy is compiled (details under "OpenClaw 2026.5 and later" below).
 
-`setup openclaw --remove` uninstalls (also tries `openclaw plugins uninstall clawmem --force` first when the CLI is available, falling back to manual cleanup for legacy unmanaged installs from earlier ClawMem versions). `setup openclaw --help` prints the full flag and env-var reference.
+With `openclaw` on `PATH` and `--link`, setup runs `openclaw plugins install -l <checkout>/src/openclaw`. OpenClaw records the checkout as a load path and loads the TypeScript from it, so an upgrade is `git pull` plus a gateway restart. This is the development path; consent and the three config values are handled the same way.
+
+Without `openclaw` on `PATH`, setup copies the plugin itself into `<state>/extensions/clawmem`, where `<state>` follows `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH` or `OPENCLAW_PROFILE` and defaults to `~/.openclaw`. It cannot enable the plugin or set the slot and the grant for you; it prints the `openclaw` commands to run once the CLI is available.
+
+`setup openclaw --remove` uninstalls. It tries `openclaw plugins uninstall clawmem --force` first and falls back to removing the extensions directory for installs made before delegation existed. `setup openclaw --help` prints every flag and environment variable.
 
 ### Custom OpenClaw profiles (v0.10.4+)
 
-If you run OpenClaw with a non-default profile (e.g. `openclaw --profile dev`, which uses `~/.openclaw-dev/`), ClawMem v0.10.4+ installs into the matching extensions directory automatically — both paths honor `OPENCLAW_STATE_DIR`:
+If you run OpenClaw with a non-default profile (for example `openclaw --profile dev`, which keeps its state in `~/.openclaw-dev/`), point setup at the same profile. All three install paths honour `OPENCLAW_STATE_DIR`. `OPENCLAW_PROFILE` works too from v0.38: on the delegated paths setup passes it to every `openclaw` command it runs as `--profile <name>` (OpenClaw reads the profile from its own argv, so the variable alone would select nothing), and the copy fallback resolves `.openclaw-<profile>` from it. A name outside OpenClaw's grammar (letters, digits, `-` and `_`, at most 64 characters) stops setup on every path, `--remove` included, before any directory is derived from it or any `openclaw` command carries it:
 
 ```bash
 # Default profile
 clawmem setup openclaw
 
-# Custom profile via env var (works in both delegated and fallback paths)
+# Named profile, by state dir (every path)
 OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw
 
-# Equivalent for users who prefer the OpenClaw --profile flag (delegated path only):
-# the openclaw subprocess inherits its own profile resolution
-openclaw --profile dev plugins install ~/path/to/clawmem/src/openclaw --force
+# Named profile, by profile name; --link for a checkout you keep editing
+OPENCLAW_PROFILE=dev clawmem setup openclaw --link
 ```
+
+Do not run `openclaw plugins install <checkout>/src/openclaw --force` by hand for a named profile. Since OpenClaw 2026.5.3 that command rejects the TypeScript entry, and it skips the consent, config and ownership steps setup performs.
 
 Pre-v0.10.4 versions hardcoded `~/.openclaw/extensions/clawmem` and ignored both env vars and the `--profile` flag — that bug is fixed in v0.10.4 (see [issue #11](https://github.com/yoloshii/ClawMem/issues/11)).
 
@@ -58,7 +62,7 @@ The plugin directory ships `src/openclaw/package.json` with:
 }
 ```
 
-This file is what OpenClaw's `discoverInDirectory` uses to decide whether a plugin directory is a valid plugin (the older `openclaw.plugin.json` manifest is still shipped and parsed, but it is not sufficient for discovery on v2026.4.11+). Setup verifies `package.json` is present before copying and fails loudly if it is missing.
+This file is what OpenClaw's `discoverInDirectory` uses to decide whether a plugin directory is a valid plugin (the older `openclaw.plugin.json` manifest is still shipped and parsed, but it is not sufficient for discovery on v2026.4.11+). Link mode loads `./index.ts` exactly as shipped. The compiled copy that setup stages carries its own `package.json` with `"extensions": ["./dist/index.js"]`; the checkout's file is never modified. Setup verifies `package.json` is present before staging and fails loudly if it is missing.
 
 ### Multi-user gotcha (system-service deployments)
 
@@ -83,9 +87,44 @@ sudo chown -R root:root ~/.openclaw/extensions/clawmem
 
 The same check also applies to the parent `~/.openclaw/` directory — if it is 700 (`drwx------`) and the gateway runs as a different user, the gateway cannot traverse into it to read its own config and fails with `Missing config` on startup. `chmod 750 ~/.openclaw` (owner rwx, group rx) plus the gateway user being a member of the owning group fixes this. Single-user installs are not affected.
 
+### OpenClaw 2026.5 and later: what changed and what setup does about it
+
+Between April and May 2026 OpenClaw added three checks that each switch off part of ClawMem without an error at install time. `clawmem setup openclaw` handles all three; the list is here so you can recognise the symptoms on an older ClawMem or a hand-rolled install.
+
+1. Agent tools must be declared in the manifest. Since v2026.5.2 the plugin registry rejects `registerTool` for any name missing from `contracts.tools` in `openclaw.plugin.json` (the `openclaw` block of `package.json` is not read for this), logs `plugin must declare contracts.tools before registering agent tools`, and the plugin keeps running hook-only. ClawMem's manifest lists all five tools, and a unit test pins that list to the names the plugin registers.
+
+2. Conversation hooks need an explicit grant. Since v2026.4.23 a plugin that OpenClaw did not bundle may not register `before_prompt_build`, `agent_end`, or the other conversation hooks unless the config allows it. Without the grant the gateway logs `typed hook "before_prompt_build" blocked because non-bundled plugins must set plugins.entries.clawmem.hooks.allowConversationAccess=true`, and ClawMem injects nothing and extracts nothing. Setup sets it. The grant hands ClawMem the raw conversation, which is what a memory layer needs; OpenClaw treats it as a trust boundary, so grant it to nothing you would not trust with your transcripts. `plugins.entries.clawmem.hooks.allowPromptInjection` must not be `false` either; setup warns if it is.
+
+3. A copied plugin must be compiled. Since v2026.5.3 `openclaw plugins install <dir> --force` refuses a package whose entry is `index.ts` (the error mentions "compiled runtime output"). Setup builds a Node-target `dist/index.js` on the fly, stages it with the manifest and a `package.json` that points `openclaw.extensions` at the compiled file, and installs that copy. Nothing generated is committed to the repo, and installing straight from the npm tarball with `openclaw plugins install npm:clawmem` is not supported. `clawmem setup openclaw --link` keeps the development path: OpenClaw loads the TypeScript from your checkout, so `git pull` plus a gateway restart is an upgrade.
+
+Two things around the install changed with it.
+
+OpenClaw asks for consent to a plugin's declared capabilities on every local install, link or copy. Setup prints what ClawMem declares (the five tools, conversation access, the memory slot, the REST service) and passes `--accept-capabilities` to OpenClaw only after you answer yes, or when you ran `clawmem setup openclaw --accept-capabilities`. Without either, a non-interactive run stops and prints the line to re-run.
+
+OpenClaw refuses a plugin whose directory or entry file is owned by anyone but its own runtime user or root, or is world-writable. A gateway that runs as a service user cannot load a copy the installing shell user owns. Pass `--gateway-user <name>` so setup verifies the installed files for that user; on a mismatch it prints the `chown` and exits non-zero rather than claiming success. Link mode applies the same rule to the checkout itself.
+
+Setup also pins the memory slot (`plugins.slots.memory: clawmem`; since the September 2026 main branch an unselected memory plugin still loads but loses its memory runtime) and records the absolute `clawmemBin`, so the plugin runs the binary from this checkout and not a search-path guess.
+
+#### Hook time budget
+
+The context-surfacing hook runs under one budget, `hookBudgetMs` (default 6000, configurable from 1000 to 60000). The plugin passes it to the hook as `CLAWMEM_HOOK_BUDGET_MS` (honoured from ClawMem v0.38; older hooks ignore it), kills the hook process two seconds after it, and registers `before_prompt_build` with OpenClaw two seconds after that. Every timeout message names the hook, the profile and the budget. An operator hook-timeout policy (`plugins.entries.clawmem.hooks.timeouts.before_prompt_build` or `plugins.entries.clawmem.hooks.timeoutMs`) overrides the plugin's registration value, so a policy below budget plus four seconds kills surfacing on every prompt; setup warns when it finds one.
+
+At `profile: deep` the hook expects an LLM endpoint for query expansion and a reranker endpoint. With either missing, the plugin logs one warning at registration and, from v0.38, the hook degrades that leg to fused order inside the budget instead of loading a model in-process on every prompt (issue #28).
+
+When no embedding endpoint is configured, the hook loads the embedding model in-process on the first prompt that needs it. On CUDA the first load after a `node-llama-cpp` upgrade includes a one-time PTX compile of about ten seconds (measured on a GTX 1080 Ti with 3.20.0), which can push that single prompt past the default budget. Run `clawmem embed` once after upgrading; it pays the compile outside any prompt, and later prompts cost hundreds of milliseconds. The plugin does not warm the model itself, because the only way to do so touched the vault's dedup and recall state.
+
+Verify after a restart:
+
+```bash
+openclaw plugins inspect clawmem                                              # Kind: memory, Status: enabled, 5 tools
+openclaw config get plugins.entries.clawmem.hooks.allowConversationAccess     # true
+openclaw config get plugins.slots.memory                                      # clawmem
+journalctl -u openclaw-gateway.service -n 200 --no-pager | grep -cE "must declare contracts|blocked because non-bundled|not selected for the memory slot"   # expect 0
+```
+
 ### Idempotency
 
-Re-running setup is safe. Setup removes any existing `~/.openclaw/extensions/clawmem` (whether it is a symlink, a directory, or a stale copy from a previous version) before writing the new copy. This makes upgrades a matter of `git pull && clawmem setup openclaw && chown -R <user>:<group> ~/.openclaw/extensions/clawmem` (the chown only matters on multi-user installs).
+Re-running setup is safe. On the delegated path OpenClaw replaces the installed copy (`--force`) and setup writes the three config values again. On the copy fallback setup builds the new tree beside the old one, moves the old directory (or a stale symlink) aside, renames the new tree into place and only then deletes the old one; if that rename fails the old entry is moved back. In link mode (delegated or CLI-absent) the previous symlink or directory is likewise moved aside before the new link is made and put back if `plugins install -l` or the symlink fails; it is deleted only once the new link is in place. A failed run therefore leaves the previous install in place instead of an empty directory. The one gap is a process killed between the two renames: the previous install is then parked as `clawmem.old-<pid>` beside an absent `clawmem`, and moving it back by hand restores it. Should a restore itself fail, setup names that `clawmem.old-<pid>` entry for the same reason. An upgrade is `git pull && clawmem setup openclaw`. On a system-service install add `--gateway-user <user>`: OpenClaw installs the files as whoever ran setup, and the ownership check tells you whether the chown from the multi-user section is needed again.
 
 ## Architecture
 
@@ -136,6 +175,7 @@ The plugin manifest (`src/openclaw/openclaw.plugin.json`) supports:
 | `clawmemBin` | auto-detected | Path to `clawmem` binary |
 | `tokenBudget` | 800 | Context injection budget |
 | `profile` | `balanced` | Performance profile |
+| `hookBudgetMs` | 6000 | Time budget for the context-surfacing hook, in milliseconds, 1000 to 60000. See "Hook time budget" above |
 | `enableTools` | true | Register agent tools |
 | `servePort` | 7438 | REST API port for agent tools |
 | `gpuEmbed` | `http://localhost:8088` | Embedding endpoint override |
@@ -292,7 +332,7 @@ openclaw config get plugins.slots.memory
 # Gateway log should include clawmem in the ready line, for example:
 #   [gateway] ready (7 plugins: acpx, browser, clawmem, device-pair, phone-control, talk-voice, telegram; ...)
 # AND the per-plugin registration line:
-#   [plugins] clawmem: plugin registered (kind=memory, bin=..., profile=balanced, budget=800)
+#   [plugins] clawmem: plugin registered (kind=memory, bin=..., profile=balanced, budget=800, hookBudgetMs=6000)
 #   [plugins] clawmem: registered 5 agent tools
 journalctl -u openclaw-gateway.service -n 50 --no-pager | grep -E "(ready|\bclawmem\b)"
 

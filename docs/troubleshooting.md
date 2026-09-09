@@ -42,6 +42,13 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - When a remote llama-server is unreachable, ClawMem falls back to in-process inference via `node-llama-cpp` (logged as cooldown message). With GPU acceleration (Metal on Apple Silicon, Vulkan on supported hardware), the fallback is fast. On CPU-only systems, inference is significantly slower.
 - Fix: Run GPU servers via [systemd services](guides/systemd-services.md) with `Restart=on-failure`. Or set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead of falling back.
 
+**`ggml_metal_library_init_from_source: error compiling source` on Apple Silicon (in-process fallback)**
+- The line comes from llama.cpp inside `node-llama-cpp`, not from ClawMem. The bundled Metal shader source failed to compile on your macOS release, so ggml falls back to a slower path. Inference still completes and nothing crashes; embedding runs without Metal acceleration.
+- Seen on macOS 26.6 with an M5 Pro when a source checkout resolved `node-llama-cpp` 3.15.1 (llama.cpp b7836, January 2026). Releases from 3.20.0 (llama.cpp b10361, August 2026) compile cleanly on that hardware. ClawMem's `package.json` now requires `node-llama-cpp` `^3.20.0`; on an older checkout run `bun update node-llama-cpp`, then re-run `clawmem embed`. In one report the full embed of a 156-document vault went from 14.5 s to 9.6 s after the update.
+- A `No results found` from `vsearch` right after that line is a separate problem: the vault has no embeddings yet. Run `clawmem embed` (or wait for the embed timer) and check the unembedded count in `clawmem status`.
+- The `[embed] Local embedding endpoint unavailable, cooldown 60s before retry` line above it is expected when no `llama-server` is running; that cooldown is what engages the in-process fallback. Point `CLAWMEM_EMBED_URL` at a server to skip in-process inference entirely.
+- On CUDA the first in-process embedding after a node-llama-cpp upgrade can take about ten seconds while the driver compiles PTX for your card (measured on a GTX 1080 Ti with 3.20.0); the result lands in `~/.nv/ComputeCache` and later calls take around 130 ms. A hook killed during that compile leaves nothing cached, so run `clawmem embed` once by hand after upgrading if you rely on hooks with local inference. The OpenClaw plugin does not warm the model itself (an automatic warm-up is deferred until it can run without touching the vault), so that manual `clawmem embed` is the upgrade step.
+
 **Query expansion always fails or returns garbage**
 - On CPU-only systems (no Metal, no Vulkan), in-process inference is significantly slower and less reliable than a dedicated GPU server. Systems with GPU acceleration (Metal/Vulkan) handle these models well in-process.
 - Fix: Run llama-server on a GPU. Even a low-end NVIDIA card handles 1.7B models.
@@ -390,7 +397,12 @@ builders operate on — so archiving documents legitimately lowers the total.
 
 **Plugin registers but hooks don't fire**
 - Verify ClawMem owns the memory slot: `openclaw config get plugins.slots.memory` must print `clawmem`. ClawMem v0.10.0+ uses the `memory` slot, not the older `contextEngine` slot.
+- On OpenClaw v2026.4.23 or newer, verify the conversation grant: `openclaw config get plugins.entries.clawmem.hooks.allowConversationAccess` must print `true`, or the gateway logs `typed hook "before_prompt_build" blocked because non-bundled plugins must set plugins.entries.clawmem.hooks.allowConversationAccess=true` and neither injection nor extraction runs. On v2026.5.2 or newer, `plugin must declare contracts.tools` in the journal means the installed manifest predates the tool contract; re-run `clawmem setup openclaw`.
 - If using hybrid mode, OpenClaw's native memory may be intercepting.
+
+**`hook context-surfacing failed: timeout after Nms (hook=context-surfacing, profile=..., hookBudgetMs=...)` on every prompt**
+- The plugin kills the hook `hookBudgetMs + 2000` ms after start and registers it with OpenClaw 2 s later than that. If the message repeats on every prompt, either the hook cannot finish inside its budget or an operator hook-timeout policy is lower than the plugin's registration value (`plugins.entries.clawmem.hooks.timeouts.before_prompt_build` or `plugins.entries.clawmem.hooks.timeoutMs` win over it).
+- Fix: run `clawmem setup openclaw` again, which reports a policy below the derived timeout with the exact `openclaw config set` to run, or lower `plugins.entries.clawmem.config.hookBudgetMs`. At `profile: deep` with no `gpuRerank` or `gpuLlm` endpoint, ClawMem v0.37 and older loaded models in-process on every prompt and blew the budget; v0.38 degrades those legs inside it. Set the endpoints or use `balanced` on older versions.
 
 **OpenClaw agent doesn't use ClawMem tools**
 - The 5 agent tools (search, get, session_log, timeline, similar) require the REST API. Verify it's running and accessible from the OpenClaw process.

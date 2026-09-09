@@ -6,7 +6,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,8 +27,61 @@ export type ClawMemConfig = {
   profile: string;
   enableTools: boolean;
   servePort: number;
+  /**
+   * The context-surfacing hook's authoritative wall-clock budget in ms. It is
+   * handed to the child as CLAWMEM_HOOK_BUDGET_MS (honored from ClawMem v0.38;
+   * older hooks ignore it), and every outer timeout derives from it — see
+   * contextSurfacingKillTimeoutMs / hostHookTimeoutMs.
+   */
+  hookBudgetMs?: number;
   env: Record<string, string>;
 };
+
+// =============================================================================
+// Hook budget contract
+// =============================================================================
+//
+// One number, three layers, always ordered inner < middle < outer:
+//   hookBudgetMs                 the hook schedules its own legs against this
+//   + HOOK_KILL_MARGIN_MS        process start-up and JSON finalization
+//   = child kill timeout         execFile kills the child here
+//   + HOST_TIMEOUT_MARGIN_MS     the host's own timer must fire AFTER our kill
+//   = before_prompt_build timeoutMs passed to the OpenClaw registration
+// Raising hookBudgetMs alone is pointless when the operator's OpenClaw hook
+// policy (plugins.entries.clawmem.hooks.timeouts) is lower than the outer value.
+
+export const DEFAULT_HOOK_BUDGET_MS = 6000;
+export const MIN_HOOK_BUDGET_MS = 1000;
+/**
+ * Product cap for a per-prompt path: one minute. OpenClaw's own hook-timeout
+ * policy tops out at OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS, and the outer host
+ * timeout (budget + both margins) must stay below it so the manifest's advice
+ * to set a matching policy is always satisfiable.
+ */
+export const MAX_HOOK_BUDGET_MS = 60_000;
+export const HOOK_KILL_MARGIN_MS = 2000;
+export const HOST_TIMEOUT_MARGIN_MS = 2000;
+export const OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS = 600_000;
+if (MAX_HOOK_BUDGET_MS + HOOK_KILL_MARGIN_MS + HOST_TIMEOUT_MARGIN_MS > OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS) {
+  throw new Error("hook budget contract: host timeout at MAX budget exceeds OpenClaw's policy maximum");
+}
+
+/** Coerce a configured budget: non-numeric or non-positive → default; clamp to [MIN, MAX]. */
+export function resolveHookBudgetMs(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_HOOK_BUDGET_MS;
+  return Math.min(MAX_HOOK_BUDGET_MS, Math.max(MIN_HOOK_BUDGET_MS, Math.floor(n)));
+}
+
+/** When execFile kills the context-surfacing child. */
+export function contextSurfacingKillTimeoutMs(cfg: Pick<ClawMemConfig, "hookBudgetMs">): number {
+  return resolveHookBudgetMs(cfg.hookBudgetMs) + HOOK_KILL_MARGIN_MS;
+}
+
+/** The timeoutMs handed to OpenClaw for the before_prompt_build registration. */
+export function hostHookTimeoutMs(cfg: Pick<ClawMemConfig, "hookBudgetMs">): number {
+  return contextSurfacingKillTimeoutMs(cfg) + HOST_TIMEOUT_MARGIN_MS;
+}
 
 export type ShellResult = {
   stdout: string;
@@ -50,14 +103,32 @@ const SEARCH_PATHS = [
 ];
 
 export function resolveClawMemBin(configured?: string): string {
-  if (configured && existsSync(configured)) return configured;
+  if (configured) {
+    // An explicit path is authoritative: a configured binary that has gone
+    // missing is an error to surface, never a cue to run some other clawmem
+    // found on a search path (the bundled plugin's source-relative fallback
+    // does not even point at a checkout). A directory at that path is not a
+    // binary either: execFile would fail on it at the first hook.
+    if (!existsSync(configured)) throw new Error(`clawmem: configured clawmemBin does not exist: ${configured}`);
+    if (!isRegularFile(configured)) throw new Error(`clawmem: configured clawmemBin is not a regular file: ${configured}`);
+    return configured;
+  }
 
   for (const p of SEARCH_PATHS) {
-    if (existsSync(p)) return p;
+    if (isRegularFile(p)) return p;
   }
 
   // Fallback: assume it's on PATH
   return "clawmem";
+}
+
+/** Follows symlinks; false for a missing path or anything but a regular file. */
+function isRegularFile(p: string): boolean {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -96,7 +167,7 @@ export function execHook(
         if (error) {
           // Fail-open: log but don't throw
           const msg = (error as any).killed
-            ? `timeout after ${hookTimeout}ms`
+            ? `timeout after ${hookTimeout}ms (hook=${hookName}, profile=${cfg.profile}, hookBudgetMs=${resolveHookBudgetMs(cfg.hookBudgetMs)})`
             : String(error.message || error);
           resolve({
             stdout: "",

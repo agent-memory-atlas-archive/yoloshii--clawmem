@@ -62,8 +62,16 @@ describe("resolveClawMemBin", () => {
     expect(result).toContain("bin/clawmem");
   });
 
+  test("throws when a configured path does not exist (an explicit binary is authoritative)", () => {
+    expect(() => resolveClawMemBin("/nonexistent/clawmem-bin-xyz")).toThrow(/configured clawmemBin does not exist/);
+  });
+
+  test("throws when a configured path is a directory, not a binary", () => {
+    expect(() => resolveClawMemBin(`${import.meta.dir}/../../bin`)).toThrow(/configured clawmemBin is not a regular file/);
+  });
+
   test("falls back to 'clawmem' if no configured path", () => {
-    const result = resolveClawMemBin("/nonexistent/path/clawmem");
+    const result = resolveClawMemBin(undefined);
     expect(typeof result).toBe("string");
   });
 });
@@ -985,8 +993,16 @@ describe("Shipping Condition 2 — setup-time migration text is present", () => 
     // where symlink.isDirectory() === false, so symlinked plugins are silently
     // skipped. Setup must default to recursive copy and only use symlinks
     // under an opt-in --link flag for dev mode or older OpenClaw versions.
-    expect(content).toContain("cpSync(pluginDir, linkPath");
+    expect(content).toContain("swapDirIntoPlace(newDir!, linkPath)");
     expect(content).toContain('args.includes("--link")');
+  });
+
+  test("link mode parks the previous install instead of deleting it, on both the delegated and the CLI-absent path", async () => {
+    const file = Bun.file(`${import.meta.dir}/../../src/clawmem.ts`);
+    const content = await file.text();
+    expect((content.match(/moveTargetAside\(linkPath\)/g) ?? []).length).toBe(2);
+    // The only remaining recursive delete of linkPath is the --remove path.
+    expect((content.match(/rmSync\(linkPath, \{ recursive: true \}\)/g) ?? []).length).toBe(1);
   });
 
   test("src/openclaw/package.json declares openclaw.extensions (v2026.4.11+ discovery gate)", async () => {

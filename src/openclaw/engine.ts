@@ -29,6 +29,7 @@ import {
   execHook as realExecHook,
   parseHookOutput as realParseHookOutput,
   extractContext as realExtractContext,
+  contextSurfacingKillTimeoutMs,
 } from "./shell.js";
 import {
   setBootstrapContext,
@@ -314,10 +315,12 @@ export async function handleBeforePromptBuild(
 
   // Every turn: prompt-aware retrieval via context-surfacing hook
   const searchPrompt = cleanPromptForSearch(event.prompt);
-  const surfacingResult = await activeHookRunner.execHook(cfg, "context-surfacing", {
-    session_id: sessionId,
-    prompt: searchPrompt,
-  });
+  const surfacingResult = await activeHookRunner.execHook(
+    cfg,
+    "context-surfacing",
+    { session_id: sessionId, prompt: searchPrompt },
+    contextSurfacingKillTimeoutMs(cfg),
+  );
 
   if (surfacingResult.exitCode === 0) {
     const parsed = activeHookRunner.parseHookOutput(surfacingResult.stdout);

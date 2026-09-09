@@ -23,6 +23,7 @@ import {
   resolveHomeForOpenClaw,
   trim,
 } from "../../src/openclaw-paths.ts";
+import { canExecuteAs, moveTargetAside, resolveOpenClawProfile, swapDirIntoPlace } from "../../src/openclaw-paths.ts";
 
 const STATIC_HOME = "/home/test-user";
 const staticHomedir = () => STATIC_HOME;
@@ -225,7 +226,7 @@ describe("§28.1 U8 — printSetupOpenClawHelp output content", () => {
 
     // Usage line
     expect(output).toContain(
-      "clawmem setup openclaw [--link] [--remove] [--help|-h]",
+      "clawmem setup openclaw [--link] [--accept-capabilities] [--gateway-user <name>] [--remove] [--help|-h]",
     );
 
     // All four flags documented
@@ -245,5 +246,226 @@ describe("§28.1 U8 — printSetupOpenClawHelp output content", () => {
 
     // At least one example shows OPENCLAW_STATE_DIR usage
     expect(output).toContain("OPENCLAW_STATE_DIR=~/.openclaw-dev");
+  });
+});
+
+describe("canExecuteAs — traverse + execute judged for another identity", () => {
+  // /home(755 root) /home/u(700 uid 1000) /home/u/bin(755 uid 1000) /home/u/bin/clawmem(755 uid 1000)
+  const tree: Record<string, { uid: number; gid: number; mode: number }> = {
+    "/": { uid: 0, gid: 0, mode: 0o40755 },
+    "/home": { uid: 0, gid: 0, mode: 0o40755 },
+    "/home/u": { uid: 1000, gid: 1000, mode: 0o40700 },
+    "/home/u/bin": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/home/u/bin/clawmem": { uid: 1000, gid: 1000, mode: 0o100755 },
+  };
+  const fsx = { statSync: (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; } };
+  test("owner can, a stranger cannot traverse a 700 home, root always can", () => {
+    expect(canExecuteAs("/home/u/bin/clawmem", 1000, [1000], fsx)).toBe(true);
+    expect(canExecuteAs("/home/u/bin/clawmem", 65534, [65534], fsx)).toBe(false);
+    expect(canExecuteAs("/home/u/bin/clawmem", 0, [], fsx)).toBe(true);
+  });
+  test("group membership grants traverse when the group x bit is set", () => {
+    tree["/home/u"] = { uid: 1000, gid: 1000, mode: 0o40750 };
+    expect(canExecuteAs("/home/u/bin/clawmem", 2000, [1000], fsx)).toBe(true);
+    expect(canExecuteAs("/home/u/bin/clawmem", 2000, [2000], fsx)).toBe(false);
+    tree["/home/u"] = { uid: 1000, gid: 1000, mode: 0o40700 };
+  });
+  test("a missing x bit on the binary itself fails", () => {
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o100644 };
+    expect(canExecuteAs("/home/u/bin/clawmem", 1000, [1000], fsx)).toBe(false);
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o100755 };
+  });
+  test("root skips traversal but still needs an x bit on the file itself (execve)", () => {
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o100644 };
+    expect(canExecuteAs("/home/u/bin/clawmem", 0, [], fsx)).toBe(false);
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o100755 };
+    expect(canExecuteAs("/home/u/bin/clawmem", 0, [], fsx)).toBe(true);
+  });
+  test("a directory target fails for root and non-root even with every x bit set (execve needs a regular file)", () => {
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o40755 };
+    expect(canExecuteAs("/home/u/bin/clawmem", 1000, [1000], fsx)).toBe(false);
+    expect(canExecuteAs("/home/u/bin/clawmem", 0, [], fsx)).toBe(false);
+    tree["/home/u/bin/clawmem"] = { uid: 1000, gid: 1000, mode: 0o100755 };
+  });
+  test("OPENCLAW_PROFILE maps to ~/.openclaw-<profile>, default/empty to ~/.openclaw", async () => {
+    const { resolveExtensionsDirNoOpenClaw } = await import("../../src/openclaw-paths.ts");
+    const home = () => "/home/u";
+    expect(resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "dev" }, homedir: home })).toBe("/home/u/.openclaw-dev/extensions");
+    expect(resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "default" }, homedir: home })).toBe("/home/u/.openclaw/extensions");
+    expect(resolveExtensionsDirNoOpenClaw({ env: {}, homedir: home })).toBe("/home/u/.openclaw/extensions");
+    expect(resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "dev", OPENCLAW_STATE_DIR: "/x" }, homedir: home })).toBe("/x/extensions");
+  });
+});
+
+describe("swapDirIntoPlace — the previous entry is parked, restored when the rename in fails", () => {
+  function fakeFs(entries: Map<string, "symlink" | "directory" | "file">) {
+    const ops: string[] = [];
+    const fsx = {
+      lstatSync: (p: string) => {
+        const k = entries.get(p);
+        if (!k) { const e: any = new Error("ENOENT " + p); e.code = "ENOENT"; throw e; }
+        return { isSymbolicLink: () => k === "symlink", isDirectory: () => k === "directory" };
+      },
+      renameSync: (a: string, b: string) => { ops.push(`rename ${a} -> ${b}`); const k = entries.get(a)!; entries.delete(a); entries.set(b, k); },
+      rmSync: (p: string, _o: { recursive: boolean; force: boolean }) => { ops.push(`rm ${p}`); entries.delete(p); },
+    };
+    return { ops, entries, fsx };
+  }
+  function failRenameIn(f: ReturnType<typeof fakeFs>) {
+    const inner = f.fsx.renameSync;
+    f.fsx.renameSync = (a: string, b: string) => {
+      if (a === "/ext/clawmem.new-1") { f.ops.push(`rename ${a} -> ${b} FAILED`); throw new Error("EXDEV simulated"); }
+      inner(a, b);
+    };
+  }
+  const backup = `/ext/clawmem.old-${process.pid}`;
+  test("replaces an existing directory and removes the backup afterwards", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "directory"], ["/ext/clawmem.new-1", "directory"]]));
+    expect(swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toEqual({ replaced: true, previous: "directory" });
+    expect(f.entries.get("/ext/clawmem")).toBe("directory");
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.entries.has("/ext/clawmem.new-1")).toBe(false);
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rename /ext/clawmem.new-1 -> /ext/clawmem`, `rm ${backup}`]);
+  });
+  test("a fresh install is a plain rename", () => {
+    const f = fakeFs(new Map([["/ext/clawmem.new-1", "directory"]]));
+    expect(swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toEqual({ replaced: false, previous: "none" });
+    expect(f.ops).toEqual([`rename /ext/clawmem.new-1 -> /ext/clawmem`]);
+  });
+  test("a stale symlink is parked as the link itself and replaced by the directory", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "symlink"], ["/ext/clawmem.new-1", "directory"]]));
+    expect(swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toEqual({ replaced: true, previous: "symlink" });
+    expect(f.entries.get("/ext/clawmem")).toBe("directory");
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rename /ext/clawmem.new-1 -> /ext/clawmem`, `rm ${backup}`]);
+  });
+  test("a regular file at the target is refused before anything moves", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "file"], ["/ext/clawmem.new-1", "directory"]]));
+    expect(() => swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toThrow("neither a symlink nor a directory");
+    expect(f.ops).toEqual([]);
+  });
+  test("when the rename in fails the previous directory is restored and the error propagates", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "directory"], ["/ext/clawmem.new-1", "directory"]]));
+    failRenameIn(f);
+    expect(() => swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toThrow("EXDEV simulated");
+    expect(f.entries.get("/ext/clawmem")).toBe("directory");      // the old tree is back
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.entries.get("/ext/clawmem.new-1")).toBe("directory"); // the new tree is left for inspection
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rename /ext/clawmem.new-1 -> /ext/clawmem FAILED`, `rename ${backup} -> /ext/clawmem`]);
+  });
+  test("when the rename in fails a parked symlink is put back as the same link", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "symlink"], ["/ext/clawmem.new-1", "directory"]]));
+    failRenameIn(f);
+    expect(() => swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx)).toThrow("EXDEV simulated");
+    expect(f.entries.get("/ext/clawmem")).toBe("symlink");
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rename /ext/clawmem.new-1 -> /ext/clawmem FAILED`, `rename ${backup} -> /ext/clawmem`]);
+  });
+  test("when the restore also fails an AggregateError carries both errors and names the backup path", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "directory"], ["/ext/clawmem.new-1", "directory"]]));
+    const inner = f.fsx.renameSync;
+    f.fsx.renameSync = (a: string, b: string) => {
+      if (a === "/ext/clawmem.new-1") { f.ops.push(`rename ${a} -> ${b} FAILED`); throw new Error("EXDEV simulated"); }
+      if (a === backup) { f.ops.push(`rename ${a} -> ${b} FAILED`); throw new Error("EACCES simulated"); }
+      inner(a, b);
+    };
+    let caught: unknown;
+    try { swapDirIntoPlace("/ext/clawmem.new-1", "/ext/clawmem", f.fsx); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(AggregateError);
+    const agg = caught as AggregateError;
+    expect((agg.errors[0] as Error).message).toBe("EXDEV simulated");
+    expect((agg.errors[1] as Error).message).toContain("EACCES simulated");
+    expect(((agg.errors[1] as Error).cause as Error).message).toBe("EACCES simulated");
+    expect(agg.message).toContain(`It remains at ${backup}`);
+    expect(agg.message).toContain(`mv ${backup} /ext/clawmem`);
+    expect(f.entries.has("/ext/clawmem")).toBe(false);            // the target is empty — the message says so
+    expect(f.entries.get(backup)).toBe("directory");              // the previous tree is still there to recover
+    expect(f.entries.get("/ext/clawmem.new-1")).toBe("directory");
+  });
+});
+
+describe("moveTargetAside — a symlink or directory is parked, then discarded or put back", () => {
+  function fakeFs(entries: Map<string, "symlink" | "directory" | "file">) {
+    const ops: string[] = [];
+    const fsx = {
+      lstatSync: (p: string) => {
+        const k = entries.get(p);
+        if (!k) { const e: any = new Error("ENOENT " + p); e.code = "ENOENT"; throw e; }
+        return { isSymbolicLink: () => k === "symlink", isDirectory: () => k === "directory" };
+      },
+      renameSync: (a: string, b: string) => { ops.push(`rename ${a} -> ${b}`); const k = entries.get(a)!; entries.delete(a); entries.set(b, k); },
+      rmSync: (p: string, _o: { recursive: boolean; force: boolean }) => { ops.push(`rm ${p}`); entries.delete(p); },
+    };
+    return { ops, entries, fsx };
+  }
+  const backup = `/ext/clawmem.old-${process.pid}`;
+  test("a directory is parked and discard() deletes the backup", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "directory"]]));
+    const aside = moveTargetAside("/ext/clawmem", f.fsx);
+    expect(aside.kind).toBe("directory");
+    expect(aside.backup).toBe(backup);
+    expect(f.entries.has("/ext/clawmem")).toBe(false);
+    expect(f.entries.get(backup)).toBe("directory");
+    aside.discard();
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rm ${backup}`]);
+  });
+  test("a symlink is parked as the link itself and restore() puts it back", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "symlink"]]));
+    const aside = moveTargetAside("/ext/clawmem", f.fsx);
+    expect(aside.kind).toBe("symlink");
+    aside.restore();
+    expect(f.entries.get("/ext/clawmem")).toBe("symlink");
+    expect(f.entries.has(backup)).toBe(false);
+    expect(f.ops).toEqual([`rm ${backup}`, `rename /ext/clawmem -> ${backup}`, `rename ${backup} -> /ext/clawmem`]);
+  });
+  test("an absent target makes restore() and discard() no-ops", () => {
+    const f = fakeFs(new Map());
+    const aside = moveTargetAside("/ext/clawmem", f.fsx);
+    expect(aside.kind).toBe("none");
+    aside.restore();
+    aside.discard();
+    expect(f.ops).toEqual([]);
+  });
+  test("a regular file is reported as 'other' and never touched", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "file"]]));
+    const aside = moveTargetAside("/ext/clawmem", f.fsx);
+    expect(aside.kind).toBe("other");
+    aside.restore();
+    aside.discard();
+    expect(f.entries.get("/ext/clawmem")).toBe("file");
+    expect(f.ops).toEqual([]);
+  });
+  test("a failed restore throws naming the backup path so the operator can recover by hand", () => {
+    const f = fakeFs(new Map([["/ext/clawmem", "directory"]]));
+    const aside = moveTargetAside("/ext/clawmem", f.fsx);
+    f.fsx.renameSync = () => { throw new Error("EACCES simulated"); };
+    expect(() => aside.restore()).toThrow(`it remains at ${backup}`);
+    expect(f.entries.get(backup)).toBe("directory");
+  });
+});
+
+describe("resolveOpenClawProfile — one grammar for --profile and .openclaw-<profile>", () => {
+  test("unset, blank and 'default' select the default profile", () => {
+    expect(resolveOpenClawProfile({})).toBeUndefined();
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "" })).toBeUndefined();
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "   " })).toBeUndefined();
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "default" })).toBeUndefined();
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "DEFAULT" })).toBeUndefined();
+  });
+  test("a valid name is returned trimmed", () => {
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: " dev " })).toBe("dev");
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "Team_A-2" })).toBe("Team_A-2");
+    expect(resolveOpenClawProfile({ OPENCLAW_PROFILE: "a".repeat(64) })).toBe("a".repeat(64));
+  });
+  test("separators, dots, spaces, a leading dash and over-long names are refused", () => {
+    for (const bad of ["x/../victim", "../victim", "a/b", "a\\b", "..", ".", "bad name!", "-dev", "a".repeat(65)]) {
+      expect(() => resolveOpenClawProfile({ OPENCLAW_PROFILE: bad })).toThrow("not a valid OpenClaw profile name");
+    }
+  });
+  test("resolveExtensionsDirNoOpenClaw refuses the name even when OPENCLAW_STATE_DIR decides the directory", () => {
+    const home = () => "/home/u";
+    expect(() => resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "x/../victim" }, homedir: home })).toThrow("not a valid OpenClaw profile name");
+    expect(() => resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "x/../victim", OPENCLAW_STATE_DIR: "/x" }, homedir: home })).toThrow("not a valid OpenClaw profile name");
   });
 });

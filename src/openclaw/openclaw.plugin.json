@@ -1,8 +1,20 @@
 {
   "id": "clawmem",
   "kind": "memory",
+  "contracts": {
+    "tools": [
+      "clawmem_search",
+      "clawmem_get",
+      "clawmem_session_log",
+      "clawmem_timeline",
+      "clawmem_similar"
+    ]
+  },
   "activation": {
-    "onCapabilities": ["hook", "tool"]
+    "onCapabilities": [
+      "hook",
+      "tool"
+    ]
   },
   "uiHints": {
     "clawmemBin": {
@@ -63,6 +75,12 @@
       "placeholder": "http://localhost:8090",
       "help": "URL for reranking service",
       "advanced": true
+    },
+    "hookBudgetMs": {
+      "label": "Hook time budget (ms)",
+      "placeholder": "6000",
+      "help": "Wall-clock budget the context-surfacing hook schedules its legs against (CLAWMEM_HOOK_BUDGET_MS, 1000-60000). The plugin kills the hook 2 s after it and registers the host hook 2 s after that; an operator hook-timeout policy (plugins.entries.clawmem.hooks.timeouts.before_prompt_build) lower than budget + 4 s wins and must be raised together with it.",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -79,7 +97,11 @@
       },
       "profile": {
         "type": "string",
-        "enum": ["speed", "balanced", "deep"]
+        "enum": [
+          "speed",
+          "balanced",
+          "deep"
+        ]
       },
       "enableTools": {
         "type": "boolean"
@@ -100,13 +122,25 @@
       },
       "gpuLlmReasoningEffort": {
         "type": "string",
-        "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+        "enum": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
       },
       "gpuLlmNoThink": {
         "type": "boolean"
       },
       "gpuRerank": {
         "type": "string"
+      },
+      "hookBudgetMs": {
+        "type": "number",
+        "minimum": 1000,
+        "maximum": 60000
       }
     }
   }

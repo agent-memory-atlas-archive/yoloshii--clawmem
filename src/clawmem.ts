@@ -104,7 +104,10 @@ import {
 } from "./session-focus.ts";
 import {
   resolveExtensionsDirNoOpenClaw,
+  resolveOpenClawProfile,
   printSetupOpenClawHelp,
+  swapDirIntoPlace,
+  moveTargetAside,
 } from "./openclaw-paths.ts";
 
 enableProductionMode();
@@ -2549,7 +2552,7 @@ function cmdPath() {
  */
 function readOpenClawConfigValue(key: string): string | undefined {
   try {
-    const r = Bun.spawnSync(["openclaw", "config", "get", key], { stdout: "pipe", stderr: "pipe" });
+    const r = Bun.spawnSync(openClawArgv(["config", "get", key]), { stdout: "pipe", stderr: "pipe" });
     if (r.exitCode !== 0) return undefined;
     const out = new TextDecoder().decode(r.stdout).trim();
     if (!out) return undefined;
@@ -2558,6 +2561,292 @@ function readOpenClawConfigValue(key: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// ---- OpenClaw plugin install helpers (PR #27 / OpenClaw >= 2026.5) ----------
+
+type OpenClawConsentFlag = {
+  /** true when `openclaw plugins install --help` printed a flag list we could read */
+  helpSeen: boolean;
+  /** true when that help advertises --accept-capabilities (OpenClaw >= 2026.9 local installs) */
+  acceptCapabilities: boolean;
+};
+
+/**
+ * Feature-detect capability consent from OpenClaw's own `plugins install
+ * --help`. Only this flag is detected: `-l` and `--force` are sent exactly as
+ * before (every supported OpenClaw accepts them in the modes we use), so the
+ * contract is narrow on purpose. Version strings are never parsed.
+ */
+function detectOpenClawConsentFlag(): OpenClawConsentFlag {
+  try {
+    const r = Bun.spawnSync(openClawArgv(["plugins", "install", "--help"]), { stdout: "pipe", stderr: "pipe" });
+    const text = new TextDecoder().decode(r.stdout ?? new Uint8Array()) + new TextDecoder().decode(r.stderr ?? new Uint8Array());
+    return { helpSeen: /--(link|force|accept-capabilities)\b/.test(text), acceptCapabilities: /--accept-capabilities\b/.test(text) };
+  } catch {
+    return { helpSeen: false, acceptCapabilities: false };
+  }
+}
+
+/**
+ * Run an openclaw subcommand with PIPED stdio, echoing both streams, so the
+ * output is visible to the operator AND inspectable by us. `stdout: "inherit"`
+ * makes Bun.spawnSync return stdout/stderr as undefined — the trap PR #27's
+ * string-detection fallback fell into.
+ */
+/**
+ * OpenClaw selects a named profile ONLY from `--profile <name>` in its own
+ * argv (openclaw src/entry.ts parseCliProfileArgs → applyCliProfileEnv); the
+ * OPENCLAW_PROFILE variable by itself changes nothing for a delegated command.
+ * So every openclaw invocation setup makes carries the operator's
+ * OPENCLAW_PROFILE as that flag, validated with OpenClaw's own name grammar
+ * (openclaw src/cli/profile-utils.ts PROFILE_NAME_RE) so a typo fails here
+ * instead of installing silently into the default profile. The grammar
+ * check itself lives in resolveOpenClawProfile (openclaw-paths.ts), shared
+ * with the CLI-absent `.openclaw-<profile>` resolver, so both install paths
+ * refuse exactly the same names.
+ */
+function openClawProfileOrDie(): string | undefined {
+  try {
+    return resolveOpenClawProfile();
+  } catch (e) {
+    die(e instanceof Error ? e.message : String(e));
+  }
+}
+function openClawProfileArgs(): string[] {
+  const profile = openClawProfileOrDie();
+  return profile ? ["--profile", profile] : [];
+}
+function openClawArgv(args: string[]): string[] {
+  return ["openclaw", ...openClawProfileArgs(), ...args];
+}
+
+function runOpenClaw(args: string[]): { exitCode: number; output: string } {
+  const r = Bun.spawnSync(openClawArgv([...args]), { stdout: "pipe", stderr: "pipe" });
+  const out = new TextDecoder().decode(r.stdout ?? new Uint8Array());
+  const err = new TextDecoder().decode(r.stderr ?? new Uint8Array());
+  if (out) process.stdout.write(out);
+  if (err) process.stderr.write(err);
+  return { exitCode: r.exitCode, output: out + err };
+}
+
+type StagedPlugin = { dir: string; manifest: Record<string, unknown> };
+
+/**
+ * What the operator consents to when OpenClaw asks for capability acceptance.
+ * The tool list comes from the manifest that will actually be installed —
+ * never from a second hand-maintained list.
+ */
+function printOpenClawPluginCapabilities(manifest: Record<string, unknown>): void {
+  const contracts = (manifest.contracts ?? {}) as { tools?: string[] };
+  const tools = contracts.tools ?? [];
+  console.log();
+  console.log(`${c.bold}ClawMem asks OpenClaw for these capabilities:${c.reset}`);
+  console.log(`  - ${tools.length} agent tools: ${tools.join(", ") || "(none declared)"}`);
+  console.log(`  - conversation access: before_prompt_build injects retrieved memory into every prompt; agent_end reads the finished turn for extraction (plugins.entries.clawmem.hooks.allowConversationAccess)`);
+  console.log(`  - ownership of the memory slot (plugins.slots.memory = clawmem)`);
+  console.log(`  - a background REST service (\`clawmem serve\`) on the configured servePort`);
+  console.log();
+}
+
+/**
+ * Build the production copy of the plugin: ONLY a Node-target dist/index.js,
+ * the manifest, and a package.json whose openclaw.extensions points at the
+ * compiled entry. Old and current gateways both load a JavaScript entry;
+ * shipping index.ts alongside would be a trap on gateways that ignore
+ * runtimeExtensions (the TS module closure would be missing). Returns the
+ * staging directory plus the manifest it carries; the caller installs from
+ * it and removes it.
+ */
+async function stageOpenClawPluginCopy(pluginDir: string): Promise<StagedPlugin> {
+  const { mkdtempSync, copyFileSync, readFileSync, writeFileSync } = await import("fs");
+  const { tmpdir } = await import("os");
+  const { join } = await import("path");
+  const { rmSync } = await import("fs");
+  const stage = mkdtempSync(join(tmpdir(), "clawmem-openclaw-plugin-"));
+  try {
+    const build = await Bun.build({
+      entrypoints: [join(pluginDir, "index.ts")],
+      target: "node",
+      outdir: join(stage, "dist"),
+    });
+    if (!build.success || !existsSync(join(stage, "dist", "index.js"))) {
+      const msgs = build.logs.map((l) => String(l.message ?? l)).join("\n");
+      throw new Error(`Failed to bundle the OpenClaw plugin runtime entry (dist/index.js):\n${msgs}`);
+    }
+    copyFileSync(join(pluginDir, "openclaw.plugin.json"), join(stage, "openclaw.plugin.json"));
+    const srcPkg = JSON.parse(readFileSync(join(pluginDir, "package.json"), "utf-8")) as Record<string, unknown>;
+    const pkg: Record<string, unknown> = { ...srcPkg, openclaw: { extensions: ["./dist/index.js"] } };
+    writeFileSync(join(stage, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
+    const manifest = JSON.parse(readFileSync(join(stage, "openclaw.plugin.json"), "utf-8")) as Record<string, unknown>;
+    return { dir: stage, manifest };
+  } catch (e) {
+    // The stage is ours; never leave it behind on a failed build.
+    try { rmSync(stage, { recursive: true, force: true }); } catch { /* best-effort */ }
+    throw e;
+  }
+}
+
+/**
+ * The three config keys a working install needs on OpenClaw >= 2026.5, set
+ * idempotently after the plugin is installed, plus the one policy that can
+ * silently disable injection if an operator set it to false.
+ */
+function applyOpenClawPluginConfig(binPath: string): { incomplete: string[] } {
+  const sets: Array<[string, string, string]> = [
+    ["plugins.entries.clawmem.config.clawmemBin", binPath, "the plugin runs this exact binary (no search-path guessing)"],
+    ["plugins.entries.clawmem.hooks.allowConversationAccess", "true", "before_prompt_build + agent_end are conversation hooks; non-bundled plugins are denied without it"],
+    ["plugins.slots.memory", "clawmem", "an unselected memory plugin loads without its memory runtime"],
+  ];
+  const incomplete: string[] = [];
+  console.log(`${c.bold}Applying OpenClaw config:${c.reset}`);
+  for (const [key, value, why] of sets) {
+    const r = Bun.spawnSync(openClawArgv(["config", "set", key, value]), { stdout: "pipe", stderr: "pipe" });
+    const err = new TextDecoder().decode(r.stderr ?? new Uint8Array()).trim();
+    // Read back: the write returning 0 is not the contract, the stored value is.
+    const seen = readOpenClawConfigValue(key);
+    if (r.exitCode === 0 && seen === value) {
+      console.log(`  ${c.green}✓${c.reset} ${key} = ${value}  ${c.dim}(${why})${c.reset}`);
+    } else {
+      incomplete.push(key);
+      console.log(`  ${c.red}✗${c.reset} ${key}: ${r.exitCode !== 0 ? `set failed (exit ${r.exitCode})${err ? `: ${err.split("\n")[0]}` : ""}` : `read back ${JSON.stringify(seen)} instead of ${JSON.stringify(value)}`}`);
+      console.log(`    run manually and re-check: ${c.cyan}openclaw config set ${key} ${value}${c.reset}`);
+    }
+  }
+  const promptInjection = readOpenClawConfigValue("plugins.entries.clawmem.hooks.allowPromptInjection");
+  if (promptInjection === "false") {
+    console.log(`  ${c.yellow}! plugins.entries.clawmem.hooks.allowPromptInjection is false — before_prompt_build is blocked; ClawMem cannot inject memory until you unset it.${c.reset}`);
+  }
+  return { incomplete };
+}
+
+/**
+ * OpenClaw lets an operator hook-timeout policy override the timeoutMs the
+ * plugin registers (per-hook, then general, then the registration value).
+ * A policy lower than the plugin's derived host timeout silently kills the
+ * surfacing hook on every prompt — the failure class of issue #28 — so
+ * setup checks it here, where the config is already being read.
+ */
+async function warnOnLowOpenClawHookTimeoutPolicy(): Promise<void> {
+  const { resolveHookBudgetMs, hostHookTimeoutMs } = await import("./openclaw/shell.ts");
+  const budget = resolveHookBudgetMs(readOpenClawConfigValue("plugins.entries.clawmem.config.hookBudgetMs"));
+  const needed = hostHookTimeoutMs({ hookBudgetMs: budget });
+  const perHook = readOpenClawConfigValue("plugins.entries.clawmem.hooks.timeouts.before_prompt_build");
+  const general = readOpenClawConfigValue("plugins.entries.clawmem.hooks.timeoutMs");
+  const raw = perHook ?? general;
+  if (raw === undefined) return;
+  const policy = Number(raw);
+  if (!Number.isFinite(policy) || policy <= 0) return;
+  if (policy < needed) {
+    const key = perHook !== undefined ? "plugins.entries.clawmem.hooks.timeouts.before_prompt_build" : "plugins.entries.clawmem.hooks.timeoutMs";
+    console.log(`${c.yellow}! ${key} = ${policy}ms is below the ${needed}ms the plugin needs for its ${budget}ms hook budget — OpenClaw will kill context-surfacing on every prompt.${c.reset}`);
+    console.log(`  fix: ${c.cyan}openclaw config set ${key} ${needed}${c.reset}  (or lower plugins.entries.clawmem.config.hookBudgetMs)`);
+  }
+}
+
+type UnixIdentity = { uid: number; gids: number[] } | { error: "id-unavailable" | "unknown-user" };
+
+/** Resolve a user name to uid + supplementary gids via `id`; distinguishes a missing `id` from an unknown user. */
+function resolveUnixIdentity(user: string): UnixIdentity {
+  let u, g;
+  try {
+    u = Bun.spawnSync(["id", "-u", user], { stdout: "pipe", stderr: "pipe" });
+    g = Bun.spawnSync(["id", "-G", user], { stdout: "pipe", stderr: "pipe" });
+  } catch {
+    return { error: "id-unavailable" };
+  }
+  if (u.exitCode !== 0 || g.exitCode !== 0) return { error: "unknown-user" };
+  const uid = Number(new TextDecoder().decode(u.stdout).trim());
+  const gids = new TextDecoder().decode(g.stdout).trim().split(/\s+/).map(Number).filter(Number.isInteger);
+  return Number.isInteger(uid) ? { uid, gids } : { error: "unknown-user" };
+}
+
+/** OpenClaw's own record of where it put the plugin (`plugins inspect clawmem --json`). */
+function readOpenClawInstallPaths(): { installPath?: string; sourcePath?: string } {
+  try {
+    const r = Bun.spawnSync(openClawArgv(["plugins", "inspect", "clawmem", "--json"]), { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) return {};
+    const text = new TextDecoder().decode(r.stdout ?? new Uint8Array()).trim();
+    const start = text.indexOf("{");
+    if (start < 0) return {};
+    const json = JSON.parse(text.slice(start)) as unknown;
+    const found: { installPath?: string; sourcePath?: string } = {};
+    const walk = (v: unknown): void => {
+      if (!v || typeof v !== "object") return;
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if (k === "installPath" && typeof val === "string" && !found.installPath) found.installPath = val;
+        else if (k === "sourcePath" && typeof val === "string" && !found.sourcePath) found.sourcePath = val;
+        else walk(val);
+      }
+    };
+    walk(json);
+    return found;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * OpenClaw refuses a non-bundled plugin whose root or runtime entry is owned
+ * by neither its own runtime uid nor root, or is world-writable
+ * (src/plugins/discovery.ts). Verify the INSTALLED location, never the
+ * temporary stage, against the gateway's uid. Returns true only when every
+ * check passed; a failure prints the exact chown and returns false so the
+ * caller never claims success on top of it.
+ */
+async function verifyOpenClawPluginOwnership(params: {
+  root: string;
+  entry: string;
+  gatewayUser?: string;
+  binPath: string;
+}): Promise<{ verified: boolean }> {
+  const { statSync } = await import("fs");
+  const { canExecuteAs } = await import("./openclaw-paths.ts");
+  let identity: UnixIdentity;
+  let label: string;
+  if (params.gatewayUser) {
+    identity = resolveUnixIdentity(params.gatewayUser);
+    if ("error" in identity) {
+      console.log(`${c.red}--gateway-user ${params.gatewayUser}: ${identity.error === "id-unavailable" ? "`id` is not available on this host, so the gateway identity cannot be resolved" : "unknown user on this host"} — installed but unverified.${c.reset}`);
+      return { verified: false };
+    }
+    label = `gateway user ${params.gatewayUser} (uid ${identity.uid})`;
+  } else {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const gids = typeof process.getgroups === "function" ? process.getgroups() : [];
+    if (uid === undefined) { console.log(`${c.yellow}Could not determine the current uid; ownership unverified.${c.reset}`); return { verified: false }; }
+    identity = { uid, gids };
+    label = `the current user (uid ${uid})`;
+  }
+  if (!existsSync(params.root)) {
+    console.log(`${c.yellow}Could not verify ownership: expected the installed plugin at ${params.root}, which is absent (custom extensions dir?).${c.reset}`);
+    return { verified: false };
+  }
+  let ok = true;
+  for (const path of [params.root, params.entry]) {
+    let st;
+    try { st = statSync(path); } catch { console.log(`${c.red}Missing after install: ${path}${c.reset}`); ok = false; continue; }
+    if ((st.mode & 0o002) !== 0) { console.log(`${c.red}World-writable: ${path} — OpenClaw refuses it. Fix: chmod o-w ${path}${c.reset}`); ok = false; }
+    if (st.uid !== identity.uid && st.uid !== 0) {
+      console.log(`${c.red}Owned by uid ${st.uid}, but OpenClaw loads plugins only when owned by ${label} or root: ${path}${c.reset}`);
+      ok = false;
+    }
+  }
+  if (!ok) {
+    console.log(`  fix: ${c.cyan}sudo chown -R ${params.gatewayUser ?? "<gateway-user>"} ${params.root}${c.reset}`);
+    return { verified: false };
+  }
+  // Execute + traverse for the identity that will actually spawn the binary,
+  // computed from mode bits and group membership, not from this process.
+  if (!canExecuteAs(params.binPath, identity.uid, identity.gids)) {
+    console.log(`${c.red}${label} cannot traverse to or execute ${params.binPath} (check the x bits on the binary and every parent directory).${c.reset}`);
+    return { verified: false };
+  }
+  console.log(`${c.green}✓ plugin files at ${params.root} are owned by ${label} or root, not world-writable, and ${params.binPath} is executable for that identity${c.reset}`);
+  if (!params.gatewayUser) {
+    console.log(`${c.dim}  If the gateway runs as a different user (system service), re-run with --gateway-user <name> to verify for that user.${c.reset}`);
+  }
+  return { verified: true };
 }
 
 async function cmdSetupOpenClaw(args: string[]) {
@@ -2569,12 +2858,31 @@ async function cmdSetupOpenClaw(args: string[]) {
 
   const remove = args.includes("--remove");
   const linkMode = args.includes("--link");
+  const gatewayUser = (() => {
+    const eq = args.find((a) => a.startsWith("--gateway-user="));
+    if (eq) {
+      const v = eq.slice("--gateway-user=".length).trim();
+      if (!v) die("--gateway-user= needs a user name");
+      return v;
+    }
+    const i = args.indexOf("--gateway-user");
+    if (i < 0) return undefined;
+    const v = (args[i + 1] ?? "").trim();
+    if (!v || v.startsWith("-")) die("--gateway-user needs a user name (the account the OpenClaw gateway runs as)");
+    return v;
+  })();
   const pluginDir = pathResolve(import.meta.dir, "openclaw");
 
   // Resolve the extensions/clawmem path we would touch directly. Both Path 1
   // link-mode pre-cleanup and Path 3 direct-copy install need this. Path 1
   // copy-mode delegation does NOT use linkPath because OpenClaw's
   // `--force` install owns the destination resolution there.
+  // OPENCLAW_PROFILE is validated here, before any path is derived from it
+  // and before the CLI probe decides which path runs: the delegated
+  // `--profile` flag and the CLI-absent `.openclaw-<profile>` directory share
+  // one grammar, so a name with a separator or `..` stops setup on every
+  // path, --remove included, instead of escaping the intended state root.
+  openClawProfileOrDie();
   const extensionsDir = resolveExtensionsDirNoOpenClaw();
   const linkPath = pathResolve(extensionsDir, "clawmem");
 
@@ -2599,7 +2907,7 @@ async function cmdSetupOpenClaw(args: string[]) {
     let cliUninstallFailed = false;
     if (hasOpenClawCli) {
       const r = Bun.spawnSync(
-        ["openclaw", "plugins", "uninstall", "clawmem", "--force"],
+        openClawArgv(["plugins", "uninstall", "clawmem", "--force"]),
         { stdout: "inherit", stderr: "inherit" },
       );
       if (r.exitCode === 0) {
@@ -2650,14 +2958,14 @@ async function cmdSetupOpenClaw(args: string[]) {
     if (hasOpenClawCli) {
       const memSlot = readOpenClawConfigValue("plugins.slots.memory");
       if (memSlot === "clawmem") {
-        Bun.spawnSync(["openclaw", "config", "unset", "plugins.slots.memory"], { stdout: "inherit", stderr: "inherit" });
+        Bun.spawnSync(openClawArgv(["config", "unset", "plugins.slots.memory"]), { stdout: "inherit", stderr: "inherit" });
         console.log(`${c.green}Cleared memory slot (was clawmem)${c.reset}`);
       }
       // Reset the legacy context-engine slot if any pre-§14.3-migration install
       // left it pointing at clawmem.
       const ceSlot = readOpenClawConfigValue("plugins.slots.contextEngine");
       if (ceSlot === "clawmem") {
-        Bun.spawnSync(["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"], { stdout: "inherit", stderr: "inherit" });
+        Bun.spawnSync(openClawArgv(["config", "set", "plugins.slots.contextEngine", "legacy"]), { stdout: "inherit", stderr: "inherit" });
         console.log(`${c.green}Reset context engine slot to legacy (was clawmem)${c.reset}`);
       }
     } else if (removed) {
@@ -2680,100 +2988,221 @@ async function cmdSetupOpenClaw(args: string[]) {
 
   // §28.1 H1/H2: choose path. Path 1 = openclaw plugins install delegation;
   // Path 3 = direct-copy fallback honoring OPENCLAW_STATE_DIR.
+  const acceptCapabilitiesFlag = args.includes("--accept-capabilities") || args.includes("--yes") || args.includes("-y");
+  const keepStage = process.env.CLAWMEM_KEEP_STAGE === "1"; // test seam: leave the staged copy on disk
+  const binPath = findClawmemBinary();
   let delegated = false;
+  let ownershipVerified = false;
   if (hasOpenClawCli) {
     // Path 1: delegate to OpenClaw. Auto-enables, writes install records,
     // applies slot selection, refreshes registry.
+    const flags = detectOpenClawConsentFlag();
+
+    // Stage BEFORE consent: OpenClaw binds consent to the final staged
+    // bytes, so the operator must be shown what those bytes declare.
+    let staged: StagedPlugin | undefined;
+    let manifestForConsent: Record<string, unknown>;
     if (linkMode) {
-      // §28.1 H2 link-mode: OpenClaw rejects --force with --link, so we do
-      // manual stale cleanup before delegating to preserve idempotence.
-      try {
-        const { lstatSync, unlinkSync, rmSync } = await import("fs");
-        const stat = lstatSync(linkPath);
-        if (stat.isSymbolicLink()) {
-          unlinkSync(linkPath);
-          console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
-        } else if (stat.isDirectory()) {
-          rmSync(linkPath, { recursive: true });
-          console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
-        }
-      } catch (e: any) {
-        if (e.code !== "ENOENT") throw e;
+      manifestForConsent = JSON.parse(readFileSync(pathResolve(pluginDir, "openclaw.plugin.json"), "utf-8"));
+    } else {
+      staged = await stageOpenClawPluginCopy(pluginDir);
+      manifestForConsent = staged.manifest;
+    }
+    const cleanupStage = async () => {
+      if (!staged) return;
+      if (keepStage) { console.log(`${c.dim}CLAWMEM_KEEP_STAGE=1 — staged plugin copy left at ${staged.dir}${c.reset}`); return; }
+      const { rmSync } = await import("fs");
+      try { rmSync(staged.dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    };
+
+    // OpenClaw >= 2026.5 asks for explicit capability consent on every local
+    // install (link or copy). We never pass --accept-capabilities silently:
+    // the operator sees the list and confirms, by flag or interactively.
+    const consentArgs: string[] = [];
+    if (flags.acceptCapabilities) {
+      printOpenClawPluginCapabilities(manifestForConsent);
+      let accepted = acceptCapabilitiesFlag;
+      if (!accepted && process.stdin.isTTY) {
+        const answer = prompt("Accept these capabilities and install? [y/N]");
+        accepted = /^y(es)?$/i.test((answer ?? "").trim());
       }
-      const r = Bun.spawnSync(
-        ["openclaw", "plugins", "install", pluginDir, "-l"],
-        { stdout: "inherit", stderr: "inherit" },
-      );
+      if (!accepted) {
+        await cleanupStage();
+        die(
+          "This OpenClaw requires capability consent for plugin installs. Review the list above, then re-run:\n" +
+            "  clawmem setup openclaw --accept-capabilities" + (linkMode ? " --link" : ""),
+        );
+      }
+      consentArgs.push("--accept-capabilities");
+    }
+
+    let installedRoot: string;
+    let installedEntry: string;
+    if (linkMode) {
+      // Development path: OpenClaw loads the TypeScript source straight from
+      // this checkout (link mode is the only install path that permits a
+      // .ts entry on >= 2026.5.3). A stale symlink or directory at linkPath
+      // is moved aside, not deleted: reruns stay idempotent without --force
+      // (which some releases reject with --link) and a failed install leaves
+      // the previous plugin exactly where it was.
+      const aside = moveTargetAside(linkPath);
+      if (aside.kind === "symlink" || aside.kind === "directory") {
+        console.log(`${c.dim}Moved the existing ${aside.kind} at ${linkPath} aside for the duration of the install${c.reset}`);
+      }
+      const r = runOpenClaw(["plugins", "install", pluginDir, "-l", ...consentArgs]);
       if (r.exitCode !== 0) {
-        die(`openclaw plugins install -l failed (exit ${r.exitCode}); aborting setup`);
+        try {
+          aside.restore();
+        } catch (e) {
+          die(`openclaw plugins install -l failed (exit ${r.exitCode}) and ${e instanceof Error ? e.message : String(e)}; aborting setup`);
+        }
+        const putBack = aside.kind === "symlink" || aside.kind === "directory" ? `; the previous ${aside.kind} at ${linkPath} was put back` : "";
+        die(`openclaw plugins install -l failed (exit ${r.exitCode})${putBack}; aborting setup`);
       }
+      aside.discard();
+      installedRoot = pluginDir;
+      installedEntry = pathResolve(pluginDir, "index.ts");
       // OpenClaw's `plugins install -l` records the source path in
       // plugins.load.paths and persists a path install record (not a
       // filesystem symlink). The v2026.4.11 symlink-discovery skip does
       // NOT apply to this mode — discovery uses the load-path entry.
       console.log(`${c.green}Linked local plugin path via openclaw plugins install -l (profile-aware, auto-enabled)${c.reset}`);
       console.log(`${c.dim}  Source recorded in plugins.load.paths — edits to ${pluginDir} take effect on next gateway restart.${c.reset}`);
+      console.log(`${c.dim}  Link mode is the development path: the gateway executes whatever this checkout contains.${c.reset}`);
     } else {
-      // §28.1 H2 copy-mode: --force makes OpenClaw replace existing target,
-      // preserving idempotence across reruns.
-      const r = Bun.spawnSync(
-        ["openclaw", "plugins", "install", pluginDir, "--force"],
-        { stdout: "inherit", stderr: "inherit" },
-      );
+      // Production path: install a compiled copy (dist/index.js only), which
+      // OpenClaw >= 2026.5.3 requires from a copied plugin ("requires
+      // compiled runtime output") and older gateways load just as well.
+      // --force makes OpenClaw replace an existing install, preserving
+      // idempotence across reruns.
+      let r: { exitCode: number; output: string };
+      try {
+        r = runOpenClaw(["plugins", "install", staged!.dir, "--force", ...consentArgs]);
+      } finally {
+        await cleanupStage();
+      }
       if (r.exitCode !== 0) {
+        if (r.output.includes("compiled runtime output")) {
+          console.log(`${c.red}OpenClaw rejected the staged copy as source-only even though dist/index.js was bundled — this is a ClawMem packaging bug, please report it with the output above.${c.reset}`);
+        }
         die(`openclaw plugins install --force failed (exit ${r.exitCode}); aborting setup`);
       }
-      console.log(`${c.green}Installed plugin via openclaw plugins install --force (profile-aware, auto-enabled)${c.reset}`);
+      installedRoot = linkPath;
+      installedEntry = pathResolve(linkPath, "dist", "index.js");
+      console.log(`${c.green}Installed plugin via openclaw plugins install --force (compiled runtime entry, profile-aware, auto-enabled)${c.reset}`);
     }
     delegated = true;
+
+    // The install alone is not a working plugin on OpenClaw >= 2026.5:
+    // tools need the manifest contract (shipped), conversation hooks need
+    // the grant, the memory slot must name us, and the plugin must run the
+    // binary from THIS checkout rather than a search-path guess.
+    const cfgResult = applyOpenClawPluginConfig(binPath);
+    if (cfgResult.incomplete.length > 0) {
+      die(`Installed but configuration incomplete — OpenClaw will not run the plugin correctly until these are set: ${cfgResult.incomplete.join(", ")}`);
+    }
+    await warnOnLowOpenClawHookTimeoutPolicy();
+    // The authoritative installed location comes from OpenClaw's own install
+    // record. In link mode the root is the checkout we handed to `install -l`,
+    // known by construction; in copy mode only the record knows where OpenClaw
+    // put the files, and the resolver's guess is diagnostic at best.
+    const recorded = readOpenClawInstallPaths();
+    let rootIsAuthoritative = linkMode;
+    if (linkMode && recorded.sourcePath) { installedRoot = recorded.sourcePath; installedEntry = pathResolve(recorded.sourcePath, "index.ts"); }
+    if (!linkMode && recorded.installPath) { installedRoot = recorded.installPath; installedEntry = pathResolve(recorded.installPath, "dist", "index.js"); rootIsAuthoritative = true; }
+    if (!rootIsAuthoritative) {
+      console.log(`${c.yellow}openclaw plugins inspect clawmem --json named no install path; checking the inferred location ${installedRoot} as a diagnostic only, not as verification.${c.reset}`);
+      if (gatewayUser) {
+        die(`Installed but cannot verify for --gateway-user ${gatewayUser}: OpenClaw's install record did not name the installed path, so setup cannot confirm the gateway can load it. Run \`openclaw plugins inspect clawmem\` and check the ownership of the path it prints.`);
+      }
+    }
+    const own = await verifyOpenClawPluginOwnership({ root: installedRoot, entry: installedEntry, gatewayUser, binPath });
+    ownershipVerified = own.verified && rootIsAuthoritative;
+    if (gatewayUser && !own.verified) {
+      die(`Installed but unverified for --gateway-user ${gatewayUser}: fix the ownership above and re-run setup; the gateway will not load the plugin as it stands.`);
+    }
   } else {
     // Path 3: direct-copy fallback. Honors OPENCLAW_STATE_DIR via the
-    // resolveExtensionsDirNoOpenClaw helper. Profile awareness is limited
-    // to env vars (no manifest validation, no security scan, no install
-    // records) — surface that to the user.
+    // resolveExtensionsDirNoOpenClaw helper. No install record, no
+    // capability consent, no config writes — OpenClaw >= 2026.5 will not
+    // register the hooks or tools until those are done by hand (see the
+    // next-steps output).
     console.log(`${c.yellow}openclaw CLI not on PATH — using direct-copy install.${c.reset}`);
-    console.log(`${c.yellow}  Profile awareness limited to OPENCLAW_STATE_DIR / OPENCLAW_CONFIG_PATH${c.reset}`);
-    console.log(`${c.yellow}  env vars. Install OpenClaw to enable manifest validation, security${c.reset}`);
-    console.log(`${c.yellow}  scans, and full plugin lifecycle management.${c.reset}`);
+    console.log(`${c.yellow}  Profile awareness limited to the OPENCLAW_STATE_DIR / OPENCLAW_CONFIG_PATH /${c.reset}`);
+    console.log(`${c.yellow}  OPENCLAW_PROFILE env vars. Install OpenClaw to enable manifest validation, security${c.reset}`);
+    console.log(`${c.yellow}  scans, capability consent, and full plugin lifecycle management.${c.reset}`);
 
     // Create extensions directory.
     if (!existsSync(extensionsDir)) {
       mkdirSync(extensionsDir, { recursive: true });
     }
 
-    // Remove any stale install (symlink or directory) before re-installing.
+    // Build the replacement BEFORE touching the live install, then swap it
+    // into place with the old tree moved aside, so a failed build, copy or
+    // rename leaves the previous plugin exactly where it was.
+    const { lstatSync, rmSync, symlinkSync, cpSync } = await import("fs");
+    let newDir: string | undefined;
+    if (!linkMode) {
+      newDir = `${linkPath}.new-${process.pid}`;
+      rmSync(newDir, { recursive: true, force: true }); // a stale tree from an interrupted run
+      const staged = await stageOpenClawPluginCopy(pluginDir);
+      try {
+        cpSync(staged.dir, newDir, { recursive: true, dereference: true });
+      } catch (e) {
+        rmSync(newDir, { recursive: true, force: true }); // never leave a partial .new-* behind
+        throw e;
+      } finally {
+        if (!keepStage) { try { rmSync(staged.dir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+        else console.log(`${c.dim}CLAWMEM_KEEP_STAGE=1 — staged plugin copy left at ${staged.dir}${c.reset}`);
+      }
+    }
     // OpenClaw v2026.4.11+ discovery (discoverInDirectory in ids-*.js) uses
     // readdirSync({ withFileTypes: true }) where symlinks report
     // isDirectory() === false and get silently skipped, so copy mode is the
-    // default. The --link flag keeps symlink behavior for older OpenClaw
-    // versions or local development workflows where editing the live source
-    // should take effect without re-running setup.
-    try {
-      const { lstatSync, unlinkSync, rmSync } = await import("fs");
-      const stat = lstatSync(linkPath);
-      if (stat.isSymbolicLink()) {
-        unlinkSync(linkPath);
-        console.log(`${c.dim}Replaced stale symlink at ${linkPath}${c.reset}`);
-      } else if (stat.isDirectory()) {
-        rmSync(linkPath, { recursive: true });
-        console.log(`${c.dim}Replaced existing directory at ${linkPath}${c.reset}`);
-      } else {
+    // default; --link keeps symlink behavior for older OpenClaw versions.
+    if (linkMode) {
+      // The previous symlink or directory is moved aside and put back if the
+      // new link cannot be made; it is deleted only once the link exists.
+      const aside = moveTargetAside(linkPath);
+      if (aside.kind === "other") {
         die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
       }
-    } catch (e: any) {
-      if (e.code !== "ENOENT") throw e;
-    }
-
-    if (linkMode) {
-      const { symlinkSync } = await import("fs");
-      symlinkSync(pluginDir, linkPath);
-      console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir} (symlink)${c.reset}`);
+      if (aside.kind !== "none") console.log(`${c.dim}Moved the existing ${aside.kind} at ${linkPath} aside${c.reset}`);
+      try {
+        symlinkSync(pluginDir, linkPath);
+      } catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
+        try {
+          aside.restore();
+        } catch (re) {
+          die(`Could not create the symlink at ${linkPath} (${why}) and ${re instanceof Error ? re.message : String(re)}`);
+        }
+        die(`Could not create the symlink at ${linkPath} (${why})${aside.kind !== "none" ? `; the previous ${aside.kind} was put back` : ""}.`);
+      }
+      aside.discard();
+      console.log(`${c.green}Installed plugin: ${linkPath} → ${pluginDir} (symlink${aside.kind !== "none" ? `, previous ${aside.kind} replaced` : ""})${c.reset}`);
       console.log(`${c.yellow}  Warning: symlink mode. OpenClaw v2026.4.11+ discovery skips${c.reset}`);
       console.log(`${c.yellow}  symlinks silently. Re-run without --link on current releases.${c.reset}`);
     } else {
-      const { cpSync } = await import("fs");
-      cpSync(pluginDir, linkPath, { recursive: true, dereference: true });
-      console.log(`${c.green}Installed plugin: ${linkPath} (copied from ${pluginDir})${c.reset}`);
+      // Whatever sits at linkPath — a stale symlink or the previous directory
+      // — is parked by the swap and put back if the rename in fails; only a
+      // regular file is refused, before anything moves.
+      try {
+        const stat = lstatSync(linkPath);
+        if (!stat.isSymbolicLink() && !stat.isDirectory()) {
+          rmSync(newDir!, { recursive: true, force: true });
+          die(`${linkPath} exists but is not a symlink or directory. Remove it manually and re-run setup.`);
+        }
+      } catch (e: any) {
+        if (e.code !== "ENOENT") { rmSync(newDir!, { recursive: true, force: true }); throw e; }
+      }
+      const swapped = swapDirIntoPlace(newDir!, linkPath);
+      console.log(`${c.green}Installed plugin: ${linkPath} (compiled copy of ${pluginDir}${swapped.replaced ? `, previous ${swapped.previous} replaced` : ""})${c.reset}`);
+    }
+    const own = await verifyOpenClawPluginOwnership({ root: linkPath, entry: pathResolve(linkPath, linkMode ? "index.ts" : "dist/index.js"), gatewayUser, binPath });
+    ownershipVerified = own.verified;
+    if (gatewayUser && !own.verified) {
+      die(`Installed but unverified for --gateway-user ${gatewayUser}: fix the ownership above and re-run setup.`);
     }
   }
 
@@ -2797,7 +3226,7 @@ async function cmdSetupOpenClaw(args: string[]) {
       console.log(`  ${c.dim} LegacyContextEngine will handle compaction unless you install a${c.reset}`);
       console.log(`  ${c.dim} third-party context-engine plugin like hermes-lcm.)${c.reset}`);
       const migrate = Bun.spawnSync(
-        ["openclaw", "config", "set", "plugins.slots.contextEngine", "legacy"],
+        openClawArgv(["config", "set", "plugins.slots.contextEngine", "legacy"]),
         { stdout: "inherit", stderr: "inherit" },
       );
       if (migrate.exitCode === 0) {
@@ -2843,9 +3272,12 @@ async function cmdSetupOpenClaw(args: string[]) {
     console.log(`     ${c.cyan}clawmem serve &${c.reset}`);
   } else {
     // Path 3 — direct-copy install. User still needs to enable + restart.
-    console.log(`  1. Enable ClawMem as the active memory plugin:`);
+    console.log(`  1. Enable ClawMem as the active memory plugin and grant its hooks:`);
     console.log(`     ${c.cyan}openclaw plugins enable clawmem${c.reset}`);
-    console.log(`     ${c.dim}(Switches plugins.slots.memory to clawmem and disables memory-core if active.)${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.slots.memory clawmem${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.hooks.allowConversationAccess true${c.reset}`);
+    console.log(`     ${c.cyan}openclaw config set plugins.entries.clawmem.config.clawmemBin ${binPath}${c.reset}`);
+    console.log(`     ${c.dim}(Without the grant, OpenClaw >= 2026.4.23 blocks before_prompt_build and agent_end for non-bundled plugins.)${c.reset}`);
     console.log();
     console.log(`  2. Restart the gateway to apply:`);
     console.log(`     ${c.cyan}openclaw gateway restart${c.reset}`);
@@ -2877,6 +3309,10 @@ async function cmdSetupOpenClaw(args: string[]) {
   if (migrationApplied) {
     console.log();
     console.log(`${c.green}✓ Upgrade migration applied — restart OpenClaw to pick up the new plugin kind.${c.reset}`);
+  }
+  if (!ownershipVerified) {
+    console.log();
+    console.log(`${c.yellow}Plugin files installed but ownership NOT verified for the gateway's runtime user — see the notes above. OpenClaw refuses plugins owned by another user.${c.reset}`);
   }
 }
 

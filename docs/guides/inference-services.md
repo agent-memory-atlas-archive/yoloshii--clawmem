@@ -26,7 +26,7 @@ Three stacks, picked by hardware, license, and quality needs. This is the decisi
 
 ## Default stack — QMD native (any GPU or in-process)
 
-Total ~4 GB VRAM, or runs in-process via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort — fast with GPU acceleration, significantly slower CPU-only). All three auto-download on first use if no server is running.
+Total ~4 GB VRAM, or runs in-process via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort — fast with GPU acceleration, significantly slower CPU-only). All three auto-download on first use if no server is running. In-process Metal on Apple Silicon needs `node-llama-cpp` 3.20.0 or newer (bundled llama.cpp b10361): 3.15.1 (llama.cpp b7836) was observed to fail its Metal shader compile on macOS 26.6.2 with an M5 Pro and then ran without the GPU. See [troubleshooting](../troubleshooting.md#embedding--gpu).
 
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|

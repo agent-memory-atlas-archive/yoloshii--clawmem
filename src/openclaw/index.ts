@@ -43,7 +43,7 @@
  * top-of-file comment for the full rationale.
  */
 
-import { resolveClawMemBin } from "./shell.js";
+import { resolveClawMemBin, resolveHookBudgetMs, hostHookTimeoutMs } from "./shell.js";
 import type { ClawMemConfig } from "./shell.js";
 import { createTools } from "./tools.js";
 import {
@@ -97,6 +97,7 @@ const clawmemPlugin = {
     const pluginCfg = (api.pluginConfig || {}) as Record<string, unknown>;
     const profile = (pluginCfg.profile as string) || "balanced";
     const tokenBudget = (pluginCfg.tokenBudget as number) || PROFILE_BUDGETS[profile] || 800;
+    const hookBudgetMs = resolveHookBudgetMs(pluginCfg.hookBudgetMs);
 
     const cfg: ClawMemConfig = {
       clawmemBin: resolveClawMemBin(pluginCfg.clawmemBin as string | undefined),
@@ -104,7 +105,9 @@ const clawmemPlugin = {
       profile,
       enableTools: pluginCfg.enableTools !== false,
       servePort: (pluginCfg.servePort as number) || 7438,
+      hookBudgetMs,
       env: {
+        CLAWMEM_HOOK_BUDGET_MS: String(hookBudgetMs),
         ...(pluginCfg.gpuEmbed ? { CLAWMEM_EMBED_URL: pluginCfg.gpuEmbed as string } : {}),
         ...(pluginCfg.gpuLlm ? { CLAWMEM_LLM_URL: pluginCfg.gpuLlm as string } : {}),
         ...(pluginCfg.gpuLlmModel ? { CLAWMEM_LLM_MODEL: pluginCfg.gpuLlmModel as string } : {}),
@@ -133,8 +136,27 @@ const clawmemPlugin = {
 
     const logger = api.logger as Logger;
     logger.info(
-      `clawmem: plugin registered (kind=memory, bin=${cfg.clawmemBin}, profile=${profile}, budget=${tokenBudget})`,
+      `clawmem: plugin registered (kind=memory, bin=${cfg.clawmemBin}, profile=${profile}, budget=${tokenBudget}, hookBudgetMs=${hookBudgetMs})`,
     );
+
+    // profile=deep is built around query expansion (LLM) and cross-encoder
+    // reranking. Without endpoints for them the hook would load models
+    // in-process on every prompt (issue #28); from ClawMem v0.38 the hook
+    // instead degrades those legs to fused order inside its budget. Say so
+    // once, at registration, and name the knobs.
+    if (profile === "deep") {
+      const missing: string[] = [];
+      const degrades: string[] = [];
+      if (!pluginCfg.gpuLlm && !process.env.CLAWMEM_LLM_URL) { missing.push("gpuLlm / CLAWMEM_LLM_URL"); degrades.push("expansion"); }
+      if (!pluginCfg.gpuRerank && !process.env.CLAWMEM_RERANK_URL) { missing.push("gpuRerank / CLAWMEM_RERANK_URL"); degrades.push("rerank"); }
+      if (missing.length > 0) {
+        logger.warn(
+          `clawmem: profile=deep with no ${missing.join(" and no ")} configured — ` +
+            `${degrades.join(" and ")} degrade${degrades.length === 1 ? "s" : ""} to fused order inside the ${hookBudgetMs}ms hook budget; ` +
+            `set plugins.entries.clawmem.config.${degrades.length === 2 ? "gpuLlm / gpuRerank" : degrades[0] === "expansion" ? "gpuLlm" : "gpuRerank"} for the full deep path`,
+        );
+      }
+    }
 
     // ----- Register memory capability -----
     // ClawMem owns the memory slot for this agent. The runtime stub returns
@@ -169,7 +191,10 @@ const clawmemPlugin = {
       async (event: BeforePromptBuildEvent, ctx: BeforePromptBuildContext) => {
         return handleBeforePromptBuild(cfg, thresholdCfg, logger, event, ctx);
       },
-      { priority: 10 },
+      // timeoutMs sits HOST_TIMEOUT_MARGIN_MS above the child kill timeout so
+      // the plugin, not the host, is what ends a slow hook (fail-open with a
+      // logged reason instead of a host-side abort with none).
+      { priority: 10, timeoutMs: hostHookTimeoutMs(cfg) },
     );
 
     // ----- Plugin Hook: agent_end (FIRE-AND-FORGET in core) -----
