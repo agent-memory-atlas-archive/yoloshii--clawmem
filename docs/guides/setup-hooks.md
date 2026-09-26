@@ -114,6 +114,8 @@ To add them, append to the `SessionStart` array in the config above:
 
 All hooks use Claude Code's native `timeout` property (in seconds). Stop hooks use 30s to allow LLM inference to complete; other hooks use 5-8s.
 
+The `context-surfacing` host timeout is derived, not fixed (v0.38.0): `clawmem setup hooks` writes `timeout ≥ ceil((1.5s startup allowance + CLAWMEM_HOOK_BUDGET_MS) / 1000)` and pins the budget into the installed hook command's env prefix, so the installed hook always runs under the budget its timeout was sized for. An existing larger host timeout is preserved (never reduced). `clawmem doctor` verifies the inequality and shows red when the host would kill the hook before its internal deadlines can act.
+
 **Do not use shell `timeout` wrappers** (e.g., `timeout 10 clawmem hook ...`). When shell `timeout` kills a process, it exits with code 124 and no stderr, which Claude Code reports as "Stop hook error: Failed with non-blocking status code: No stderr output". The native `timeout` property is handled gracefully by Claude Code's hook runner.
 
 ## Deduplication
@@ -163,4 +165,4 @@ ClawMem's built-in hooks handle this automatically. This only applies to custom 
 
 ## Profile integration
 
-`context-surfacing` reads `CLAWMEM_PROFILE` to configure its token budget, max results, vector timeout, minimum score threshold, and deep escalation (query expansion + reranking on the `deep` profile). See [Tuning context-surfacing with profiles](../concepts/hooks-vs-mcp.md#tuning-context-surfacing-with-profiles).
+`context-surfacing` reads `CLAWMEM_PROFILE` to configure its token budget, max results, vector timeout, `factsTokens` sub-budget, and deep escalation (query expansion + reranking on the `deep` profile). Since v0.38.0 the keep/drop decision is the profile-independent relevance admission — the per-profile score thresholds are consulted only by the eval-only composite control arm (`CLAWMEM_ADMISSION_POLICY=composite`). See [Tuning context-surfacing with profiles](../concepts/hooks-vs-mcp.md#tuning-context-surfacing-with-profiles).

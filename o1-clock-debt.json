@@ -1,0 +1,2060 @@
+{
+  "generated": "2026-08-27T10:54:00.797Z",
+  "note": "O1 raw-clock debt across src/ and scripts/. Every entry samples a platform clock outside src/clock.ts and was classified A-E by a reader. The ratchet only tightens: --write refuses additions and only retires; nothing here is assigned by the tool. Activation requires ZERO entries.",
+  "counts": {
+    "TOTAL": 227,
+    "cat:A": 48,
+    "cat:B": 41,
+    "cat:C": 9,
+    "cat:D": 114,
+    "cat:E": 15,
+    "clock:Date.now": 114,
+    "clock:new Date()": 101,
+    "clock:performance.now": 12
+  },
+  "sites": [
+    {
+      "file": "scripts/eval-acceptance.ts",
+      "line": 134,
+      "clock": "new Date()",
+      "scope": "asOf",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "scripts/eval-acceptance.ts::asOf::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "scripts/eval-bypass-ab.ts",
+      "line": 177,
+      "clock": "new Date()",
+      "scope": "asOf",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "scripts/eval-bypass-ab.ts::asOf::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "scripts/eval-bypass-ab.ts",
+      "line": 197,
+      "clock": "performance.now",
+      "scope": "addCase.capture.t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "scripts/eval-bypass-ab.ts::addCase.capture.t0::performance.now::0ee5d327#0"
+    },
+    {
+      "file": "scripts/eval-bypass-ab.ts",
+      "line": 199,
+      "clock": "performance.now",
+      "scope": "addCase.capture.ms",
+      "expr": "performance.now() - t0",
+      "category": "B",
+      "id": "scripts/eval-bypass-ab.ts::addCase.capture.ms::performance.now::ea98ddfa#0"
+    },
+    {
+      "file": "scripts/eval-bypass-ab.ts",
+      "line": 389,
+      "clock": "performance.now",
+      "scope": "callArm.t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "scripts/eval-bypass-ab.ts::callArm.t0::performance.now::0ee5d327#0"
+    },
+    {
+      "file": "scripts/eval-bypass-ab.ts",
+      "line": 391,
+      "clock": "performance.now",
+      "scope": "callArm.ms",
+      "expr": "performance.now() - t0",
+      "category": "B",
+      "id": "scripts/eval-bypass-ab.ts::callArm.ms::performance.now::ea98ddfa#0"
+    },
+    {
+      "file": "scripts/eval-composite-ablation.ts",
+      "line": 199,
+      "clock": "new Date()",
+      "scope": "now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "scripts/eval-composite-ablation.ts::now::new Date()::21184a97#0"
+    },
+    {
+      "file": "scripts/eval-hook-stamp-baseline.ts",
+      "line": 196,
+      "clock": "new Date()",
+      "scope": "identity.attested",
+      "expr": "{ gold_fingerprint: goldFingerprint(scored), limit: report.limit, budget_ms: report.budget_ms, profiles: [...new Set(report.cases.map(c => c.profile))].sort(...",
+      "category": "D",
+      "id": "scripts/eval-hook-stamp-baseline.ts::identity.attested::new Date()::f78bf6d1#0"
+    },
+    {
+      "file": "scripts/eval-hook-stamp-baseline.ts",
+      "line": 199,
+      "clock": "new Date()",
+      "scope": "backup",
+      "expr": "`${runPath}.bak-${new Date().toISOString().replace(/[:.]/g, \"-\")}-prestamp`",
+      "category": "D",
+      "id": "scripts/eval-hook-stamp-baseline.ts::backup::new Date()::0c02fe7e#0"
+    },
+    {
+      "file": "scripts/eval-keyword-acceptance.ts",
+      "line": 179,
+      "clock": "new Date()",
+      "scope": "asOf",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "scripts/eval-keyword-acceptance.ts::asOf::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "scripts/eval-keyword-acceptance.ts",
+      "line": 360,
+      "clock": "performance.now",
+      "scope": "t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "scripts/eval-keyword-acceptance.ts::t0::performance.now::0ee5d327#0"
+    },
+    {
+      "file": "scripts/eval-keyword-acceptance.ts",
+      "line": 362,
+      "clock": "performance.now",
+      "scope": "<module>",
+      "expr": "s516ColdMs = performance.now() - t0",
+      "category": "B",
+      "id": "scripts/eval-keyword-acceptance.ts::<module>::performance.now::add1a8cc#0"
+    },
+    {
+      "file": "scripts/eval-keyword-acceptance.ts",
+      "line": 379,
+      "clock": "performance.now",
+      "scope": "t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "scripts/eval-keyword-acceptance.ts::t0::performance.now::0ee5d327#1"
+    },
+    {
+      "file": "scripts/eval-keyword-acceptance.ts",
+      "line": 381,
+      "clock": "performance.now",
+      "scope": "<module>",
+      "expr": "times.push(performance.now() - t0)",
+      "category": "B",
+      "id": "scripts/eval-keyword-acceptance.ts::<module>::performance.now::294df268#0"
+    },
+    {
+      "file": "src/amem.ts",
+      "line": 784,
+      "clock": "new Date()",
+      "scope": "generateMemoryLinks.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/amem.ts::generateMemoryLinks.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/beads.ts",
+      "line": 156,
+      "clock": "new Date()",
+      "scope": "normalizeBeadsIssue.created_at",
+      "expr": "{ id: raw.id, title: raw.title || \"\", description: raw.description, notes: raw.notes, status: raw.status || \"open\", priority: raw.priority ?? 2, issue_type: ...",
+      "category": "D",
+      "id": "src/beads.ts::normalizeBeadsIssue.created_at::new Date()::c6d06f4b#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 183,
+      "clock": "new Date()",
+      "scope": "insertCausalRun.row",
+      "expr": "db.prepare( `INSERT INTO causal_runs (run_key, session_id, source, mode, outcome, started_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`, ).get( input.runKey, i...",
+      "category": "D",
+      "id": "src/causal-writer.ts::insertCausalRun.row::new Date()::e7dc522f#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 204,
+      "clock": "new Date()",
+      "scope": "insertCausalEvent",
+      "expr": "db.prepare( `INSERT INTO causal_run_events ( run_id, scope, event_type, source_doc_id, target_doc_id, source_fact_ordinal, target_fact_ordinal, confidence, d...",
+      "category": "D",
+      "id": "src/causal-writer.ts::insertCausalEvent::new Date()::1868da69#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 254,
+      "clock": "new Date()",
+      "scope": "finalizeCausalRun",
+      "expr": "db.prepare( `UPDATE causal_runs SET outcome = ?, model = COALESCE(?, model), prompt_version = COALESCE(?, prompt_version), prompt_sha256 = COALESCE(?, prompt...",
+      "category": "D",
+      "id": "src/causal-writer.ts::finalizeCausalRun::new Date()::da420ded#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 255,
+      "clock": "Date.now",
+      "scope": "finalizeCausalRun",
+      "expr": "db.prepare( `UPDATE causal_runs SET outcome = ?, model = COALESCE(?, model), prompt_version = COALESCE(?, prompt_version), prompt_sha256 = COALESCE(?, prompt...",
+      "category": "B",
+      "id": "src/causal-writer.ts::finalizeCausalRun::Date.now::da420ded#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 276,
+      "clock": "new Date()",
+      "scope": "finalizeCliCausalRun",
+      "expr": "db.prepare( `UPDATE causal_runs SET outcome = ?, finished_at = ?, duration_ms = ? WHERE id = ?`, ).run(outcome, new Date().toISOString(), Date.now() - starte...",
+      "category": "D",
+      "id": "src/causal-writer.ts::finalizeCliCausalRun::new Date()::e701a0f5#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 276,
+      "clock": "Date.now",
+      "scope": "finalizeCliCausalRun",
+      "expr": "db.prepare( `UPDATE causal_runs SET outcome = ?, finished_at = ?, duration_ms = ? WHERE id = ?`, ).run(outcome, new Date().toISOString(), Date.now() - starte...",
+      "category": "B",
+      "id": "src/causal-writer.ts::finalizeCliCausalRun::Date.now::e701a0f5#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 518,
+      "clock": "Date.now",
+      "scope": "runCausalStep.startedAtMs",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/causal-writer.ts::runCausalStep.startedAtMs::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 678,
+      "clock": "Date.now",
+      "scope": "runCausalStep.remaining",
+      "expr": "opts.deadlineAt - Date.now() - PERSIST_RESERVE_MS",
+      "category": "C",
+      "id": "src/causal-writer.ts::runCausalStep.remaining::Date.now::54b47e12#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 860,
+      "clock": "new Date()",
+      "scope": "runCausalStep.writeGroup.nowIso",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/causal-writer.ts::runCausalStep.writeGroup.nowIso::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 1069,
+      "clock": "new Date()",
+      "scope": "buildResolutionManifest.generatedAt",
+      "expr": "{ version: CAUSAL_FINGERPRINT_VERSION, generatedAt: new Date().toISOString(), edges: entries.map(e => ({ sourceId: e.row.source_id, targetId: e.row.target_id...",
+      "category": "D",
+      "id": "src/causal-writer.ts::buildResolutionManifest.generatedAt::new Date()::e5204311#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 1148,
+      "clock": "new Date()",
+      "scope": "applyResolution.txn",
+      "expr": "db.prepare(INSERT_LEGACY_SIGHTING_SQL).run( edge.sourceId, edge.targetId, null, null, \"\", row.weight, opts.runKey, opts.runId, row.created_at ?? new Date().t...",
+      "category": "D",
+      "id": "src/causal-writer.ts::applyResolution.txn::new Date()::54207c5b#0"
+    },
+    {
+      "file": "src/causal-writer.ts",
+      "line": 1170,
+      "clock": "new Date()",
+      "scope": "applyResolution.txn",
+      "expr": "db.prepare( `INSERT INTO retired_causal_edges ( source_id, target_id, relation_type, weight, metadata, created_at, contradict_confidence, retired_at, retired...",
+      "category": "D",
+      "id": "src/causal-writer.ts::applyResolution.txn::new Date()::401efc32#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 471,
+      "clock": "Date.now",
+      "scope": "cmdMine.stagingDir",
+      "expr": "pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`)",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdMine.stagingDir::Date.now::cdde2f59#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 724,
+      "clock": "new Date()",
+      "scope": "cmdEmbed.finalizeCanary",
+      "expr": "await setTaint(`no preflight validation at ${new Date().toISOString()}`)",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEmbed.finalizeCanary::new Date()::9ab2363b#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 738,
+      "clock": "new Date()",
+      "scope": "cmdEmbed.finalizeCanary",
+      "expr": "await setTaint(`unverified end-of-run at ${new Date().toISOString()}`)",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEmbed.finalizeCanary::new Date()::d4297076#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 742,
+      "clock": "new Date()",
+      "scope": "cmdEmbed.finalizeCanary",
+      "expr": "await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${new Date().toISOString()}`)",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEmbed.finalizeCanary::new Date()::fd5a0051#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 862,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.batchStart",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.batchStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 909,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.docStart",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.docStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 946,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.elapsed",
+      "expr": "Date.now() - lastBatchSentAt",
+      "category": "A",
+      "id": "src/clawmem.ts::cmdEmbed.elapsed::Date.now::56bc6367#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 956,
+      "clock": "Date.now",
+      "scope": "cmdEmbed",
+      "expr": "lastBatchSentAt = Date.now()",
+      "category": "A",
+      "id": "src/clawmem.ts::cmdEmbed::Date.now::00dab78f#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 957,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.reqStart",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.reqStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 961,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.reqMs",
+      "expr": "Date.now() - reqStart",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.reqMs::Date.now::3064ac84#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 979,
+      "clock": "new Date()",
+      "scope": "cmdEmbed",
+      "expr": "s.insertEmbedding( hash, seq, frag.startLine, new Float32Array(result.embedding), result.model, new Date().toISOString(), frag.type, frag.label ?? undefined,...",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEmbed::new Date()::a47d3a78#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1007,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.fragStart",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.fragStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1009,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.fragMs",
+      "expr": "Date.now() - fragStart",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.fragMs::Date.now::eb99daf2#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1021,
+      "clock": "new Date()",
+      "scope": "cmdEmbed",
+      "expr": "s.insertEmbedding( hash, seq, frag.startLine, new Float32Array(result.embedding), result.model, new Date().toISOString(), frag.type, frag.label ?? undefined,...",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEmbed::new Date()::a47d3a78#1"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1059,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.docMs",
+      "expr": "Date.now() - docStart",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.docMs::Date.now::d18374e3#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1060,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.elapsed",
+      "expr": "((Date.now() - batchStart) / 1000).toFixed(0)",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.elapsed::Date.now::ace7e21e#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1064,
+      "clock": "Date.now",
+      "scope": "cmdEmbed.totalSec",
+      "expr": "((Date.now() - batchStart) / 1000).toFixed(1)",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdEmbed.totalSec::Date.now::4878e45d#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1494,
+      "clock": "new Date()",
+      "scope": "cmdEval.outDir",
+      "expr": "result = await runEval({ goldPath, profile: profile as EvalProfile, limit, minExamples, audited: values.audited, outDir: values.out ? pathResolve(values.out)...",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEval.outDir::new Date()::7bc462ee#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 1885,
+      "clock": "new Date()",
+      "scope": "cmdEvalHookRun.outDir",
+      "expr": "result = await runHookEval({ goldPath, store: s, limit, budgetMs, minExamples, audited: values.audited, profileOverride: values.profile as \"speed\" | \"balance...",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdEvalHookRun.outDir::new Date()::ba88d78e#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 2197,
+      "clock": "Date.now",
+      "scope": "cmdSurface.sessionId",
+      "expr": "input.trim() || `io6-${Date.now()}`",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdSurface.sessionId::Date.now::84e3ef99#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4211,
+      "clock": "Date.now",
+      "scope": "cmdMigrate.startedAtMs",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdMigrate.startedAtMs::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4308,
+      "clock": "Date.now",
+      "scope": "cmdMigrate.startedAtMs",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/clawmem.ts::cmdMigrate.startedAtMs::Date.now::d8171d11#1"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4570,
+      "clock": "new Date()",
+      "scope": "cmdReflect.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdReflect.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4768,
+      "clock": "new Date()",
+      "scope": "cmdDiary.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdDiary.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4845,
+      "clock": "new Date()",
+      "scope": "cmdCurate.report.timestamp",
+      "expr": "{ timestamp: new Date().toISOString(), health: { active: 0, archived: 0, forgotten: 0, pinned: 0, snoozed: 0, neverAccessed: 0, embeddingBacklog: 0, infrastr...",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdCurate.report.timestamp::new Date()::f859353b#0"
+    },
+    {
+      "file": "src/clawmem.ts",
+      "line": 4854,
+      "clock": "new Date()",
+      "scope": "cmdCurate",
+      "expr": "console.log(`${c.bold}ClawMem Curator${c.reset} \u2014 ${new Date().toISOString().slice(0, 10)}\\n`)",
+      "category": "D",
+      "id": "src/clawmem.ts::cmdCurate::new Date()::ddadcfb4#0"
+    },
+    {
+      "file": "src/consolidation.ts",
+      "line": 276,
+      "clock": "Date.now",
+      "scope": "stopConsolidationWorker.deadline",
+      "expr": "Date.now() + STOP_DRAIN_TIMEOUT_MS",
+      "category": "A",
+      "id": "src/consolidation.ts::stopConsolidationWorker.deadline::Date.now::e140c848#0"
+    },
+    {
+      "file": "src/consolidation.ts",
+      "line": 277,
+      "clock": "Date.now",
+      "scope": "stopConsolidationWorker",
+      "expr": "isRunning && Date.now() < deadline",
+      "category": "A",
+      "id": "src/consolidation.ts::stopConsolidationWorker::Date.now::fc0a04d8#0"
+    },
+    {
+      "file": "src/consolidation.ts",
+      "line": 1025,
+      "clock": "Date.now",
+      "scope": "updateTrends.now",
+      "expr": "Date.now()",
+      "category": "D",
+      "id": "src/consolidation.ts::updateTrends.now::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/consolidation.ts",
+      "line": 1168,
+      "clock": "new Date()",
+      "scope": "generateDeductiveObservations.timestamp",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/consolidation.ts::generateDeductiveObservations.timestamp::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/conversation-synthesis.ts",
+      "line": 636,
+      "clock": "new Date()",
+      "scope": "runConversationSynthesis",
+      "expr": "store.db .prepare( `INSERT INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(so...",
+      "category": "D",
+      "id": "src/conversation-synthesis.ts::runConversationSynthesis::new Date()::fe66bb85#0"
+    },
+    {
+      "file": "src/directory-context.ts",
+      "line": 166,
+      "clock": "new Date()",
+      "scope": "getDecisionsForDirectory.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/directory-context.ts::getDecisionsForDirectory.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/eval/hook-run.ts",
+      "line": 1433,
+      "clock": "new Date()",
+      "scope": "runHookEvalTransaction.createdAt",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/eval/hook-run.ts::runHookEvalTransaction.createdAt::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/eval/hook-run.ts",
+      "line": 1728,
+      "clock": "new Date()",
+      "scope": "runHookEvalTransaction.stamp",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/eval/hook-run.ts::runHookEvalTransaction.stamp::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/eval/hook-run.ts",
+      "line": 1917,
+      "clock": "Date.now",
+      "scope": "runHookEvalTransaction.scoreCase.nowMs",
+      "expr": "Date.now()",
+      "category": "D",
+      "id": "src/eval/hook-run.ts::runHookEvalTransaction.scoreCase.nowMs::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/eval/hook-run.ts",
+      "line": 1938,
+      "clock": "performance.now",
+      "scope": "runHookEvalTransaction.scoreCase.t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "src/eval/hook-run.ts::runHookEvalTransaction.scoreCase.t0::performance.now::0ee5d327#0"
+    },
+    {
+      "file": "src/eval/hook-run.ts",
+      "line": 1941,
+      "clock": "performance.now",
+      "scope": "runHookEvalTransaction.scoreCase",
+      "expr": "repElapsed.push(performance.now() - t0)",
+      "category": "B",
+      "id": "src/eval/hook-run.ts::runHookEvalTransaction.scoreCase::performance.now::297d0c33#0"
+    },
+    {
+      "file": "src/eval/hook-trace.ts",
+      "line": 460,
+      "clock": "new Date()",
+      "scope": "persistSurfacingTrace",
+      "expr": "db.prepare( `INSERT INTO surfacing_diagnostics (session_id, turn_index, created_at, trace_json) VALUES (?, ?, ?, ?)` ).run(sessionId ?? null, turnIndex ?? nu...",
+      "category": "D",
+      "id": "src/eval/hook-trace.ts::persistSurfacingTrace::new Date()::12044bc8#0"
+    },
+    {
+      "file": "src/eval/replay.ts",
+      "line": 71,
+      "clock": "performance.now",
+      "scope": "replayQueryExample.t0",
+      "expr": "performance.now()",
+      "category": "B",
+      "id": "src/eval/replay.ts::replayQueryExample.t0::performance.now::0ee5d327#0"
+    },
+    {
+      "file": "src/eval/replay.ts",
+      "line": 75,
+      "clock": "performance.now",
+      "scope": "replayQueryExample.elapsedMs",
+      "expr": "performance.now() - t0",
+      "category": "B",
+      "id": "src/eval/replay.ts::replayQueryExample.elapsedMs::performance.now::ea98ddfa#0"
+    },
+    {
+      "file": "src/eval/replicated.ts",
+      "line": 671,
+      "clock": "new Date()",
+      "scope": "aggregateReplicatedRuns.created_at",
+      "expr": "{ schema: \"replicated-aggregate-v1\", created_at: new Date().toISOString(), n: summaries.length, pilot, members: summaries, identity, treatment, pair_protocol...",
+      "category": "D",
+      "id": "src/eval/replicated.ts::aggregateReplicatedRuns.created_at::new Date()::9c2ffd70#0"
+    },
+    {
+      "file": "src/eval/run.ts",
+      "line": 92,
+      "clock": "new Date()",
+      "scope": "runEval.createdAt",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/eval/run.ts::runEval.createdAt::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/eval/vec-daemon-child.ts",
+      "line": 140,
+      "clock": "Date.now",
+      "scope": "spawnEvalVectorDaemon.t0",
+      "expr": "Date.now()",
+      "category": "C",
+      "id": "src/eval/vec-daemon-child.ts::spawnEvalVectorDaemon.t0::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/eval/vec-daemon-child.ts",
+      "line": 157,
+      "clock": "Date.now",
+      "scope": "spawnEvalVectorDaemon.next",
+      "expr": "await withDeadline(reader.read(), readyTimeoutMs - (Date.now() - t0))",
+      "category": "C",
+      "id": "src/eval/vec-daemon-child.ts::spawnEvalVectorDaemon.next::Date.now::e277f05b#0"
+    },
+    {
+      "file": "src/eval/vec-daemon-child.ts",
+      "line": 233,
+      "clock": "Date.now",
+      "scope": "spawnEvalVectorDaemon.readyMs",
+      "expr": "Date.now() - t0",
+      "category": "B",
+      "id": "src/eval/vec-daemon-child.ts::spawnEvalVectorDaemon.readyMs::Date.now::25298847#0"
+    },
+    {
+      "file": "src/hooks.ts",
+      "line": 218,
+      "clock": "new Date()",
+      "scope": "wasPromptSeenRecently.now",
+      "expr": "new Date()",
+      "category": "E",
+      "id": "src/hooks.ts::wasPromptSeenRecently.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks.ts",
+      "line": 433,
+      "clock": "new Date()",
+      "scope": "logInjection.usageId.timestamp",
+      "expr": "store.insertUsage({ sessionId, timestamp: new Date().toISOString(), hookName, injectedPaths, estimatedTokens, wasReferenced: 0, turnIndex, queryText, })",
+      "category": "D",
+      "id": "src/hooks.ts::logInjection.usageId.timestamp::new Date()::2240724d#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 240,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.traceT0",
+      "expr": "Date.now()",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.traceT0::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 252,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.finStamp",
+      "expr": "finStamps[label] = Date.now()",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.finStamp::Date.now::448f182c#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 257,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.finish",
+      "expr": "trace.timings.totalMs = Date.now() - traceT0",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.finish::Date.now::cace5ace#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 263,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.finish.emitAt",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.finish.emitAt::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 268,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.finish.emitAt",
+      "expr": "Date.now()",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.finish.emitAt::Date.now::d8171d11#1"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 501,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.recordVectorLegDeadline.over_ms",
+      "expr": "(trace.vectorLegDeadlines ??= []).push({ leg, over_ms: Date.now() - deadlineAbs, budget_ms: deadlineAbs - startedAt })",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.recordVectorLegDeadline.over_ms::Date.now::aa7d8a99#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 509,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.vectorT0",
+      "expr": "Date.now()",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.vectorT0::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 518,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.vectorDeadline",
+      "expr": "Math.min(Date.now() + profile.vectorTimeout, workDeadlineAt - CANDIDATE_FLOOR_RESERVE_MS) as LegacyWallDeadline",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.vectorDeadline::Date.now::ea9d2774#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 532,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.timeoutPromise",
+      "expr": "vectorTimer = setTimeout(() => reject(new Error(\"vector timeout\")), Math.max(1, vectorDeadline - Date.now()))",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.timeoutPromise::Date.now::4fa852eb#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 547,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "trace.timings.vectorMs = Date.now() - vectorT0",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::a8f67444#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 576,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "priorLegEnabled && Date.now() < workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::7844a97a#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 581,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "Date.now() >= workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::77e16986#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 601,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "profile.useVector && priorVectorAllowed && Date.now() < workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::fb2ac4c6#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 606,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.priorLegStart",
+      "expr": "Date.now()",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.priorLegStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 613,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.priorTimeoutPromise",
+      "expr": "priorTimer = setTimeout(() => reject(new Error(\"vector timeout\")), Math.max(1, priorDeadline - Date.now()))",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.priorTimeoutPromise::Date.now::9f07c4f5#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 632,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "surfaceSecondaryVaults() && getVaultPath(\"skill\") && Date.now() < workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::1eef0190#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 651,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "fileMatches.length > 0 && Date.now() < workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::45856a68#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 655,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "Date.now() >= workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::77e16986#1"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 685,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.elapsed",
+      "expr": "Date.now() - startTime",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.elapsed::Date.now::b74d70ac#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 688,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "elapsed < profile.escalationBudgetMs && Date.now() < workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::3d887cf6#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 696,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.expandRemaining",
+      "expr": "workDeadlineAt - Date.now()",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.expandRemaining::Date.now::d5e086e2#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 715,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "Date.now() >= workDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::77e16986#2"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 729,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.deepLegStart",
+      "expr": "Date.now()",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.deepLegStart::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 777,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "Date.now() < workDeadlineAt && results.length >= 3",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::df1426f7#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 856,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "trace.timings.escalationMs = Date.now() - startTime",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::30884216#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 867,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "escalationEndAt = Date.now()",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::742a0943#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 872,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "escalationEndAt = Date.now()",
+      "category": "B",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::742a0943#1"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 910,
+      "clock": "new Date()",
+      "scope": "contextSurfacing.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 1291,
+      "clock": "Date.now",
+      "scope": "contextSurfacing",
+      "expr": "Date.now() >= internalDeadlineAt",
+      "category": "A",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing::Date.now::7e55b325#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 1314,
+      "clock": "Date.now",
+      "scope": "contextSurfacing.jobId",
+      "expr": "setPendingSurfacingBookkeeping({ v: 1, kind: \"surfacing-bookkeeping\", jobId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString...",
+      "category": "D",
+      "id": "src/hooks/context-surfacing.ts::contextSurfacing.jobId::Date.now::a2148609#0"
+    },
+    {
+      "file": "src/hooks/context-surfacing.ts",
+      "line": 1645,
+      "clock": "Date.now",
+      "scope": "fetchRecentPriorQueries.cutoff",
+      "expr": "new Date(Date.now() - maxAgeMinutes * 60 * 1000).toISOString()",
+      "category": "D",
+      "id": "src/hooks/context-surfacing.ts::fetchRecentPriorQueries.cutoff::Date.now::7270fa3e#0"
+    },
+    {
+      "file": "src/hooks/curator-nudge.ts",
+      "line": 52,
+      "clock": "Date.now",
+      "scope": "curatorNudge.reportAge",
+      "expr": "Date.now() - new Date(report.timestamp).getTime()",
+      "category": "E",
+      "id": "src/hooks/curator-nudge.ts::curatorNudge.reportAge::Date.now::4bd52c76#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 115,
+      "clock": "Date.now",
+      "scope": "checkMergePolicy",
+      "expr": "deadlineMs !== undefined && Date.now() >= deadlineMs",
+      "category": "A",
+      "id": "src/hooks/decision-extractor.ts::checkMergePolicy::Date.now::f2107f2f#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 136,
+      "clock": "new Date()",
+      "scope": "checkMergePolicy.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/decision-extractor.ts::checkMergePolicy.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 875,
+      "clock": "Date.now",
+      "scope": "detectContradictions.remaining",
+      "expr": "deadlineAt - Date.now() - PERSIST_RESERVE_MS",
+      "category": "A",
+      "id": "src/hooks/decision-extractor.ts::detectContradictions.remaining::Date.now::9525eeb5#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 929,
+      "clock": "Date.now",
+      "scope": "detectContradictions.remaining",
+      "expr": "deadlineAt - Date.now() - PERSIST_RESERVE_MS",
+      "category": "A",
+      "id": "src/hooks/decision-extractor.ts::detectContradictions.remaining::Date.now::9525eeb5#1"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 1154,
+      "clock": "Date.now",
+      "scope": "decisionExtractor.sessionId",
+      "expr": "input.sessionId || `session-${Date.now()}`",
+      "category": "D",
+      "id": "src/hooks/decision-extractor.ts::decisionExtractor.sessionId::Date.now::9beb33d3#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 1169,
+      "clock": "Date.now",
+      "scope": "decisionExtractor.deadlineAt",
+      "expr": "Date.now() + stopBudget.budgetMs as LegacyWallDeadline",
+      "category": "A",
+      "id": "src/hooks/decision-extractor.ts::decisionExtractor.deadlineAt::Date.now::8c133174#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 1217,
+      "clock": "new Date()",
+      "scope": "decisionExtractor.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/decision-extractor.ts::decisionExtractor.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/decision-extractor.ts",
+      "line": 1224,
+      "clock": "Date.now",
+      "scope": "decisionExtractor.extractionRemaining",
+      "expr": "deadlineAt - Date.now() - PERSIST_RESERVE_MS",
+      "category": "A",
+      "id": "src/hooks/decision-extractor.ts::decisionExtractor.extractionRemaining::Date.now::9525eeb5#0"
+    },
+    {
+      "file": "src/hooks/feedback-loop.ts",
+      "line": 200,
+      "clock": "new Date()",
+      "scope": "trackUtilitySignals.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/hooks/feedback-loop.ts::trackUtilitySignals.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/hooks/handoff-generator.ts",
+      "line": 42,
+      "clock": "Date.now",
+      "scope": "handoffGenerator.sessionId",
+      "expr": "input.sessionId || `session-${Date.now()}`",
+      "category": "D",
+      "id": "src/hooks/handoff-generator.ts::handoffGenerator.sessionId::Date.now::9beb33d3#0"
+    },
+    {
+      "file": "src/hooks/handoff-generator.ts",
+      "line": 43,
+      "clock": "new Date()",
+      "scope": "handoffGenerator.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/handoff-generator.ts::handoffGenerator.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/postcompact-inject.ts",
+      "line": 96,
+      "clock": "new Date()",
+      "scope": "postcompactInject.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/postcompact-inject.ts::postcompactInject.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/postcompact-inject.ts",
+      "line": 130,
+      "clock": "new Date()",
+      "scope": "postcompactInject.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/postcompact-inject.ts::postcompactInject.cutoff::new Date()::21184a97#1"
+    },
+    {
+      "file": "src/hooks/postcompact-inject.ts",
+      "line": 216,
+      "clock": "new Date()",
+      "scope": "postcompactInject.timestamp",
+      "expr": "store.insertUsage({ sessionId: input.sessionId || \"unknown\", timestamp: new Date().toISOString(), hookName: \"postcompact-inject\", injectedPaths: [], estimate...",
+      "category": "D",
+      "id": "src/hooks/postcompact-inject.ts::postcompactInject.timestamp::new Date()::22225264#0"
+    },
+    {
+      "file": "src/hooks/precompact-extract.ts",
+      "line": 231,
+      "clock": "new Date()",
+      "scope": "precompactExtract.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/hooks/precompact-extract.ts::precompactExtract.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/hooks/session-bootstrap.ts",
+      "line": 45,
+      "clock": "Date.now",
+      "scope": "sessionBootstrap.sessionId",
+      "expr": "input.sessionId || `session-${Date.now()}`",
+      "category": "D",
+      "id": "src/hooks/session-bootstrap.ts::sessionBootstrap.sessionId::Date.now::9beb33d3#0"
+    },
+    {
+      "file": "src/hooks/session-bootstrap.ts",
+      "line": 46,
+      "clock": "new Date()",
+      "scope": "sessionBootstrap.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/hooks/session-bootstrap.ts::sessionBootstrap.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/hooks/session-bootstrap.ts",
+      "line": 259,
+      "clock": "new Date()",
+      "scope": "getCurrentFocus.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/session-bootstrap.ts::getCurrentFocus.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/session-bootstrap.ts",
+      "line": 271,
+      "clock": "Date.now",
+      "scope": "getCurrentFocus.now",
+      "expr": "Date.now()",
+      "category": "D",
+      "id": "src/hooks/session-bootstrap.ts::getCurrentFocus.now::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/hooks/session-bootstrap.ts",
+      "line": 367,
+      "clock": "new Date()",
+      "scope": "getStaleNotes.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/session-bootstrap.ts::getStaleNotes.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/staleness-check.ts",
+      "line": 34,
+      "clock": "new Date()",
+      "scope": "stalenessCheck.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/hooks/staleness-check.ts::stalenessCheck.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/hooks/surfacing-bookkeeping.ts",
+      "line": 277,
+      "clock": "new Date()",
+      "scope": "applySurfacingBookkeeping.vaultUsageId.timestamp",
+      "expr": "vaultStore.insertUsage({ dedupeKey: `${job.jobId}:${unit}:mirror`, sessionId: job.sessionId, timestamp: new Date().toISOString(), hookName: \"context-surfacin...",
+      "category": "D",
+      "id": "src/hooks/surfacing-bookkeeping.ts::applySurfacingBookkeeping.vaultUsageId.timestamp::new Date()::d80dc525#0"
+    },
+    {
+      "file": "src/hooks/surfacing-bookkeeping.ts",
+      "line": 316,
+      "clock": "Date.now",
+      "scope": "writeSurfacingBookkeepingSpoolJob.name",
+      "expr": "`${Date.now()}-${process.pid}-${spoolSeq++}.json`",
+      "category": "D",
+      "id": "src/hooks/surfacing-bookkeeping.ts::writeSurfacingBookkeepingSpoolJob.name::Date.now::1c5f4c4a#0"
+    },
+    {
+      "file": "src/hooks/surfacing-bookkeeping.ts",
+      "line": 373,
+      "clock": "Date.now",
+      "scope": "drainSurfacingBookkeepingSpool.now",
+      "expr": "opts?.now ?? Date.now()",
+      "category": "E",
+      "id": "src/hooks/surfacing-bookkeeping.ts::drainSurfacingBookkeepingSpool.now::Date.now::89e7d9f4#0"
+    },
+    {
+      "file": "src/indexer.ts",
+      "line": 291,
+      "clock": "new Date()",
+      "scope": "indexCollection.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/indexer.ts::indexCollection.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/intent.ts",
+      "line": 121,
+      "clock": "new Date()",
+      "scope": "extractTemporalConstraint.result",
+      "expr": "extractor(new Date(), match)",
+      "category": "D",
+      "id": "src/intent.ts::extractTemporalConstraint.result::new Date()::5f85f1c3#0"
+    },
+    {
+      "file": "src/intent.ts",
+      "line": 142,
+      "clock": "new Date()",
+      "scope": "classifyIntentHeuristic.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/intent.ts::classifyIntentHeuristic.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/intent.ts",
+      "line": 249,
+      "clock": "new Date()",
+      "scope": "cacheIntent",
+      "expr": "db.prepare(` INSERT OR REPLACE INTO intent_classifications ( query_hash, query_text, intent, confidence, temporal_start, temporal_end, cached_at ) VALUES (?,...",
+      "category": "D",
+      "id": "src/intent.ts::cacheIntent::new Date()::3dcdd326#0"
+    },
+    {
+      "file": "src/llm-retry.ts",
+      "line": 60,
+      "clock": "Date.now",
+      "scope": "withRetryAndFeedback.startTime",
+      "expr": "Date.now()",
+      "category": "C",
+      "id": "src/llm-retry.ts::withRetryAndFeedback.startTime::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/llm-retry.ts",
+      "line": 65,
+      "clock": "Date.now",
+      "scope": "withRetryAndFeedback.remaining",
+      "expr": "deadlineAt - Date.now()",
+      "category": "C",
+      "id": "src/llm-retry.ts::withRetryAndFeedback.remaining::Date.now::48a723f7#0"
+    },
+    {
+      "file": "src/llm-retry.ts",
+      "line": 130,
+      "clock": "Date.now",
+      "scope": "withRetryAndFeedback",
+      "expr": "console.warn( `[llm-retry] ${label}: exhausted after ${attemptsMade} attempt(s) / ${Date.now() - startTime}ms \u2014 failing open (last error: ${lastError.slice(0...",
+      "category": "B",
+      "id": "src/llm-retry.ts::withRetryAndFeedback::Date.now::25885a02#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 925,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.isRemoteLlmDown",
+      "expr": "Date.now() < this.remoteLlmDownUntil",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.isRemoteLlmDown::Date.now::edf0aa01#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 929,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.isRemoteEmbedDown",
+      "expr": "Date.now() < this.remoteEmbedDownUntil",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.isRemoteEmbedDown::Date.now::1e07af68#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 944,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.noteRemoteFallback.now",
+      "expr": "Date.now()",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.noteRemoteFallback.now::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 960,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.markRemoteLlmDown",
+      "expr": "this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.markRemoteLlmDown::Date.now::161a0b74#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 971,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.markRemoteEmbedDown",
+      "expr": "this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.markRemoteEmbedDown::Date.now::ccb9b9a7#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 1029,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.noteRemoteHttpError",
+      "expr": "this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.noteRemoteHttpError::Date.now::161a0b74#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 1033,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.noteRemoteHttpError",
+      "expr": "this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.noteRemoteHttpError::Date.now::ccb9b9a7#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 1159,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.parseRetryAfter",
+      "expr": "Math.max(0, date - Date.now())",
+      "category": "E",
+      "id": "src/llm.ts::LlamaCpp.parseRetryAfter::Date.now::07128ae5#0"
+    },
+    {
+      "file": "src/llm.ts",
+      "line": 1568,
+      "clock": "Date.now",
+      "scope": "LlamaCpp.expandQuery.expandSignal",
+      "expr": "deadlineAt !== undefined ? AbortSignal.timeout(Math.max(1, deadlineAt - Date.now())) : undefined",
+      "category": "C",
+      "id": "src/llm.ts::LlamaCpp.expandQuery.expandSignal::Date.now::82d4868c#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 153,
+      "clock": "new Date()",
+      "scope": "insertMaintenanceRun.startedAt",
+      "expr": "row.startedAt ?? new Date().toISOString()",
+      "category": "D",
+      "id": "src/maintenance.ts::insertMaintenanceRun.startedAt::new Date()::1e7b609a#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 211,
+      "clock": "new Date()",
+      "scope": "finalizeMaintenanceRun",
+      "expr": "store.db.prepare( `UPDATE maintenance_runs SET status = ?, reason = ?, selected_count = ?, processed_count = ?, created_count = ?, updated_count = ?, rejecte...",
+      "category": "D",
+      "id": "src/maintenance.ts::finalizeMaintenanceRun::new Date()::fdf92109#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 262,
+      "clock": "Date.now",
+      "scope": "countRecentContextUsages.cutoff",
+      "expr": "new Date(Date.now() - minutes * 60 * 1000).toISOString()",
+      "category": "D",
+      "id": "src/maintenance.ts::countRecentContextUsages.cutoff::Date.now::0e108e9b#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 376,
+      "clock": "new Date()",
+      "scope": "runHeavyMaintenanceTick.clock",
+      "expr": "new Date()",
+      "category": "E",
+      "id": "src/maintenance.ts::runHeavyMaintenanceTick.clock::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 387,
+      "clock": "new Date()",
+      "scope": "runHeavyMaintenanceTick.skippedId.finishedAt",
+      "expr": "insertMaintenanceRun(store, { lane: \"heavy\", phase: \"gate\", status: \"skipped\", reason: gate.reason ?? \"unknown\", finishedAt: new Date().toISOString(), })",
+      "category": "D",
+      "id": "src/maintenance.ts::runHeavyMaintenanceTick.skippedId.finishedAt::new Date()::b9444113#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 505,
+      "clock": "new Date()",
+      "scope": "runHeavyMaintenanceTick.skippedId.finishedAt",
+      "expr": "insertMaintenanceRun(store, { lane: \"heavy\", phase: \"gate\", status: \"skipped\", reason: \"lease_unavailable\", finishedAt: new Date().toISOString(), })",
+      "category": "D",
+      "id": "src/maintenance.ts::runHeavyMaintenanceTick.skippedId.finishedAt::new Date()::838b9daa#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 585,
+      "clock": "Date.now",
+      "scope": "startHeavyMaintenanceWorker.deadline",
+      "expr": "Date.now() + HEAVY_STOP_DRAIN_TIMEOUT_MS",
+      "category": "A",
+      "id": "src/maintenance.ts::startHeavyMaintenanceWorker.deadline::Date.now::d45f6631#0"
+    },
+    {
+      "file": "src/maintenance.ts",
+      "line": 586,
+      "clock": "Date.now",
+      "scope": "startHeavyMaintenanceWorker",
+      "expr": "heavyRunning && Date.now() < deadline",
+      "category": "A",
+      "id": "src/maintenance.ts::startHeavyMaintenanceWorker::Date.now::6210b33d#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 65,
+      "clock": "Date.now",
+      "scope": "onRerankFallback.now",
+      "expr": "Date.now()",
+      "category": "E",
+      "id": "src/mcp.ts::onRerankFallback.now::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 1130,
+      "clock": "new Date()",
+      "scope": "buildMcpServer.timestamp",
+      "expr": "s.insertUsage({ sessionId: \"mcp-forget\", timestamp: new Date().toISOString(), hookName: \"memory_forget\", injectedPaths: [best.displayPath], estimatedTokens: ...",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.timestamp::new Date()::00d603b3#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 1474,
+      "clock": "new Date()",
+      "scope": "buildMcpServer.staleCount",
+      "expr": "store.db.prepare( `SELECT COUNT(*) as count FROM documents WHERE active = 1 AND review_by IS NOT NULL AND review_by <= ?` ).get(new Date().toISOString()) as ...",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.staleCount::new Date()::882385e8#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 1561,
+      "clock": "Date.now",
+      "scope": "buildMcpServer.nowMs",
+      "expr": "Date.now()",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.nowMs::Date.now::d8171d11#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 2575,
+      "clock": "new Date()",
+      "scope": "buildMcpServer.timestamp",
+      "expr": "s.insertUsage({ sessionId: \"mcp-pin\", timestamp: new Date().toISOString(), hookName: \"memory_pin\", injectedPaths: [r.displayPath], estimatedTokens: 0, wasRef...",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.timestamp::new Date()::29e01dde#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 2624,
+      "clock": "new Date()",
+      "scope": "buildMcpServer.timestamp",
+      "expr": "s.insertUsage({ sessionId: \"mcp-snooze\", timestamp: new Date().toISOString(), hookName: \"memory_snooze\", injectedPaths: [r.displayPath], estimatedTokens: 0, ...",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.timestamp::new Date()::dad65073#0"
+    },
+    {
+      "file": "src/mcp.ts",
+      "line": 2902,
+      "clock": "new Date()",
+      "scope": "buildMcpServer.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/mcp.ts::buildMcpServer.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/memory.ts",
+      "line": 105,
+      "clock": "new Date()",
+      "scope": "effectiveHalfLife",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/memory.ts::effectiveHalfLife::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/memory.ts",
+      "line": 125,
+      "clock": "new Date()",
+      "scope": "recencyScore",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/memory.ts::recencyScore::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/memory.ts",
+      "line": 150,
+      "clock": "new Date()",
+      "scope": "confidenceScore",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/memory.ts::confidenceScore::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/memory.ts",
+      "line": 371,
+      "clock": "new Date()",
+      "scope": "applyCompositeScoring.now",
+      "expr": "options?.now ?? new Date()",
+      "category": "D",
+      "id": "src/memory.ts::applyCompositeScoring.now::new Date()::f655a722#0"
+    },
+    {
+      "file": "src/profile.ts",
+      "line": 125,
+      "clock": "new Date()",
+      "scope": "buildDynamicProfile.cutoff",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/profile.ts::buildDynamicProfile.cutoff::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/profile.ts",
+      "line": 170,
+      "clock": "new Date()",
+      "scope": "updateProfile.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/profile.ts::updateProfile.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/server.ts",
+      "line": 490,
+      "clock": "Date.now",
+      "scope": "handleSnooze.until",
+      "expr": "body?.unsnooze ? null : (body?.until ?? new Date(Date.now() + 30 * 86400000).toISOString())",
+      "category": "D",
+      "id": "src/server.ts::handleSnooze.until::Date.now::63536a28#0"
+    },
+    {
+      "file": "src/server.ts",
+      "line": 569,
+      "clock": "new Date()",
+      "scope": "handleExport.exported_at",
+      "expr": "jsonResponse({ version: \"1.0.0\", exported_at: new Date().toISOString(), count: docs.length, documents: docs, })",
+      "category": "D",
+      "id": "src/server.ts::handleExport.exported_at::new Date()::002dd3bf#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 1930,
+      "clock": "new Date()",
+      "scope": "createStore.saveCanaryBaseline.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.saveCanaryBaseline.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 1957,
+      "clock": "new Date()",
+      "scope": "createStore.setVaultFlag",
+      "expr": "db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(flag, value, new Date().toISOString())",
+      "category": "D",
+      "id": "src/store.ts::createStore.setVaultFlag::new Date()::23c70349#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2061,
+      "clock": "new Date()",
+      "scope": "createStore.addTriple.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.addTriple.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2103,
+      "clock": "new Date()",
+      "scope": "createStore.invalidateTriple.ended",
+      "expr": "endedDate || new Date().toISOString().slice(0, 10)",
+      "category": "D",
+      "id": "src/store.ts::createStore.invalidateTriple.ended::new Date()::ad12c93b#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2208,
+      "clock": "new Date()",
+      "scope": "createStore.insertRecallEvents.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.insertRecallEvents.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2264,
+      "clock": "new Date()",
+      "scope": "createStore.recomputeRecallStats.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.recomputeRecallStats.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2365,
+      "clock": "new Date()",
+      "scope": "createStore.recordCoActivation.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.recordCoActivation.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2413,
+      "clock": "new Date()",
+      "scope": "createStore.insertRelation",
+      "expr": "db.prepare(` INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_id, target_id, ...",
+      "category": "D",
+      "id": "src/store.ts::createStore.insertRelation::new Date()::72c300cf#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2426,
+      "clock": "new Date()",
+      "scope": "createStore.archiveDocuments.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::createStore.archiveDocuments.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2708,
+      "clock": "Date.now",
+      "scope": "getIndexHealth",
+      "expr": "daysStale = Math.floor((Date.now() - lastUpdate.getTime()) / (24 * 60 * 60 * 1000))",
+      "category": "D",
+      "id": "src/store.ts::getIndexHealth::Date.now::9cb5c4d9#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2731,
+      "clock": "new Date()",
+      "scope": "setCachedResult.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::setCachedResult.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 2984,
+      "clock": "new Date()",
+      "scope": "saveMemory.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::saveMemory.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 4246,
+      "clock": "Date.now",
+      "scope": "searchVecMatch",
+      "expr": "deadlineMs !== undefined && Date.now() >= deadlineMs",
+      "category": "A",
+      "id": "src/store.ts::searchVecMatch::Date.now::f2107f2f#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 4732,
+      "clock": "Date.now",
+      "scope": "searchVecDetailedWithVector.done",
+      "expr": "!filteringActive || classified.allowedDocs >= limit || k >= effectiveCap || raw.length < k || // MATCH returned fewer than requested: table exhausted below k...",
+      "category": "A",
+      "id": "src/store.ts::searchVecDetailedWithVector.done::Date.now::2fad5fdd#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 4779,
+      "clock": "Date.now",
+      "scope": "searchVecDetailed",
+      "expr": "opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs",
+      "category": "A",
+      "id": "src/store.ts::searchVecDetailed::Date.now::b350145d#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 4804,
+      "clock": "Date.now",
+      "scope": "getEmbedding.remaining",
+      "expr": "deadlineMs - Date.now()",
+      "category": "A",
+      "id": "src/store.ts::getEmbedding.remaining::Date.now::2aa3647f#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5026,
+      "clock": "Date.now",
+      "scope": "expandQuery",
+      "expr": "opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt",
+      "category": "A",
+      "id": "src/store.ts::expandQuery::Date.now::c2f311f9#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5057,
+      "clock": "Date.now",
+      "scope": "expandQuery",
+      "expr": "opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt",
+      "category": "A",
+      "id": "src/store.ts::expandQuery::Date.now::c2f311f9#1"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5174,
+      "clock": "Date.now",
+      "scope": "rerankIdentityState.age",
+      "expr": "Date.now() - new Date(raw.updated_at).getTime()",
+      "category": "D",
+      "id": "src/store.ts::rerankIdentityState.age::Date.now::b8264f8e#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5219,
+      "clock": "new Date()",
+      "scope": "bumpRerankProviderGeneration",
+      "expr": "db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`) .run(rerankGenerationFlag(url), String(next), new Date().toISOStr...",
+      "category": "D",
+      "id": "src/store.ts::bumpRerankProviderGeneration::new Date()::ce3ee8a1#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5254,
+      "clock": "Date.now",
+      "scope": "readRerankProviderFingerprint.age",
+      "expr": "Date.now() - new Date(row!.updated_at).getTime()",
+      "category": "D",
+      "id": "src/store.ts::readRerankProviderFingerprint.age::Date.now::6aeb6b59#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5277,
+      "clock": "new Date()",
+      "scope": "writeRerankProviderFingerprint.apply",
+      "expr": "db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`) .run(rerankProviderFlag(url), fingerprint, new Date().toISOString())",
+      "category": "D",
+      "id": "src/store.ts::writeRerankProviderFingerprint.apply::new Date()::7ed0badf#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5296,
+      "clock": "new Date()",
+      "scope": "revokeRerankProviderFingerprint.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::revokeRerankProviderFingerprint.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5416,
+      "clock": "Date.now",
+      "scope": "rerank.timeoutDeadlineAt",
+      "expr": "options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs as LegacyWallDeadline /* O1-DEBT-0005 */ : undefined",
+      "category": "A",
+      "id": "src/store.ts::rerank.timeoutDeadlineAt::Date.now::7921df74#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5434,
+      "clock": "Date.now",
+      "scope": "rerank.batchSignal",
+      "expr": "AbortSignal.timeout(Math.max(1, effectiveDeadlineAt - Date.now()))",
+      "category": "C",
+      "id": "src/store.ts::rerank.batchSignal::Date.now::f9360969#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5521,
+      "clock": "Date.now",
+      "scope": "rerank",
+      "expr": "effectiveDeadlineAt !== undefined && Date.now() >= effectiveDeadlineAt",
+      "category": "A",
+      "id": "src/store.ts::rerank::Date.now::e05a5215#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 5980,
+      "clock": "new Date()",
+      "scope": "getStatus.collections.lastUpdated",
+      "expr": "{ name: col.name, path: col.path, pattern: col.pattern, documents: stats.active_count, lastUpdated: stats.last_doc_update || new Date().toISOString(), }",
+      "category": "D",
+      "id": "src/store.ts::getStatus.collections.lastUpdated::new Date()::3d4cca26#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6288,
+      "clock": "new Date()",
+      "scope": "incrementAccessCountFn.now",
+      "expr": "new Date().toISOString()",
+      "category": "D",
+      "id": "src/store.ts::incrementAccessCountFn.now::new Date()::c3b9a005#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6388,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "insertContent(db, hash, docBody, new Date().toISOString())",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::20748623#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6390,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "db.prepare(`UPDATE documents SET hash = ?, modified_at = ? WHERE id = ?`) .run(hash, new Date().toISOString(), existingDoc.id)",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::150077d9#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6401,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "db.prepare(` UPDATE beads_issues SET status = ?, priority = ?, assignee = ?, last_synced_at = ? WHERE beads_id = ? `).run( issue.status, issue.priority, issu...",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::6e26255e#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6431,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "db.prepare(` INSERT INTO beads_issues ( beads_id, doc_id, issue_type, status, priority, tags, assignee, parent_id, created_at, closed_at, last_synced_at ) VA...",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::eced9401#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6446,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "db.prepare(` INSERT OR IGNORE INTO beads_dependencies (source_id, target_id, dep_type, created_at) VALUES (?, ?, ?, ?) `).run(dep.issue_id, dep.depends_on_id...",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::d78a0e40#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6487,
+      "clock": "new Date()",
+      "scope": "syncBeadsIssues",
+      "expr": "db.prepare(` INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, metadata, created_at) VALUES (?, ?, ?, 1.0, ?, ?) `).run( s...",
+      "category": "D",
+      "id": "src/store.ts::syncBeadsIssues::new Date()::9e66bf64#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6549,
+      "clock": "new Date()",
+      "scope": "buildTemporalBackbone",
+      "expr": "edges += db.prepare(` INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at) VALUES (?, ?, 'temporal', 1.0, ?) `).r...",
+      "category": "D",
+      "id": "src/store.ts::buildTemporalBackbone::new Date()::9e52156a#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 6600,
+      "clock": "new Date()",
+      "scope": "buildSemanticGraph",
+      "expr": "edges += db.prepare(` INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at) VALUES (?, ?, 'semantic', ?, ?) `).run...",
+      "category": "D",
+      "id": "src/store.ts::buildSemanticGraph::new Date()::e0376b9d#0"
+    },
+    {
+      "file": "src/store.ts",
+      "line": 7049,
+      "clock": "new Date()",
+      "scope": "getArchiveCandidatesFn.now",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/store.ts::getArchiveCandidatesFn.now::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/vault-facts.ts",
+      "line": 449,
+      "clock": "new Date()",
+      "scope": "buildVaultFactsBlock.now",
+      "expr": "options.now ?? new Date().toISOString()",
+      "category": "D",
+      "id": "src/vault-facts.ts::buildVaultFactsBlock.now::new Date()::157efbb1#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 155,
+      "clock": "Date.now",
+      "scope": "testSyncScanDelay.until",
+      "expr": "Date.now() + ms",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncScanDelay.until::Date.now::8f639708#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 156,
+      "clock": "Date.now",
+      "scope": "testSyncScanDelay",
+      "expr": "Date.now() < until",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncScanDelay::Date.now::1ce0a122#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 172,
+      "clock": "Date.now",
+      "scope": "testSyncHydrateDelay.until",
+      "expr": "Date.now() + ms",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncHydrateDelay.until::Date.now::8f639708#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 173,
+      "clock": "Date.now",
+      "scope": "testSyncHydrateDelay",
+      "expr": "Date.now() < until",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncHydrateDelay::Date.now::1ce0a122#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 189,
+      "clock": "Date.now",
+      "scope": "testSyncEntryDecodeDelay.until",
+      "expr": "Date.now() + ms",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncEntryDecodeDelay.until::Date.now::8f639708#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 190,
+      "clock": "Date.now",
+      "scope": "testSyncEntryDecodeDelay",
+      "expr": "Date.now() < until",
+      "category": "A",
+      "id": "src/vector-daemon.ts::testSyncEntryDecodeDelay::Date.now::1ce0a122#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 404,
+      "clock": "Date.now",
+      "scope": "startVectorDaemon.handleRequest",
+      "expr": "req.deadlineMs !== undefined && Date.now() >= req.deadlineMs",
+      "category": "A",
+      "id": "src/vector-daemon.ts::startVectorDaemon.handleRequest::Date.now::b3d788b6#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 421,
+      "clock": "Date.now",
+      "scope": "startVectorDaemon.handleRequest",
+      "expr": "req.deadlineMs !== undefined && Date.now() >= req.deadlineMs",
+      "category": "A",
+      "id": "src/vector-daemon.ts::startVectorDaemon.handleRequest::Date.now::b3d788b6#1"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 579,
+      "clock": "Date.now",
+      "scope": "daemonVecMatch.pump",
+      "expr": "deadlineAbs !== undefined && Date.now() >= deadlineAbs",
+      "category": "A",
+      "id": "src/vector-daemon.ts::daemonVecMatch.pump::Date.now::fe6c47eb#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 586,
+      "clock": "Date.now",
+      "scope": "daemonVecMatch.pump",
+      "expr": "deadlineAbs !== undefined && Date.now() >= deadlineAbs",
+      "category": "A",
+      "id": "src/vector-daemon.ts::daemonVecMatch.pump::Date.now::fe6c47eb#1"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 816,
+      "clock": "Date.now",
+      "scope": "searchVecBounded.startedAt",
+      "expr": "VEC_TIMING ? Date.now() : 0",
+      "category": "B",
+      "id": "src/vector-daemon.ts::searchVecBounded.startedAt::Date.now::88098776#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 817,
+      "clock": "Date.now",
+      "scope": "searchVecBounded.ipcTimeoutMs",
+      "expr": "deadlineMs !== undefined ? deadlineMs - Date.now() : DEFAULT_IPC_TIMEOUT_MS",
+      "category": "C",
+      "id": "src/vector-daemon.ts::searchVecBounded.ipcTimeoutMs::Date.now::c0a184ec#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 854,
+      "clock": "Date.now",
+      "scope": "searchVecBounded",
+      "expr": "console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : \"\"} elapsedMs=${Date.now() - startedAt} results=${results.length}`)",
+      "category": "B",
+      "id": "src/vector-daemon.ts::searchVecBounded::Date.now::76bebc83#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 887,
+      "clock": "Date.now",
+      "scope": "searchVecDaemonRequired.startedAt",
+      "expr": "VEC_TIMING ? Date.now() : 0",
+      "category": "B",
+      "id": "src/vector-daemon.ts::searchVecDaemonRequired.startedAt::Date.now::88098776#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 888,
+      "clock": "Date.now",
+      "scope": "searchVecDaemonRequired.ipcTimeoutMs",
+      "expr": "deadlineMs !== undefined ? deadlineMs - Date.now() : DEFAULT_IPC_TIMEOUT_MS",
+      "category": "C",
+      "id": "src/vector-daemon.ts::searchVecDaemonRequired.ipcTimeoutMs::Date.now::c0a184ec#0"
+    },
+    {
+      "file": "src/vector-daemon.ts",
+      "line": 909,
+      "clock": "Date.now",
+      "scope": "searchVecDaemonRequired",
+      "expr": "console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : \"\"} (daemon-required) elapsedMs=${Date.now() - startedAt} results=${res...",
+      "category": "B",
+      "id": "src/vector-daemon.ts::searchVecDaemonRequired::Date.now::388196d3#0"
+    },
+    {
+      "file": "src/worker-lease.ts",
+      "line": 30,
+      "clock": "new Date()",
+      "scope": "nowIso",
+      "expr": "new Date()",
+      "category": "D",
+      "id": "src/worker-lease.ts::nowIso::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/worker-lease.ts",
+      "line": 59,
+      "clock": "new Date()",
+      "scope": "acquireWorkerLease",
+      "expr": "new Date()",
+      "category": "E",
+      "id": "src/worker-lease.ts::acquireWorkerLease::new Date()::21184a97#0"
+    },
+    {
+      "file": "src/worker-lease.ts",
+      "line": 132,
+      "clock": "new Date()",
+      "scope": "renewWorkerLease",
+      "expr": "new Date()",
+      "category": "E",
+      "id": "src/worker-lease.ts::renewWorkerLease::new Date()::21184a97#0"
+    }
+  ]
+}

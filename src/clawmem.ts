@@ -4,7 +4,8 @@
  */
 
 import { parseArgs } from "util";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, mkdtempSync, cpSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
@@ -30,7 +31,7 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
-import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
+import { startVectorDaemon, vectorDaemonHealth, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
@@ -59,6 +60,9 @@ import {
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
 import { GoldFileError } from "./eval/gold.ts";
+import { runHookEval, HookEvalIntegrityError, PAIR_TREATMENTS, type RunHookEvalResult, type PairTreatment, type VectorExecSpec } from "./eval/hook-run.ts";
+import { aggregateReplicatedRunDirs, writeReplicatedArtifacts, type ReplicatedAggregate } from "./eval/replicated.ts";
+import { HookGoldFileError } from "./eval/hook-gold.ts";
 import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
@@ -77,6 +81,7 @@ import {
   startHeavyMaintenanceWorker,
 } from "./maintenance.ts";
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
+import { consumePendingSurfacingBookkeeping, writeSurfacingBookkeepingSpoolJob, drainSurfacingBookkeepingSpool, validateSurfacingBookkeepingJob, serializeSurfacingBookkeepingJob, SPOOL_JOB_MAX_BYTES } from "./hooks/surfacing-bookkeeping.ts";
 import { contextSurfacing } from "./hooks/context-surfacing.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
 import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
@@ -1430,8 +1435,12 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 // =============================================================================
 
 async function cmdEval(args: string[]) {
-  const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]";
+  const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]\n" +
+    "       clawmem eval hook-run --gold <hook-cases.jsonl> --db <snapshot> [--limit N] [--budget-ms N] [--min-examples N] [--audited] [--profile speed|balanced|deep] [--skill-db <snapshot>] [--baseline <hook-run.json>] [--capture-expansions <draw.json>|--replay-expansions <draw.json>] [--pair-with <run-dir> --pair-min-valid N [--pair-max-retries N] [--pair-require-ids a,b] [--pair-min-valid-stratum deep=8] [--pair-min-exposed-stratum deep=6] [--pair-min-basis-stratum speed:bm25-rrf=3] [--pair-treatment rerank_lane_weight|degeneracy_gate|admission_policy]] [--vector-exec daemon-required|in-process] [--vector-prewarm steady-state|cold] [--vector-daemon-ready-timeout-ms N] [--out <dir>] [--json]\n" +
+    "       clawmem eval hook-aggregate --runs <run-dir1,run-dir2,...> [--out <dir>] [--json]   (replicated-distribution aggregate over frozen-draw member runs of ONE arm)";
   const sub = args[0];
+  if (sub === "hook-run") { await cmdEvalHookRun(args.slice(1), usage); return; }
+  if (sub === "hook-aggregate") { cmdEvalHookAggregate(args.slice(1), usage); return; }
   if (sub !== "run") die(usage);
 
   const { values } = parseArgs({
@@ -1516,6 +1525,445 @@ async function cmdEval(args: string[]) {
   if (!report.gates.pass) process.exitCode = 1;
 }
 
+/**
+ * `clawmem eval hook-aggregate` — replicated-distribution aggregate (BUILD-3d)
+ * over n frozen-draw member runs of ONE arm. Pure read-and-combine: no store,
+ * no snapshot, no env mutation — each member dir's hook-run.json is parsed
+ * with the same validation a --baseline gets. Structural impossibilities
+ * (non-frozen members, duplicate draws, identity mismatch, mixed protocols)
+ * REFUSE; member trust/acceptance failures produce a FAILING aggregate with
+ * the artifact still written (evidence preserved), exit 1.
+ */
+function cmdEvalHookAggregate(args: string[], usage: string) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      runs: { type: "string" },
+      out: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  if (!values.runs) die(usage);
+  const dirs = values.runs.split(",").map(s => s.trim()).filter(Boolean).map(d => pathResolve(d));
+  if (dirs.length < 2) die("--runs needs at least 2 member run directories (a replicated distribution is n >= 2 independent draws)");
+  for (const d of dirs) {
+    if (!existsSync(d) || !statSync(d).isDirectory()) die(`--runs entry is not a run directory: ${d}`);
+    if (!existsSync(pathResolve(d, "hook-run.json"))) die(`--runs entry has no hook-run.json: ${d}`);
+  }
+  let agg: ReplicatedAggregate;
+  try {
+    agg = aggregateReplicatedRunDirs(dirs);
+  } catch (e) {
+    if (e instanceof HookEvalIntegrityError) die(e.message);
+    throw e;
+  }
+  if (values.out) {
+    const { jsonPath, mdPath } = writeReplicatedArtifacts(agg, pathResolve(values.out));
+    if (!values.json) {
+      console.log(`${c.dim}wrote ${jsonPath}${c.reset}`);
+      console.log(`${c.dim}wrote ${mdPath}${c.reset}`);
+    }
+  }
+  if (values.json) {
+    console.log(JSON.stringify(agg, null, 2));
+  } else {
+    const g = agg.gates;
+    console.log(`${c.bold}replicated aggregate${c.reset} — ${agg.n} draws (${agg.identity.ranking_policy!.expansion_set})`);
+    for (const m of agg.members) {
+      console.log(`  ${m.run_id} draw ${m.draw}: trust ${m.trust_pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset}`} · acceptance ${m.acceptance_mode ?? "—"}${m.pair_valid !== null ? ` · pair ${m.pair_valid} valid / ${m.pair_treatment_exposed} exposed` : ""}`);
+    }
+    console.log(`  gates: ${g.pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset}`}${g.reasons.length ? ` — ${g.reasons.join("; ")}` : ""}`);
+  }
+  // A failing distributional aggregate must be machine-visible, same contract
+  // as the run-level gate.
+  if (!agg.gates.pass) process.exitCode = 1;
+}
+
+/**
+ * `clawmem eval hook-run` — replay labeled UserPromptSubmit cases through the
+ * REAL context-surfacing handler against a corpus snapshot (BUILD-0). The
+ * snapshot is REQUIRED: the hook writes telemetry during replay (cleaned up
+ * per case, but a crash mid-case must never leave residue in the live vault,
+ * and a live watcher would race the run). Make one with:
+ *   sqlite3 ~/.cache/clawmem/index.sqlite "VACUUM INTO 'snapshot.sqlite'"
+ */
+async function cmdEvalHookRun(args: string[], usage: string) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      gold: { type: "string" },
+      db: { type: "string" },
+      limit: { type: "string", default: "10" },
+      "budget-ms": { type: "string", default: "8000" },
+      "min-examples": { type: "string", default: "30" },
+      audited: { type: "boolean", default: false },
+      profile: { type: "string" },
+      "skill-db": { type: "string" },
+      baseline: { type: "string" },
+      "latency-reps": { type: "string", default: "3" },
+      "accept-unmeasured": { type: "string" },
+      "allow-local-fallback": { type: "boolean", default: false },
+      "capture-expansions": { type: "string" },
+      "replay-expansions": { type: "string" },
+      "pair-with": { type: "string" },
+      "pair-min-valid": { type: "string" },
+      "pair-max-retries": { type: "string", default: "2" },
+      "pair-require-ids": { type: "string" },
+      "pair-min-valid-stratum": { type: "string" },
+      "pair-min-exposed-stratum": { type: "string" },
+      "pair-min-basis-stratum": { type: "string" },
+      "pair-treatment": { type: "string" },
+      // Codex t76 (daemon-backed eval): the vector execution protocol. The
+      // DEFAULT is the production protocol — a dedicated vector-daemon child
+      // on the working copy with the watcher's steady-state prewarm; the
+      // in-process protocol is an explicit, recorded opt-out whose latency
+      // evidence is never authoritative on vector-exercising profiles.
+      "vector-exec": { type: "string", default: "daemon-required" },
+      "vector-prewarm": { type: "string", default: "steady-state" },
+      "vector-daemon-ready-timeout-ms": { type: "string", default: "120000" },
+      out: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+
+  if (!values.gold || !values.db) die(usage);
+  if (values["vector-exec"] !== "daemon-required" && values["vector-exec"] !== "in-process") die("--vector-exec must be daemon-required (default; the production protocol) or in-process (recorded; latency not authoritative on balanced/deep)");
+  if (values["vector-prewarm"] !== "steady-state" && values["vector-prewarm"] !== "cold") die("--vector-prewarm must be steady-state (default; the watcher topology's periodic prewarm, performed before readiness) or cold");
+  const vectorDaemonReadyTimeoutMs = Number(values["vector-daemon-ready-timeout-ms"]);
+  if (!Number.isInteger(vectorDaemonReadyTimeoutMs) || vectorDaemonReadyTimeoutMs < 1) die("--vector-daemon-ready-timeout-ms must be a positive integer");
+  const vectorExec: VectorExecSpec = values["vector-exec"] === "in-process"
+    ? { protocol: "in-process" }
+    : { protocol: "daemon-required", prewarm: values["vector-prewarm"] as "steady-state" | "cold", readyTimeoutMs: vectorDaemonReadyTimeoutMs };
+  const limit = Number(values.limit);
+  const budgetMs = Number(values["budget-ms"]);
+  const minExamples = Number(values["min-examples"]);
+  const latencyReps = Number(values["latency-reps"]);
+  if (!Number.isInteger(limit) || limit < 1) die("--limit must be a positive integer");
+  if (!Number.isInteger(budgetMs) || budgetMs < 1) die("--budget-ms must be a positive integer");
+  if (!Number.isInteger(minExamples) || minExamples < 1) die("--min-examples must be a positive integer");
+  if (!Number.isInteger(latencyReps) || latencyReps < 1) die("--latency-reps must be a positive integer");
+  if (values.profile !== undefined && !["speed", "balanced", "deep"].includes(values.profile)) {
+    die("--profile must be speed, balanced, or deep");
+  }
+  const acceptUnmeasured = values["accept-unmeasured"]
+    ? values["accept-unmeasured"].split(",").map(s => s.trim()).filter(Boolean)
+    : undefined;
+  if (acceptUnmeasured) {
+    const { WAIVABLE_ACCEPTANCE_AXES } = await import("./eval/hook-run.ts");
+    const bad = acceptUnmeasured.filter(a => !WAIVABLE_ACCEPTANCE_AXES.has(a));
+    if (bad.length > 0) {
+      die(`--accept-unmeasured: not waivable: ${bad.join(", ")} (core relevance/damage axes cannot be waived; waivable: ${[...WAIVABLE_ACCEPTANCE_AXES].join(", ")})`);
+    }
+  }
+
+  const dbPath = pathResolve(values.db);
+  if (!existsSync(dbPath) || !statSync(dbPath).isFile()) die(`--db snapshot not found (or not a file): ${dbPath}`);
+  let skillDbPath: string | undefined;
+  if (values["skill-db"]) {
+    skillDbPath = pathResolve(values["skill-db"]);
+    if (!existsSync(skillDbPath) || !statSync(skillDbPath).isFile()) die(`--skill-db snapshot not found (or not a file): ${skillDbPath}`);
+  }
+  let baselinePath: string | undefined;
+  if (values.baseline) {
+    baselinePath = pathResolve(values.baseline);
+    if (!existsSync(baselinePath)) die(`--baseline run report not found: ${baselinePath}`);
+  }
+
+  const goldPath = pathResolve(values.gold);
+  if (!existsSync(goldPath)) die(`Hook gold file not found: ${goldPath}`);
+
+  // Paired-counterfactual draw plumbing (codex turn-17 finding 2): the
+  // generator arm --capture-expansions writes its llm_cache delta as a draw
+  // file; the replay arm --replay-expansions injects that exact draw so both
+  // arms rank identical expansion inputs (identity records draw:<fp>).
+  if (values["capture-expansions"] && values["replay-expansions"]) {
+    die("--capture-expansions and --replay-expansions are mutually exclusive — an arm either generates a draw or replays one");
+  }
+  let expansionFreeze: { fingerprint: string; rows: { hash: string; result: string }[]; binding: { gold_fingerprint: string; corpus: string | null; query_model: string; rerank_model: string; rerank_request_rev: number; served_rerank: string; transmitted_text_manifest: string } } | undefined;
+  if (values["replay-expansions"]) {
+    const drawPath = pathResolve(values["replay-expansions"]);
+    if (!existsSync(drawPath)) die(`--replay-expansions draw file not found: ${drawPath}`);
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(drawPath, "utf-8")); } catch (e) { die(`--replay-expansions is not readable JSON: ${(e as Error).message}`); }
+    const d = parsed as { fingerprint?: unknown; rows?: unknown; binding?: unknown };
+    const b = d.binding as Record<string, unknown> | undefined;
+    if (typeof d.fingerprint !== "string" || !/^[0-9a-f]{16}$/.test(d.fingerprint)
+      || !Array.isArray(d.rows)
+      || !d.rows.every(r => r && typeof r === "object" && typeof (r as Record<string, unknown>).hash === "string" && typeof (r as Record<string, unknown>).result === "string")
+      || !b || typeof b !== "object" || Array.isArray(b)
+      || typeof b.gold_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(b.gold_fingerprint)
+      || (b.corpus !== null && typeof b.corpus !== "string")
+      || typeof b.query_model !== "string" || typeof b.rerank_model !== "string"
+      || typeof b.rerank_request_rev !== "number" || !Number.isInteger(b.rerank_request_rev) || b.rerank_request_rev < 1
+      // BUILD-3b binding v3 — a draw predating either field cannot be
+      // validated against this run's provider or transmitted texts.
+      || typeof b.served_rerank !== "string" || b.served_rerank.length === 0
+      || typeof b.transmitted_text_manifest !== "string" || !/^[0-9a-f]{64}$/.test(b.transmitted_text_manifest)) {
+      die(`--replay-expansions draw file is malformed (expected { fingerprint: hex16, rows: [{ hash, result }], binding: { gold_fingerprint, corpus, query_model, rerank_model, rerank_request_rev, served_rerank, transmitted_text_manifest } }) — a draw file predating the binding (codex turn-18 finding 2), the request-revision pin (codex turn-19 finding 2), or the BUILD-3b cache-identity contract (served-provider fingerprint + transmitted-text manifest) must be RE-CAPTURED with --capture-expansions on this build`);
+    }
+    if ((d.rows as unknown[]).length === 0) die(`--replay-expansions draw file carries zero rows — capture it from a run whose profiles exercise expansion (deep)`);
+    expansionFreeze = d as typeof expansionFreeze;
+  }
+
+  // BUILD-3c in-run pair gate: audit this run's per-case pre-treatment
+  // envelope against a partner run, reject + replace divergent cases, and
+  // compute acceptance over VALID pairs only.
+  let pairWith: string | undefined;
+  let pairMinValid: number | undefined;
+  let pairMaxRetries: number | undefined;
+  let pairRequireIds: string[] | undefined;
+  let pairMinValidByStratum: Record<string, number> | undefined;
+  let pairMinExposedByStratum: Record<string, number> | undefined;
+  let pairMinBasisByStratum: Record<string, number> | undefined;
+  let pairTreatments: PairTreatment[] | undefined;
+  if (values["pair-with"]) {
+    pairWith = pathResolve(values["pair-with"]);
+    if (!existsSync(pairWith) || !statSync(pairWith).isDirectory()) die(`--pair-with must be a completed run DIRECTORY (containing hook-run.json + traces.jsonl): ${pairWith}`);
+    if (values["pair-min-valid"] === undefined) die("--pair-with requires --pair-min-valid (the PRE-REGISTERED valid-pair count) — a threshold chosen after seeing the audit is not a gate");
+    pairMinValid = Number(values["pair-min-valid"]);
+    if (!Number.isInteger(pairMinValid) || pairMinValid < 1) die("--pair-min-valid must be a positive integer");
+    pairMaxRetries = Number(values["pair-max-retries"]);
+    if (!Number.isInteger(pairMaxRetries) || pairMaxRetries < 0) die("--pair-max-retries must be a non-negative integer");
+    // Pre-registered witnesses + per-stratum minimums (codex turn-29 SPEC-5):
+    // a total-count gate alone can be satisfied after discarding every
+    // treatment-bearing case.
+    if (values["pair-require-ids"]) {
+      pairRequireIds = values["pair-require-ids"].split(",").map(x => x.trim()).filter(Boolean);
+      if (pairRequireIds.length === 0) die("--pair-require-ids was given but names no case ids");
+    }
+    const parseStrata = (flag: string, raw: string): Record<string, number> => {
+      const out: Record<string, number> = {};
+      for (const pair of raw.split(",").map(x => x.trim()).filter(Boolean)) {
+        const eq = pair.indexOf("=");
+        if (eq < 1) die(`${flag} expects comma-separated <stratum>=<n> pairs (e.g. deep=8,holdout=6); got "${pair}"`);
+        const key = pair.slice(0, eq).trim();
+        const n = Number(pair.slice(eq + 1).trim());
+        if (!key || !Number.isInteger(n) || n < 1) die(`${flag} entry "${pair}" must be <stratum>=<positive integer>`);
+        out[key] = n;
+      }
+      return out;
+    };
+    if (values["pair-min-valid-stratum"]) pairMinValidByStratum = parseStrata("--pair-min-valid-stratum", values["pair-min-valid-stratum"]);
+    if (values["pair-min-exposed-stratum"]) pairMinExposedByStratum = parseStrata("--pair-min-exposed-stratum", values["pair-min-exposed-stratum"]);
+    // Pre-registered per-stratum ADMISSION-BASIS coverage minima (codex t68
+    // F3): counts VALID pairs whose candidate-arm case was judged on the
+    // named basis — the machine-decisive form of the R4 "missing BM25
+    // topology" requirement. Grammar: <stratum>:<basis>=<n>,...
+    if (values["pair-min-basis-stratum"]) {
+      const BASES = ["bm25-rrf", "weighted-rrf", "rerank-fused-rrf"];
+      const out: Record<string, number> = {};
+      for (const entry of values["pair-min-basis-stratum"].split(",").map(x => x.trim()).filter(Boolean)) {
+        const eq = entry.indexOf("=");
+        const colon = entry.indexOf(":");
+        if (colon < 1 || eq < colon + 2) die(`--pair-min-basis-stratum expects comma-separated <stratum>:<basis>=<n> entries (e.g. speed:bm25-rrf=3,deep:rerank-fused-rrf=2); got "${entry}"`);
+        const stratum = entry.slice(0, colon).trim();
+        const basis = entry.slice(colon + 1, eq).trim();
+        const n = Number(entry.slice(eq + 1).trim());
+        if (!BASES.includes(basis)) die(`--pair-min-basis-stratum entry "${entry}" names "${basis}", which is not an admission basis (${BASES.join(", ")})`);
+        if (!stratum || !Number.isInteger(n) || n < 1) die(`--pair-min-basis-stratum entry "${entry}" must be <stratum>:<basis>=<positive integer>`);
+        const basisKey = `${stratum}:${basis}`;
+        if (out[basisKey] !== undefined) die(`--pair-min-basis-stratum contains duplicate entry for "${basisKey}" — register each stratum:basis minimum once`);
+        out[basisKey] = n;
+      }
+      if (Object.keys(out).length === 0) die("--pair-min-basis-stratum was given but names no entries");
+      pairMinBasisByStratum = out;
+    }
+    // The REGISTERED treatments of the experiment (codex turn-40 finding 2):
+    // exactly these ranking_policy variables may differ from the partner, and
+    // paired acceptance permits exactly this difference. Omitted = the arms
+    // must be policy-identical (a replicate audit).
+    if (values["pair-treatment"]) {
+      const names = values["pair-treatment"].split(",").map(x => x.trim()).filter(Boolean);
+      if (names.length === 0) die("--pair-treatment was given but names no treatment");
+      for (const n of names) {
+        if (!(PAIR_TREATMENTS as readonly string[]).includes(n)) die(`--pair-treatment "${n}" is not a registrable treatment (${PAIR_TREATMENTS.join(", ")})`);
+      }
+      if (new Set(names).size !== names.length) die("--pair-treatment contains duplicates — register each treatment once");
+      pairTreatments = names as PairTreatment[];
+    }
+  } else if (values["pair-min-valid"] !== undefined || values["pair-require-ids"] !== undefined || values["pair-min-valid-stratum"] !== undefined || values["pair-min-exposed-stratum"] !== undefined || values["pair-min-basis-stratum"] !== undefined || values["pair-treatment"] !== undefined) {
+    die("--pair-min-valid / --pair-require-ids / --pair-min-valid-stratum / --pair-min-basis-stratum / --pair-treatment require --pair-with — there is no partner run to audit against");
+  }
+
+  // ALL run state — the mkdtemp working directory, the env mutations
+  // (INDEX_PATH, CLAWMEM_NO_LOCAL_MODELS), the store, the inference handles
+  // — is created inside ONE outer try/finally, and expected failures
+  // (malformed gold/baseline — the NORMAL failure path) defer their exit
+  // until after the finally has cleaned up. die() process.exit()s past
+  // finally blocks, so calling it from inside the try leaked the working
+  // dir, the env, and the handles (codex turn-11 finding 1); the deferred
+  // path uses process.exitCode so main()'s own finally (closeStore) still
+  // runs.
+  const priorNoLocal = process.env.CLAWMEM_NO_LOCAL_MODELS;
+  const priorIndexPath = process.env.INDEX_PATH;
+  let workDir: string | undefined;
+  let result: RunHookEvalResult | undefined;
+  let deferredDie: string | undefined;
+  try {
+    // The replay writes telemetry during each case (cleaned up, but a crash
+    // mid-case must never leave residue in the operator's snapshot). The run
+    // therefore opens INTERNALLY-CREATED working copies only; the given
+    // snapshots are read once by cp and never opened.
+    workDir = mkdtempSync(pathResolve(tmpdir(), "clawmem-hook-eval-"));
+    const workDb = pathResolve(workDir, "work.sqlite");
+    cpSync(dbPath, workDb);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(dbPath + suffix)) cpSync(dbPath + suffix, workDb + suffix);
+    }
+    let workSkillDb: string | undefined;
+    if (skillDbPath) {
+      workSkillDb = pathResolve(workDir, "work-skill.sqlite");
+      cpSync(skillDbPath, workSkillDb);
+      for (const suffix of ["-wal", "-shm"]) {
+        if (existsSync(skillDbPath + suffix)) cpSync(skillDbPath + suffix, workSkillDb + suffix);
+      }
+    }
+    process.env.INDEX_PATH = workDb;
+    console.error(`${c.dim}working copy: ${workDb} (snapshot ${dbPath} is never opened)${c.reset}`);
+
+    // Corpus identity = CONTENT hash of the WORKING COPIES — the bytes the
+    // replay actually executes. Hashing the originals after copying left a
+    // TOCTOU window where a mutated source recorded a hash the run never ran
+    // (codex turn-9 finding 3); the hash uses length framing per file
+    // (hashCorpusFiles). The stamp tool hashes the attested snapshot with the
+    // same helper — byte-identical content yields the same digest.
+    const { hashCorpusFiles, probeServedModel, probeRerankFingerprint } = await import("./eval/hook-run.ts");
+    const corpusHash = await hashCorpusFiles([
+      workDb,
+      existsSync(workDb + "-wal") ? workDb + "-wal" : undefined,
+      workSkillDb,
+      workSkillDb && existsSync(workSkillDb + "-wal") ? workSkillDb + "-wal" : undefined,
+    ]);
+
+    // Served-model probes: /v1/models for the OpenAI-compatible embed/llm
+    // endpoints; a BEHAVIORAL fingerprint (fixed probe pair → score hash) for
+    // the rerank endpoint, whose seq-cls sidecar exposes no model listing.
+    // Tri-state per service: value · "unreachable" · "unknown" — an "unknown"
+    // on an exercised service fails comparability unless attested.
+    const servedModels = {
+      embed: await probeServedModel(process.env.CLAWMEM_EMBED_URL),
+      llm: await probeServedModel(process.env.CLAWMEM_LLM_URL),
+      rerank: await probeRerankFingerprint(process.env.CLAWMEM_RERANK_URL),
+    };
+
+    // Eval runs execute a UNIFORM remote-only policy: with local fallback
+    // allowed, an unreachable endpoint silently swaps in an unidentified
+    // in-process model and two "unreachable" runs can execute different
+    // pipelines while comparing equal (codex turn-10 finding 3). Forced
+    // UNCONDITIONALLY — the ambient env is launcher-defaulted, not an invoker
+    // decision — with --allow-local-fallback as the explicit opt-out; the
+    // identity records whichever policy was effective either way.
+    process.env.CLAWMEM_NO_LOCAL_MODELS = values["allow-local-fallback"] ? "false" : "true";
+
+    const s = getStore();
+    result = await runHookEval({
+      goldPath,
+      store: s,
+      limit,
+      budgetMs,
+      minExamples,
+      audited: values.audited,
+      profileOverride: values.profile as "speed" | "balanced" | "deep" | undefined,
+      skillVaultDb: workSkillDb,
+      baselinePath,
+      corpusHash,
+      corpusLabel: `${dbPath} (${statSync(dbPath).size} bytes)`,
+      servedModels,
+      latencyReps,
+      acceptUnmeasured,
+      expansionCapture: values["capture-expansions"] !== undefined,
+      expansionFreeze,
+      pairWith,
+      pairMinValid,
+      pairMaxRetries,
+      pairRequireIds,
+      pairMinValidByStratum,
+      pairMinExposedByStratum,
+      pairMinBasisByStratum,
+      pairTreatments,
+      vectorExec,
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-hook`),
+    });
+  } catch (e) {
+    if (e instanceof HookGoldFileError || e instanceof HookEvalIntegrityError) deferredDie = e.message;
+    else throw e;
+  } finally {
+    if (priorNoLocal === undefined) delete process.env.CLAWMEM_NO_LOCAL_MODELS;
+    else process.env.CLAWMEM_NO_LOCAL_MODELS = priorNoLocal;
+    if (priorIndexPath === undefined) delete process.env.INDEX_PATH;
+    else process.env.INDEX_PATH = priorIndexPath;
+    await disposeDefaultLlamaCpp();
+    if (workDir) {
+      try { rmSync(workDir, { recursive: true, force: true }); } catch { /* best-effort scratch cleanup */ }
+    }
+  }
+  if (deferredDie !== undefined) {
+    console.error(`${c.red}Error:${c.reset} ${deferredDie}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!result) throw new Error("unreachable: hook eval produced no result and no error");
+
+  const { report, artifacts } = result;
+  if (values["capture-expansions"]) {
+    const drawOut = pathResolve(values["capture-expansions"]);
+    writeFileSync(drawOut, JSON.stringify(result.expansionDraw ?? { fingerprint: "", rows: [] }, null, 2));
+    const draw = result.expansionDraw;
+    if (!draw || draw.rows.length === 0) {
+      console.error(`${c.yellow}captured expansion draw is EMPTY${c.reset} (no llm_cache writes — did the profiles exercise expansion?) → ${drawOut}`);
+    } else {
+      console.error(`${c.dim}captured expansion draw ${draw.fingerprint} (${draw.rows.length} rows) → ${drawOut}${c.reset}`);
+    }
+  }
+  if (expansionFreeze) {
+    console.error(`${c.dim}replayed frozen expansion draw ${expansionFreeze.fingerprint} (${expansionFreeze.rows.length} rows; leak audit passed)${c.reset}`);
+  }
+  if (report.pair_audit) {
+    const pa = report.pair_audit;
+    console.error(`${c.dim}pair gate vs ${pa.partner_run_id}: ${pa.valid} valid / ${pa.invalid} invalid (min ${pa.min_valid}, ${pa.retried} retry attempt(s)) — reported aggregates cover VALID PAIRS ONLY${c.reset}`);
+    for (const ic of pa.invalid_cases) console.error(`${c.dim}  excluded ${ic.id}: ${ic.divergences.slice(0, 2).join(" | ")}${c.reset}`);
+  }
+  if (values.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const a = report.aggregate;
+    const n = (v: number | null, d = 3) => (v === null ? "—" : v.toFixed(d));
+    console.log(`${c.bold}eval hook-run ${report.run_id}${c.reset} (k=${report.limit}, budget ${report.budget_ms}ms, secondary ${report.secondary_vaults})`);
+    console.log(`  cases: ${report.examples_scored} scored / ${report.examples_total} total` +
+      (report.unresolved_labels.length ? ` · ${c.red}${report.unresolved_labels.length} unresolved${c.reset}` : ""));
+    console.log(`  nDCG ${c.cyan}${n(a.ndcgMean)}${c.reset} · must-not(case) ${c.cyan}${n(a.mustNotCaseRate)}${c.reset} · must-recall ${n(a.mustIncludeRecallMean)} · abst ${n(a.abstentionAccuracy)} · prior-leg ${n(a.priorLegAccuracy)} · p95 ${n(a.latencyP95Ms, 0)}ms · timeouts ${n(a.timeoutRate)}`);
+    for (const [split, agg] of Object.entries(report.by_split)) {
+      console.log(`  [${split}] nDCG ${n(agg.ndcgMean)} · must-not(case) ${n(agg.mustNotCaseRate)} · must-recall ${n(agg.mustIncludeRecallMean)} (${agg.cases} cases)`);
+    }
+    console.log(`  invariants: ${report.enforced_invariant_violations === 0 ? `${c.green}0 enforced${c.reset}` : `${c.red}${report.enforced_invariant_violations} enforced${c.reset}`} · ${report.observed_invariant_violations} observed (unenforced)`);
+    const g = report.gates;
+    const acceptanceLabel = g.acceptance_pass === null
+      ? `${c.yellow}NOT EVALUATED${c.reset} (no --baseline; NOT product acceptance)`
+      : g.acceptance_pass
+        ? (g.acceptance_waived.length > 0
+          ? `${c.yellow}CONDITIONAL PASS${c.reset} (waived: ${g.acceptance_waived.join(", ")} — NOT unconditional product acceptance)`
+          : `${c.green}PASS${c.reset}`)
+        : `${c.red}FAIL${c.reset}`;
+    console.log(`  gates: trust ${g.trust_pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset}`} · acceptance ${acceptanceLabel}${g.reasons.length ? ` — ${g.reasons.join("; ")}` : ""}`);
+    if (artifacts) {
+      console.log(`  ${c.dim}wrote ${artifacts.runJsonPath}${c.reset}`);
+      console.log(`  ${c.dim}wrote ${artifacts.reportMdPath}${c.reset}`);
+      console.log(`  ${c.dim}wrote ${artifacts.tracesPath}${c.reset}`);
+    }
+  }
+
+  // Exit reflects the gate the invocation ASKED for: with --baseline, the
+  // acceptance verdict (a CONDITIONAL pass exits 0 — the waiver was this
+  // invocation's own explicit --accept-unmeasured instruction — while
+  // gates.pass stays false so machine consumers never read it as
+  // unconditional product acceptance); without, the trust gate. The JSON's
+  // acceptance_pass: null / acceptance_waived fields carry the distinction.
+  const requiredPass = baselinePath
+    ? report.gates.trust_pass && report.gates.acceptance_pass === true
+    : report.gates.trust_pass;
+  if (!requiredPass) process.exitCode = 1;
+}
+
 // =============================================================================
 // Hook dispatch
 // =============================================================================
@@ -1598,6 +2046,122 @@ async function cmdHook(args: string[]) {
   }
 
   writeHookOutput(output);
+
+  // BUILD-5 t60/t61/t63 (codex F59-1 + F60-4 + F62-3): the surfacing
+  // bookkeeping handoff. The hook output is ALREADY on stdout — the hook
+  // process performs NO post-stdout fs or SQLite work at all. The job is
+  // handed over a pipe to a detached, unref'd `spool-ingest` child, and
+  // THAT child persists it to the spool and drains. The handoff makes NO
+  // kernel pipe-capacity assumption (t63): write() lands in the FileSink's
+  // user-space buffer, and the flush (end()) is RACED against a hard
+  // 250ms timeout — on any host, under any pipe limit, the parent moves on
+  // within the bound. A spool-fs or DB stall blocks the child, never this
+  // process's output or exit. Durability, stated honestly: the job dies
+  // with the child if the child is killed before its spool write lands,
+  // and an unflushed tail can be dropped at parent exit on a pathological
+  // pipe (learning signal only — the alignment row was committed
+  // in-handler or the turn was failed closed).
+  if (hookName === "context-surfacing") {
+    try {
+      const job = consumePendingSurfacingBookkeeping();
+      // t62 (codex F61-3): the nonblocking-pipe claim is only true when the
+      // payload is bounded — serialize through the capped helper, and DROP
+      // an oversized or inadmissible job (fail-open: optional learning
+      // data) instead of ever writing an unbounded blob into the pipe.
+      const raw = job && s.dbPath && s.dbPath !== ":memory:" ? serializeSurfacingBookkeepingJob(job) : null;
+      if (raw !== null) {
+        const child = Bun.spawn({
+          cmd: [process.execPath, process.argv[1]!, "spool-ingest"],
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: { ...process.env },
+        });
+        child.stdin.write(raw);
+        // t64 (codex F63-2): the race must not LEAK its loser. end() is
+        // called unconditionally (the child needs EOF); when the flush has
+        // not settled within the bound, the pending sink operation is
+        // unref'd and the child is dropped outright — a half-delivered
+        // handoff is worthless (the ingest child would refuse a truncated
+        // payload anyway) and an unresolved sink op must never retain this
+        // process. CLAWMEM_TEST_HANDOFF_END_DELAY_MS is a test seam that
+        // delays only the RACE's view of the flush, forcing the loser
+        // branch deterministically.
+        const endDelayMs = Number(process.env.CLAWMEM_TEST_HANDOFF_END_DELAY_MS ?? "0");
+        let endP: Promise<unknown> = Promise.resolve(child.stdin.end()).catch(() => {});
+        if (endDelayMs > 0) endP = endP.then(() => Bun.sleep(endDelayMs));
+        const flushed = await Promise.race([endP.then(() => true), Bun.sleep(250).then(() => false)]);
+        if (!flushed) {
+          try { (child.stdin as unknown as { unref?: () => void }).unref?.(); } catch { /* best-effort */ }
+          try { child.kill(); } catch { /* already gone */ }
+        }
+        child.unref();
+      }
+    } catch { /* bookkeeping handoff is fail-open */ }
+  }
+}
+
+// =============================================================================
+// Spool drain (internal): apply surfacing bookkeeping off the hook lifetime
+// =============================================================================
+
+/**
+ * BUILD-5 t60 (codex F59-1): drain the surfacing-bookkeeping spool for the
+ * default store. Spawned detached by cmdHook after each injected surfacing
+ * turn; safe to run any time (claim-by-rename makes concurrent drainers
+ * non-duplicating, and an empty spool is a no-op). Uses the operational
+ * busy_timeout — a stall here blocks only this drainer process.
+ */
+async function cmdSpoolDrain() {
+  const s = getStore();
+  const r = drainSurfacingBookkeepingSpool(s);
+  if (r.applied || r.discarded || r.retained) {
+    console.error(`[clawmem] spool-drain: applied=${r.applied} discarded=${r.discarded} retained=${r.retained}`);
+  }
+}
+
+/**
+ * t61 (codex F60-4): detached child spawned by cmdHook AFTER hook stdout.
+ * Reads ONE bookkeeping job as JSON from stdin, validates it structurally,
+ * persists it to the spool (the durability point), then drains the spool.
+ * The parent hook process does no post-stdout fs/SQLite work — this child
+ * absorbs every stall. CLAWMEM_TEST_SPOOL_INGEST_HANG_MS makes the child
+ * sleep BEFORE reading/persisting so tests can prove the parent's exit does
+ * not depend on this child's progress.
+ */
+/**
+ * t63 (codex F62-3): size-limited stdin reader for the ingest child — the
+ * read ABORTS the moment the accumulated bytes cross the cap, so a rogue or
+ * oversized stream is never fully buffered in memory. Returns null on
+ * over-limit.
+ */
+async function readStdinRawBounded(maxBytes: number): Promise<string | null> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of Bun.stdin.stream()) {
+    total += chunk.byteLength;
+    if (total > maxBytes) return null; // abort — do not keep accumulating
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf-8").trim();
+}
+
+async function cmdSpoolIngest() {
+  const hangMs = Number(process.env.CLAWMEM_TEST_SPOOL_INGEST_HANG_MS ?? "0");
+  if (hangMs > 0) await Bun.sleep(hangMs);
+  // t62/t63 (codex F61-3, F62-3): the bound is enforced DURING the read —
+  // crossing the cap aborts instead of buffering an unbounded stream.
+  const raw = await readStdinRawBounded(SPOOL_JOB_MAX_BYTES);
+  if (!raw) return;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return; }
+  if (!validateSurfacingBookkeepingJob(parsed)) return;
+  const s = getStore();
+  writeSurfacingBookkeepingSpoolJob(s.dbPath, parsed);
+  const r = drainSurfacingBookkeepingSpool(s);
+  if (r.discarded || r.retained) {
+    console.error(`[clawmem] spool-ingest: applied=${r.applied} discarded=${r.discarded} retained=${r.retained}`);
+  }
 }
 
 // =============================================================================
@@ -1827,8 +2391,31 @@ async function cmdSetupHooks(args: string[]) {
     // Shell `timeout` kills the process with SIGTERM (exit 124) which produces
     // "Stop hook error: Failed with non-blocking status code" in Claude Code.
     // Native timeout is handled gracefully by the hook runner.
+    // BUILD-3a (C2c/C3): the UserPromptSubmit HOST timeout is derived from
+    // the hook's INTERNAL budget — host ≥ startup allowance + budget, so the
+    // outer kill switch can never fire before the handler's own deadlines.
+    // The two are set TOGETHER here; `clawmem doctor` enforces the same
+    // inequality against whatever is installed. A larger already-installed
+    // timeout is preserved (never reduced).
+    const { resolveHookBudgetMs, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
+    // The budget the timeout is derived FROM is also PERSISTED into the
+    // installed command (env prefix below) — otherwise the installer's
+    // transient environment sizes the timeout while the installed hook runs
+    // under whatever ambient budget it happens to get (codex turn-23
+    // finding 4: silent drift in both directions).
+    const installBudgetMs = resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
+    const requiredUserPromptTimeoutSec = Math.ceil((STARTUP_ALLOWANCE_MS + installBudgetMs) / 1000);
+    const priorUserPromptTimeoutSec = (() => {
+      let max = 0;
+      for (const entry of settings.hooks["UserPromptSubmit"] ?? []) {
+        for (const h of entry.hooks ?? []) {
+          if (h.command?.includes("clawmem") && typeof h.timeout === "number") max = Math.max(max, h.timeout);
+        }
+      }
+      return max;
+    })();
     const timeouts: Record<string, number> = {
-      UserPromptSubmit: 8,
+      UserPromptSubmit: Math.max(8, requiredUserPromptTimeoutSec, priorUserPromptTimeoutSec),
       SessionStart: 5,
       PreCompact: 5,
       Stop: 30, // LLM-based extraction hooks need more time
@@ -1844,12 +2431,18 @@ async function cmdSetupHooks(args: string[]) {
 
       const timeout = timeouts[event] || 5;
 
-      // Add new entries with native timeout property
+      // Add new entries with native timeout property. The context-surfacing
+      // command carries its budget as an env prefix so the installed
+      // budget+timeout pair lives in ONE settings entry — the hook process
+      // reads it from its own environment and doctor parses it from the
+      // command string, neither depending on ambient env (codex turn-23 F4).
       settings.hooks[event].push({
         matcher: "",
         hooks: hooks.map(name => ({
           type: "command",
-          command: `${binPath} hook ${name}`,
+          command: name === "context-surfacing"
+            ? `CLAWMEM_HOOK_BUDGET_MS=${installBudgetMs} ${binPath} hook ${name}`
+            : `${binPath} hook ${name}`,
           timeout,
         })),
       });
@@ -2542,6 +3135,43 @@ async function cmdReindex(args: string[]) {
 // Doctor (Health Check)
 // =============================================================================
 
+/**
+ * `clawmem vec-daemon-health [--db <path>] [--json]` — the machine-decisive
+ * form of the doctor's vector-daemon check (codex t77 F5 / t89 P1): exit 0
+ * ONLY for the Path-A-AUTHORITATIVE state `live` — the pong names exactly
+ * this DB + the owning pid AND advertises the hydrated-v1 response protocol.
+ * The liveness-without-authority tiers exit 1: `live-raw` (attested but not
+ * hydrated-capable — serves the raw-hit execution) and `live-legacy` (a
+ * pre-v0.38 watcher: an idle daemon-protocol listener that cannot attest).
+ * JSON carries `live` (any listener), `attested`, and `authoritative`
+ * separately. Shipping preflights gate on this; a socket glob is not
+ * evidence of a listener.
+ */
+async function cmdVecDaemonHealth(args: string[]) {
+  const { values } = parseArgs({ args, options: { db: { type: "string" }, json: { type: "boolean", default: false }, "timeout-ms": { type: "string", default: "2000" } } });
+  const timeoutMs = Number(values["timeout-ms"]);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1) die("--timeout-ms must be a positive integer");
+  const dbPath = values.db ? pathResolve(values.db) : getStore().dbPath;
+  const h = await vectorDaemonHealth(dbPath, timeoutMs);
+  // t89 P1: exit 0 is reserved for the Path-A-AUTHORITATIVE daemon — exact DB/pid AND the
+  // hydrated-v1 capability. live-raw/live-legacy prove a listener (liveness) but execute the
+  // client-side-hydration timing, which is not the contract the deadline certifies.
+  const authoritative = h.status === "live";
+  const listening = authoritative || h.status === "live-raw" || h.status === "live-legacy";
+  if (values.json) {
+    console.log(JSON.stringify({ ...h, checked_db: dbPath, live: listening, authoritative, attested: h.status === "live" || h.status === "live-raw" }));
+  } else if (h.status === "live") {
+    console.log(`${c.green}✓${c.reset} vector daemon LIVE for ${dbPath} (pid ${h.pid}, ${h.socket}) — hydrated-v1 attested; the hook's vector deadline is authoritative`);
+  } else if (h.status === "live-raw") {
+    console.log(`${c.yellow}⚠${c.reset} vector daemon LIVE but NOT hydrated-v1-capable for ${dbPath} (pid ${h.pid}, ${h.socket}) — it serves the raw-hit execution (client-side hydration); restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
+  } else if (h.status === "live-legacy") {
+    console.log(`${c.yellow}⚠${c.reset} vector daemon LIVE (legacy, unattested) for ${dbPath} (${h.socket}) — a pre-v0.38 watcher; restart it on v0.38 to attest DB/pid and serve hydrated-v1`);
+  } else {
+    console.log(`${c.red}✗${c.reset} vector daemon ${h.status} for ${dbPath} (${h.socket}) — run 'clawmem watch' (or restart it); the hook's vector deadline is unbounded without it`);
+  }
+  process.exitCode = authoritative ? 0 : 1;
+}
+
 async function cmdDoctor() {
   console.log(`${c.bold}ClawMem Doctor${c.reset}\n`);
   let issues = 0;
@@ -2574,6 +3204,37 @@ async function cmdDoctor() {
     }
   } catch (err) {
     console.log(`${c.red}✗${c.reset} Collections config: ${err}`);
+    issues++;
+  }
+
+  // 2b. Vector daemon (the watcher's per-vault socket) — codex t77 F5: the
+  // v0.38.0 latency contract is scoped to daemon-backed deployments, so the
+  // deployed vault's daemon liveness is an operational health fact, checked
+  // by a real round trip (a socket file alone is not a listener).
+  try {
+    const s = getStore();
+    const h = await vectorDaemonHealth(s.dbPath);
+    if (h.status === "live") {
+      console.log(`${c.green}✓${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} — hydrated-v1 attested; the context-surfacing hook's vector deadline is authoritative on this host`);
+    } else if (h.status === "live-raw") {
+      // t89 P1: liveness without deadline authority — the daemon serves the raw-hit
+      // execution (client-side hydration timing), not the certified Path-A contract.
+      console.log(`${c.yellow}⚠${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} but NOT hydrated-v1-capable — it serves the raw-hit execution; restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
+      issues++;
+    } else if (h.status === "live-legacy") {
+      console.log(`${c.yellow}⚠${c.reset} Vector daemon: live on ${h.socket} (pre-v0.38 watcher — answers the daemon protocol but cannot attest its DB/pid, and serves the raw-hit execution; restart 'clawmem watch' on v0.38 for attested, deadline-authoritative health)`);
+      issues++;
+    } else {
+      const why = h.status === "absent" ? "no socket — 'clawmem watch' is not running for this vault"
+        : h.status === "stale" ? "stale socket (no listener) — the watcher crashed; restart 'clawmem watch'"
+        : h.status === "unresponsive" ? "listener did not answer — the watcher may be wedged; restart 'clawmem watch'"
+        : h.status === "foreign-db" ? `socket served for a different DB (${h.db}, pid ${h.pid}) — a foreign daemon owns this vault's socket`
+        : String(h.status);
+      console.log(`${c.red}✗${c.reset} Vector daemon: ${h.status} on ${h.socket} — ${why}. Without it the hook's vector leg runs in-process and its deadline cannot fire (v0.38.0: the latency contract holds for daemon-backed deployments only).`);
+      issues++;
+    }
+  } catch (err) {
+    console.log(`${c.red}✗${c.reset} Vector daemon: ${err}`);
     issues++;
   }
 
@@ -2636,6 +3297,38 @@ async function cmdDoctor() {
       );
       if (hasHooks) {
         console.log(`${c.green}✓${c.reset} Claude Code hooks: installed`);
+        // BUILD-3a (C2c/C3): the HOST timeout must cover the hook's INTERNAL
+        // budget plus the cold-start allowance — a smaller host timeout kills
+        // the handler before its own deadlines can act (the internal budget is
+        // authoritative; the host timeout is only the outer kill switch).
+        try {
+          const { resolveHookBudgetMs, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
+          let installedSec: number | null = null;
+          let installedBudgetMs: number | null = null;
+          for (const entry of settings.hooks?.["UserPromptSubmit"] ?? []) {
+            for (const h of entry.hooks ?? []) {
+              if (h.command?.includes("clawmem") && h.command?.includes("context-surfacing")) {
+                installedSec = typeof h.timeout === "number" ? h.timeout : null;
+                // The INSTALLED budget is authoritative — parsed from the
+                // command's env prefix, never from this process's ambient
+                // environment (codex turn-23 finding 4).
+                const m = /CLAWMEM_HOOK_BUDGET_MS=(\d+)/.exec(h.command ?? "");
+                installedBudgetMs = m ? resolveHookBudgetMs(m[1]) : null;
+              }
+            }
+          }
+          const budgetMs = installedBudgetMs ?? resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
+          const budgetSource = installedBudgetMs !== null ? "installed" : "ambient — pre-BUILD-3a install carries no budget; run 'clawmem setup hooks' to pin it";
+          const requiredSec = Math.ceil((STARTUP_ALLOWANCE_MS + budgetMs) / 1000);
+          if (installedSec === null) {
+            console.log(`${c.yellow}!${c.reset} Hook timeout budget: context-surfacing entry has no timeout — run 'clawmem setup hooks' to set host timeout ≥ ${requiredSec}s (startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms)`);
+          } else if (installedSec * 1000 < STARTUP_ALLOWANCE_MS + budgetMs) {
+            console.log(`${c.red}✗${c.reset} Hook timeout budget: host timeout ${installedSec}s < startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource}) — the host kills the hook before its internal deadlines can act. Fix: run 'clawmem setup hooks' (writes ≥ ${requiredSec}s and pins the budget), or lower CLAWMEM_HOOK_BUDGET_MS and re-run setup`);
+            issues++; // a red line must contribute to doctor's failure state (codex turn-23 finding 2)
+          } else {
+            console.log(`${c.green}✓${c.reset} Hook timeout budget: host ${installedSec}s ≥ startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource})`);
+          }
+        } catch { /* budget check is advisory — never blocks the doctor */ }
       } else {
         console.log(`${c.yellow}!${c.reset} Claude Code hooks: not installed (run 'clawmem setup hooks')`);
       }
@@ -2712,8 +3405,11 @@ async function cmdDoctor() {
   //    (cache-bypassed, coverage-enforced) and checks calibration + per-pair discrimination.
   try {
     const s = getStore();
-    const { probeRerankHealth } = await import("./health/rerank-health.ts");
-    const health = await probeRerankHealth(s, { timeoutMs: 8000 });
+    // Both production callers delegate to the shared policy function, so the
+    // remote-only rule cannot drift between doctor and rerank-health (codex
+    // turn-34 finding 1).
+    const { runDoctorRerankCheck } = await import("./health/rerank-health.ts");
+    const health = await runDoctorRerankCheck(s, { timeoutMs: 8000 });
     if (health.ok) {
       console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin})`);
     } else {
@@ -3009,8 +3705,23 @@ async function cmdRerankHealth(args: string[]) {
   });
   const timeoutMs = values["timeout-ms"] ? parseInt(values["timeout-ms"] as string, 10) : undefined;
   const store = getStore();
-  const { probeRerankHealth } = await import("./health/rerank-health.ts");
-  const health = await probeRerankHealth(store, timeoutMs ? { timeoutMs } : {});
+  // The COMMAND workflow — probe under the remote-only policy, then attest or
+  // revoke — lives in the health module so a test can drive the production
+  // path with an injected store (codex turn-35 finding 1). The CLI formats.
+  const { runRerankHealthWorkflow } = await import("./health/rerank-health.ts");
+  const outcome = await runRerankHealthWorkflow(store, timeoutMs ? { timeoutMs } : {});
+  const health = outcome.health;
+  if (!values.json) {
+    if (outcome.attested) {
+      console.log(`${c.dim}provider identity recorded for ${process.env.CLAWMEM_RERANK_URL?.trim()}: ${outcome.attested} (namespaces the rerank score cache)${c.reset}`);
+    } else if (outcome.revoked) {
+      console.log(`${c.dim}provider identity REVOKED for ${process.env.CLAWMEM_RERANK_URL?.trim()} — rerank scores will not be cached until a healthy probe re-attests${c.reset}`);
+    }
+  }
+  if (outcome.revokeError) {
+    console.error(`${c.red}✗ could not revoke the provider identity${c.reset}: ${outcome.revokeError}`);
+    process.exitCode = 1;
+  }
 
   if (values.json) {
     console.log(JSON.stringify(health));
@@ -3337,6 +4048,12 @@ async function main() {
       case "hook":
         await cmdHook(subArgs);
         break;
+      case "spool-drain":
+        await cmdSpoolDrain();
+        break;
+      case "spool-ingest":
+        await cmdSpoolIngest();
+        break;
       case "budget":
         await cmdBudget(subArgs);
         break;
@@ -3360,6 +4077,9 @@ async function main() {
         break;
       case "doctor":
         await cmdDoctor();
+        break;
+      case "vec-daemon-health":
+        await cmdVecDaemonHealth(subArgs);
         break;
       case "rerank-health":
         await cmdRerankHealth(subArgs);
@@ -4349,6 +5069,7 @@ ${c.bold}Integration:${c.reset}
   clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
+  clawmem vec-daemon-health [--db P] [--json]   Is the watcher's vector daemon Path-A authoritative? (exit 0 ONLY when live: attested DB/pid + hydrated-v1; live-raw/live-legacy = listener present but non-authoritative, exit 1)
   clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
   clawmem migrate causal-witnesses --preflight [--out <manifest.json>]
                                        Census unresolved pre-cut causal edges (run before CLAWMEM_CAUSAL_WRITER=on)

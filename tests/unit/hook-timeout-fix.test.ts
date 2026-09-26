@@ -318,3 +318,32 @@ describe("resolveStore forwards the busy_timeout cap to a NAMED vault (B3 High-f
     }
   });
 });
+
+describe("resolveHookBudgetMs — the authoritative internal budget (BUILD-3a C2c/C3)", () => {
+  const { resolveHookBudgetMs, DEFAULT_HOOK_BUDGET_MS, MIN_HOOK_BUDGET_MS } = require("../../src/hooks/context-surfacing.ts");
+
+  it("returns the default when unset / empty / whitespace / unparseable", () => {
+    expect(resolveHookBudgetMs(undefined)).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("")).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("   ")).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("banana")).toBe(DEFAULT_HOOK_BUDGET_MS);
+  });
+
+  it("never disables: zero, negatives, NaN, and Infinity all fall back to the default", () => {
+    expect(resolveHookBudgetMs("0")).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("-4000")).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("NaN")).toBe(DEFAULT_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("Infinity")).toBe(DEFAULT_HOOK_BUDGET_MS);
+  });
+
+  it("clamps sub-minimum budgets UP to the floor instead of honoring them", () => {
+    expect(resolveHookBudgetMs("1")).toBe(MIN_HOOK_BUDGET_MS);
+    expect(resolveHookBudgetMs("999")).toBe(MIN_HOOK_BUDGET_MS);
+  });
+
+  it("honors valid budgets, flooring fractions", () => {
+    expect(resolveHookBudgetMs("1000")).toBe(1000);
+    expect(resolveHookBudgetMs("8000")).toBe(8000);
+    expect(resolveHookBudgetMs("6000.9")).toBe(6000);
+  });
+});

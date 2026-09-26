@@ -12,12 +12,15 @@
  *   const store = createStore();
  */
 
+import type { LegacyWallDeadline } from "./clock-legacy.ts";
+import type { DurationMs } from "./clock.ts";
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
+  type LLM,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -27,6 +30,12 @@ import {
   type RerankDocument,
 } from "./llm.ts";
 import { normalizeIsoTimestamp } from "./normalize.ts";
+// Projection-scan dependencies (codex #28 t86 hydrated-v1): the daemon computes every
+// body-derived field the hook consumes with the hook's OWN functions — one implementation,
+// zero forks. All three modules are import-free (no cycles).
+import { sanitizeSnippet } from "./promptguard.ts";
+import { isRetrievedNoise } from "./retrieval-gate.ts";
+import { docGateTokens } from "./hooks/gate-tokens.ts";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -732,14 +741,20 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   if (!cuCols.some(c => c.name === "query_text")) {
     try { db.exec(`ALTER TABLE context_usage ADD COLUMN query_text TEXT`); } catch { /* exists */ }
   }
+  // t62 (codex F61-4): idempotency key for drainer-written VAULT MIRROR rows.
+  // NULL for every ordinary writer; the partial unique index + INSERT OR
+  // IGNORE in insertUsageFn make a keyed re-insert reuse the existing row,
+  // so a bookkeeping retry after a crash-mid-unit cannot duplicate the
+  // mirror.
+  if (!cuCols.some(c => c.name === "dedupe_key")) {
+    try { db.exec(`ALTER TABLE context_usage ADD COLUMN dedupe_key TEXT`); } catch { /* exists */ }
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_context_usage_dedupe ON context_usage(dedupe_key) WHERE dedupe_key IS NOT NULL`);
   // Cache the column presence for insertUsageFn so it can build the INSERT
   // statement without running PRAGMA table_info on every write path.
-  contextUsageHasQueryTextCache.set(
-    db,
-    db.prepare("PRAGMA table_info(context_usage)")
-      .all()
-      .some((c) => (c as { name: string }).name === "query_text"),
-  );
+  const cuColsFinal = db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
+  contextUsageHasQueryTextCache.set(db, cuColsFinal.some(c => c.name === "query_text"));
+  contextUsageHasDedupeKeyCache.set(db, cuColsFinal.some(c => c.name === "dedupe_key"));
 
   // Hook prompt dedupe: suppress duplicate/heartbeat prompts to reduce GPU churn.
   db.exec(`
@@ -1239,6 +1254,14 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   if (!reColNames.has("turn_index")) {
     try { db.exec(`ALTER TABLE recall_events ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   }
+  // t61 (codex F60-3): idempotency key for drainer-written events. NULL for
+  // every non-drainer writer (plain inserts, pre-t61 rows); the partial
+  // unique index makes a keyed re-insert a no-op (INSERT OR IGNORE), so a
+  // bookkeeping retry after a partial apply cannot duplicate events.
+  if (!reColNames.has("dedupe_key")) {
+    try { db.exec(`ALTER TABLE recall_events ADD COLUMN dedupe_key TEXT`); } catch { /* exists */ }
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_recall_events_dedupe ON recall_events(dedupe_key) WHERE dedupe_key IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_usage ON recall_events(usage_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_doc ON recall_events(doc_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_events_session ON recall_events(session_id)`);
@@ -1363,6 +1386,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
 // correct INSERT shape without running PRAGMA on every write. Falls back
 // to `false` (safe — equivalent to pre-migration behavior) when absent.
 const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
+const contextUsageHasDedupeKeyCache = new WeakMap<Database, boolean>();
 
 /**
  * Fatal, non-recoverable vector-store errors. These abort the embed run rather
@@ -1665,11 +1689,11 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline) => Promise<SearchResult[]>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
+  expandQuery: (query: string, model?: string, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -1718,6 +1742,8 @@ export type Store = {
 
   // SAME: Context usage tracking
   insertUsage: (usage: UsageRecord) => number;
+  /** BUILD-5 t60/t61 (F59-2, F60-5): fill the injected paths/tokens onto an alignment row written at retrieval-commit time. Guarded — the UPDATE applies only when the row still matches the expected session/turn identity for the context-surfacing hook, and the return reports whether exactly that row changed. Off-process drainer path — never called from the hook's blocking lifetime. */
+  updateUsageInjection: (id: number, injectedPaths: string[], estimatedTokens: number, expect: { sessionId: string; turnIndex: number }) => boolean;
   getUsageForSession: (sessionId: string) => UsageRow[];
   markUsageReferenced: (id: number) => void;
 
@@ -1745,16 +1771,16 @@ export type Store = {
   buildSemanticGraph: (threshold?: number) => Promise<number>;
 
   // A-MEM: Self-Evolving Memory
-  constructMemoryNote: (llm: any, docId: number) => Promise<any>;
+  constructMemoryNote: (llm: LlamaCpp, docId: number) => Promise<any>;
   storeMemoryNote: (docId: number, note: any) => boolean;
-  generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
-  evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
-  postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<EnrichOutcome>;
+  generateMemoryLinks: (llm: LlamaCpp, docId: number, kNeighbors?: number) => Promise<number>;
+  evolveMemories: (llm: LlamaCpp, memoryId: number, triggeredBy: number) => Promise<boolean>;
+  postIndexEnrich: (llm: LlamaCpp, docId: number, isNew: boolean) => Promise<EnrichOutcome>;
   findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalEdgesResult;
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
 
   // Entity resolution + co-occurrence
-  enrichDocumentEntities: (llm: any, docId: number, vault?: string) => Promise<number>;
+  enrichDocumentEntities: (llm: LLM, docId: number, vault?: string) => Promise<number>;
   searchEntities: (query: string, limit?: number) => { entity_id: string; name: string; type: string; mention_count: number; cooccurrence_count: number }[];
   getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => { docId: number; score: number; viaEntity: string }[];
 
@@ -1765,7 +1791,7 @@ export type Store = {
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
 
   // Recall tracking
-  insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean }[]) => number;
+  insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean; dedupeKey?: string }[]) => number;
   recomputeRecallStats: () => number;
   getRecallStats: (docId: number) => RecallStatsRow | null;
   getRecallStatsAll: (minRecallCount?: number) => RecallStatsRow[];
@@ -1864,11 +1890,11 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
+    expandQuery: (query: string, model?: string, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }) => expandQuery(query, model, db, intent, opts),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => rerank(query, documents, model, db, intent, options),
 
     // Document retrieval
@@ -1954,6 +1980,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // SAME: Context usage tracking
     insertUsage: (usage: UsageRecord) => insertUsageFn(db, usage) as number,
+    updateUsageInjection: (id: number, injectedPaths: string[], estimatedTokens: number, expect: { sessionId: string; turnIndex: number }) => updateUsageInjectionFn(db, id, injectedPaths, estimatedTokens, expect),
     getUsageForSession: (sessionId: string) => getUsageForSessionFn(db, sessionId),
     markUsageReferenced: (id: number) => markUsageReferencedFn(db, id),
 
@@ -2016,16 +2043,16 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     buildSemanticGraph: (threshold?: number) => buildSemanticGraph(db, threshold),
 
     // A-MEM: Self-Evolving Memory
-    constructMemoryNote: (llm: any, docId: number) => constructMemoryNote({ db, dbPath: resolvedPath } as Store, llm, docId),
+    constructMemoryNote: (llm: LlamaCpp, docId: number) => constructMemoryNote({ db, dbPath: resolvedPath } as Store, llm, docId),
     storeMemoryNote: (docId: number, note: any) => storeMemoryNote({ db, dbPath: resolvedPath } as Store, docId, note),
-    generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => generateMemoryLinks({ db, dbPath: resolvedPath } as Store, llm, docId, kNeighbors),
-    evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => evolveMemories({ db, dbPath: resolvedPath } as Store, llm, memoryId, triggeredBy),
-    postIndexEnrich: (llm: any, docId: number, isNew: boolean) => postIndexEnrich({ db, dbPath: resolvedPath } as Store, llm, docId, isNew),
+    generateMemoryLinks: (llm: LlamaCpp, docId: number, kNeighbors?: number) => generateMemoryLinks({ db, dbPath: resolvedPath } as Store, llm, docId, kNeighbors),
+    evolveMemories: (llm: LlamaCpp, memoryId: number, triggeredBy: number) => evolveMemories({ db, dbPath: resolvedPath } as Store, llm, memoryId, triggeredBy),
+    postIndexEnrich: (llm: LlamaCpp, docId: number, isNew: boolean) => postIndexEnrich({ db, dbPath: resolvedPath } as Store, llm, docId, isNew),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
 
     // Entity resolution + co-occurrence
-    enrichDocumentEntities: (llm: any, docId: number, vault?: string) => enrichDocumentEntities(db, llm, docId, vault),
+    enrichDocumentEntities: (llm: LLM, docId: number, vault?: string) => enrichDocumentEntities(db, llm, docId, vault),
     searchEntities: (query: string, limit?: number) => searchEntities(db, query, limit),
     getEntityGraphNeighbors: (seedDocIds: number[], limit?: number) => getEntityGraphNeighbors(db, seedDocIds, limit),
 
@@ -2169,20 +2196,27 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Co-activation tracking
     // Recall tracking: batch insert surfacing events
-    insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean }[]) => {
+    insertRecallEvents: (events: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; wasReferenced?: boolean; dedupeKey?: string }[]) => {
       if (events.length === 0) return 0;
+      // t61 (codex F60-3): rows carrying a dedupeKey are idempotent — the
+      // partial unique index on dedupe_key turns a retried insert into a
+      // no-op via OR IGNORE, and the return counts rows ACTUALLY inserted.
+      // Keyless rows (every non-drainer caller) keep the plain INSERT.
       const stmt = db.prepare(`
-        INSERT INTO recall_events (doc_id, query_hash, search_score, session_id, usage_id, turn_index, surfaced_at, was_referenced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO recall_events (doc_id, query_hash, search_score, session_id, usage_id, turn_index, surfaced_at, was_referenced, dedupe_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const now = new Date().toISOString();
+      let inserted = 0;
       const tx = db.transaction(() => {
         for (const e of events) {
-          stmt.run(e.docId, e.queryHash, e.searchScore, e.sessionId, e.usageId ?? null, e.turnIndex ?? 0, now, e.wasReferenced ? 1 : 0);
+          stmt.run(e.docId, e.queryHash, e.searchScore, e.sessionId, e.usageId ?? null, e.turnIndex ?? 0, now, e.wasReferenced ? 1 : 0, e.dedupeKey ?? null);
+          const c = (db.prepare("SELECT changes() AS c").get() as { c: number }).c;
+          inserted += c;
         }
       });
       tx();
-      return events.length;
+      return inserted;
     },
 
     // Recall tracking: recompute derived stats from events
@@ -2337,13 +2371,21 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           count = count + 1,
           last_seen = excluded.last_seen
       `);
-      // Record all pairs (order-independent: always store sorted)
-      for (let i = 0; i < paths.length; i++) {
-        for (let j = i + 1; j < paths.length; j++) {
-          const sorted = [paths[i]!, paths[j]!].sort();
-          stmt.run(sorted[0]!, sorted[1]!, now);
+      // Record all pairs (order-independent: always store sorted).
+      // ONE transaction, not N*(N-1)/2 autocommit upserts: the per-pair
+      // autocommit fsync (~45 pairs for a 10-doc injection) dominated the
+      // post-output injection tail at ~3s under host I/O load, blowing both
+      // the finalization reserve and the internal hook budget (BUILD-3d.4,
+      // codex turn-47 finding 2). Collapsing to a single commit is one fsync.
+      const tx = db.transaction(() => {
+        for (let i = 0; i < paths.length; i++) {
+          for (let j = i + 1; j < paths.length; j++) {
+            const sorted = [paths[i]!, paths[j]!].sort();
+            stmt.run(sorted[0]!, sorted[1]!, now);
+          }
         }
-      }
+      });
+      tx();
     },
     getCoActivated: (path: string, limit: number = 5) => {
       return db.prepare(`
@@ -2568,6 +2610,8 @@ export type SessionRecord = {
 };
 
 export type UsageRecord = {
+  /** t62 (codex F61-4): idempotency key for drainer-written vault MIRROR rows. When present AND the dedupe_key column exists, the insert is OR IGNORE and a conflict returns the EXISTING row's id — retry-idempotent. Ad-hoc DBs without the column silently drop it (pre-t62 shape). */
+  dedupeKey?: string;
   sessionId: string;
   timestamp: string;
   hookName: string;
@@ -4175,10 +4219,12 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
 // Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the wall-clock
 // deadline, then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
 // collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
-// daemon can run JUST this half on the long-lived watcher — keeping the blocking MATCH off the hook's
-// event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
-// composes the two, so its public contract is unchanged.
-export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {
+// daemon can run this half on the long-lived watcher — and, under hydrated-v1 (the primary path,
+// codex #28), the Step-2 projection too (projectVecResults above), so the hook does zero synchronous
+// sqlite on its timed path. Client-side hydrateVecResults() survives as the raw-hit COMPAT path (a
+// legacy daemon answering raw hits). In-process searchVec() below composes the two halves, so its
+// public contract is unchanged.
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: LegacyWallDeadline): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -4301,10 +4347,203 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Projection-complete daemon hydration (codex #28 t83–t88, hydrated-v1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A vector result as the DAEMON projects it: everything the hook's timed path
+ * consumes, with the body itself never leaving the daemon. Every field is
+ * computed with the hook's own functions on the same inputs, so a projected
+ * candidate is result-equivalent to the body path per CONSUMER:
+ *  - `snippets`      → buildContext's extractSnippet(sanitizeSnippet(body),
+ *                      presentationQuery, len, chunkPos, intent).snippet
+ *  - `rerankText`    → the rerank lane's exact `body.slice(0, 2000)` transmit
+ *  - `noise`         → the injection filter's isRetrievedNoise(body)
+ *  - `hasBody`       → the `!r.body` truthiness branch
+ *  - `gateTokens`    → passesCurrentQueryGate's docGateTokens derivation
+ *  - `bodyLength`    → UTF-16 `body.length`, byte-identical to in-process
+ *                      hydration (t87 F3: UTF-8 bytes are ONLY the admission
+ *                      ceiling, never the projected length)
+ */
+export type ProjectedVecResult = Omit<SearchResult, "body"> & {
+  projected: true;
+  /** extractSnippet(...).snippet per requested length (HOT 300 / WARM 150), keyed by length. Empty strings when sanitizeFiltered. */
+  snippets: Record<number, string>;
+  /** Raw `body.slice(0, rerankTextLen)` — the identical rerank transmit slice, so rerankTextHash and the draw-binding manifests are unchanged. */
+  rerankText: string;
+  /** isRetrievedNoise(body) — precomputed for the injection noise filter. */
+  noise: boolean;
+  /** body.length > 0 — drives the hook's `!r.body` truthiness branch. */
+  hasBody: boolean;
+  /** Deduped docGateTokens(title, body, gateTextLen) for passesCurrentQueryGate (set semantics — dedup is sound for an existential prefix match). */
+  gateTokens: string[];
+  /** sanitizeSnippet(body) returned the filtered marker — the hook skips the entry exactly as the body path does. */
+  sanitizeFiltered: boolean;
+};
+
+/** Type guard: a hook candidate that carries the daemon projection instead of a body.
+ * ProjectedVecResult is a STRUCTURAL SUBTYPE of SearchResult (body is optional there), so
+ * projected results flow through every existing SearchResult signature; the five hook
+ * consumer sites branch on this guard (codex #28 t86). */
+export function isProjectedVecResult<T extends object>(r: T): r is T & ProjectedVecResult {
+  return (r as { projected?: boolean }).projected === true;
+}
+
+/** Phase-1 admission refusal (t87 F1): a SELECTED result's stored body exceeds the source ceiling — refused BEFORE any body fetch; the daemon answers `oversized` and the hook falls back to FTS (vector-candidate loss, traced distinctly). */
+export class HydratedBodyOversizedError extends Error {
+  constructor(public readonly bodyBytes: number, public readonly ceiling: number) {
+    super(`stored body is ${bodyBytes} bytes > hydrated source ceiling ${ceiling}`);
+    this.name = "HydratedBodyOversizedError";
+  }
+}
+
+/**
+ * The daemon-side projection scan (the shared "hydratedScan" factory of the
+ * t84 design — the eval daemon child and the production watcher both serve
+ * exactly this). Two phases inside ONE read transaction (consistent WAL
+ * snapshot, t85):
+ *
+ *  PHASE 1 (metadata only, no body materialization): the hydrateVecResults
+ *  SELECT with `content.doc` replaced by `length(CAST(content.doc AS BLOB))`
+ *  — dedupe by filepath keeping the best-distance fragment, order by
+ *  distance, slice to `limit`. A selected row whose body_bytes exceeds
+ *  `maxSourceBodyBytes` throws HydratedBodyOversizedError BEFORE its body is
+ *  fetched — the genuine finite bound on peak allocation (t87 F1).
+ *
+ *  PHASE 2 (per-row, one body at a time): fetch ONE body, compute the
+ *  projection, release the body before the next fetch. Peak allocation =
+ *  one admitted body (≤ ceiling) + the accumulated projected entries.
+ *
+ * Dedup/order/score/chunkPos mirror hydrateVecResults exactly — locked by
+ * the cross-topology equivalence suite.
+ */
+export function projectVecResults(
+  db: Database,
+  vecResults: { hash_seq: string; distance: number }[],
+  opts: {
+    limit: number;
+    presentationQuery: string;
+    intent?: string;
+    snippetLens: readonly number[];
+    rerankTextLen: number;
+    gateTextLen: number;
+    maxSourceBodyBytes: number;
+    collectionId?: number;
+    collections?: string[];
+    dateRange?: { start: string; end: string };
+  }
+): ProjectedVecResult[] {
+  if (vecResults.length === 0) return [];
+
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+
+  const run = db.transaction(() => {
+    // PHASE 1 — metadata + byte length only; content.doc is NEVER selected here.
+    const placeholders = hashSeqs.map(() => '?').join(',');
+    let docSql = `
+      SELECT
+        cv.hash || '_' || cv.seq as hash_seq,
+        cv.hash,
+        cv.pos,
+        cv.fragment_type,
+        cv.fragment_label,
+        'clawmem://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        d.modified_at,
+        length(CAST(content.doc AS BLOB)) as body_bytes
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
+      JOIN content ON content.hash = d.hash
+      WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    `;
+    const params: string[] = [...hashSeqs];
+    if (opts.collections && opts.collections.length > 0) {
+      const colPlaceholders = opts.collections.map(() => '?').join(',');
+      docSql += ` AND d.collection IN (${colPlaceholders})`;
+      params.push(...opts.collections);
+    } else if (opts.collectionId) {
+      docSql += ` AND d.collection = ?`;
+      params.push(String(opts.collectionId));
+    }
+    if (opts.dateRange) {
+      docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
+      params.push(opts.dateRange.start, opts.dateRange.end);
+    }
+    const docRows = db.prepare(docSql).all(...params) as {
+      hash_seq: string; hash: string; pos: number; filepath: string;
+      display_path: string; title: string; modified_at: string;
+      fragment_type: string | null; fragment_label: string | null;
+      body_bytes: number;
+    }[];
+
+    // Dedup by filepath keeping the best-scoring fragment — hydrateVecResults' exact rule.
+    const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+    for (const row of docRows) {
+      const distance = distanceMap.get(row.hash_seq) ?? 1;
+      const existing = seen.get(row.filepath);
+      if (!existing || distance < existing.bestDist) {
+        seen.set(row.filepath, { row, bestDist: distance });
+      }
+    }
+    const selected = Array.from(seen.values())
+      .sort((a, b) => a.bestDist - b.bestDist)
+      .slice(0, opts.limit);
+
+    // Admission ceiling BEFORE any body fetch (t87 F1).
+    for (const { row } of selected) {
+      if (row.body_bytes > opts.maxSourceBodyBytes) {
+        throw new HydratedBodyOversizedError(row.body_bytes, opts.maxSourceBodyBytes);
+      }
+    }
+
+    // PHASE 2 — one body at a time; the body dies before the next fetch.
+    const bodyStmt = db.prepare(`SELECT doc FROM content WHERE hash = ?`);
+    return selected.map(({ row, bestDist }) => {
+      const body = (bodyStmt.get(row.hash) as { doc: string } | null)?.doc ?? "";
+      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      const sanitized = sanitizeSnippet(body);
+      const sanitizeFiltered = sanitized === "[content filtered for security]";
+      const snippets: Record<number, string> = {};
+      for (const len of opts.snippetLens) {
+        snippets[len] = sanitizeFiltered ? "" : extractSnippet(sanitized, opts.presentationQuery, len, row.pos, opts.intent).snippet;
+      }
+      return {
+        projected: true as const,
+        filepath: row.filepath,
+        displayPath: row.display_path,
+        title: row.title,
+        hash: row.hash,
+        docid: getDocid(row.hash),
+        collectionName,
+        modifiedAt: row.modified_at || "",
+        bodyLength: body.length,  // UTF-16 code units — byte-identical to hydrateVecResults (t87 F3)
+        context: getContextForFile(db, row.filepath),
+        score: 1 - bestDist,
+        source: "vec" as const,
+        chunkPos: row.pos,
+        fragmentType: row.fragment_type ?? undefined,
+        fragmentLabel: row.fragment_label ?? undefined,
+        snippets,
+        rerankText: body.slice(0, opts.rerankTextLen),
+        noise: isRetrievedNoise(body),
+        hasBody: body.length > 0,
+        gateTokens: docGateTokens(row.title, body, opts.gateTextLen),
+        sanitizeFiltered,
+      };
+    });
+  });
+  return run() as ProjectedVecResult[];
+}
+
 // In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
-// the daemon-backed hook path (context-surfacing) instead calls searchVecMatch (in the daemon) +
-// hydrateVecResults (locally), so the blocking MATCH never runs on the hook's event loop.
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+// the daemon-backed hook path (context-surfacing) instead receives DAEMON-SIDE projected results
+// (hydrated-v1: the scan AND a hydrateVecResults-equivalent projection both run in the daemon),
+// falling back to client-side hydrateVecResults only on the raw-hit compat path — so neither the
+// blocking MATCH nor, under hydrated-v1, the hydration ever runs on the hook's event loop.
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline): Promise<SearchResult[]> {
   const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
   return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
 }
@@ -4329,7 +4568,7 @@ export interface VecSearchDetailedOpts {
   collections?: string[];
   excludeCollections?: string[];
   dateRange?: { start: string; end: string };
-  deadlineMs?: number;
+  deadlineMs?: LegacyWallDeadline;
   /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
   escalationCap?: number;
   /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
@@ -4552,7 +4791,7 @@ export async function searchVecDetailed(
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<{ embedding: number[]; model: string } | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: LegacyWallDeadline): Promise<{ embedding: number[]; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
@@ -4756,7 +4995,7 @@ export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }): Promise<ExpandedQuery[]> {
   // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
   const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
@@ -4783,10 +5022,19 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
+  // BUILD-3a (codex turn-24 finding 3): a deadline that has already passed
+  // gets NO LLM call and NO cache write — the typed fallback only.
+  if (opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+    return expansionFallback(query)
+      .filter(r => r.text !== query)
+      .map(r => ({ type: r.type, query: r.text }));
+  }
+
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses a hardcoded model; the model parameter is ignored here.
-  // Pass intent to steer expansion when provided.
-  const results = await llm.expandQuery(query, { intent });
+  // Pass intent to steer expansion when provided. deadlineAt gives the
+  // remote fetch a REAL abort and structurally disables local inference.
+  const results = await llm.expandQuery(query, { intent, deadlineAt: opts?.deadlineAt });
 
   // Defense-in-depth: re-run the shared guard (also covers the local GBNF path and
   // any future provider), then drop entries that just echo the original query.
@@ -4803,6 +5051,13 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const expanded: ExpandedQuery[] = cleaned.map(r => ({ type: r.type, query: r.text }));
+  // Post-cancellation write guard (codex turn-24 finding 3): a result that
+  // lands AT or PAST the deadline is returned but never cached — the caller
+  // has already moved on, and in the eval a late write would mutate
+  // llm_cache after rep cleanup or the freeze leak audit.
+  if (opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+    return expanded;
+  }
   setCachedResult(db, cacheKey, JSON.stringify(expanded));
   return expanded;
 }
@@ -4811,16 +5066,320 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-/** Options for the reranker health probe. Production query/hook callers omit all of these. */
+/**
+ * Monotonic revision of the rerank REQUEST construction — spanning BOTH
+ * layers that shape what the reranker sees: the context-surfacing handler's
+ * per-candidate payload (`{file: candidateKey, text: body.slice(0, 2000)}`,
+ * id scheme, query/topic inputs) and this module's transport projection
+ * (rerankTransmittedText). Recorded in expansion-draw bindings AND in every
+ * rerank cache key (BUILD-3b) so cached scores produced under one request
+ * construction are never served under another: corpus content alone does not
+ * determine transmitted text across code revisions (codex turn-19 finding 2).
+ * Bump on ANY change to the payload construction, the transport truncation,
+ * or their inputs. The cache-key change itself (BUILD-3b) did NOT bump the
+ * rev: the transmitted request is byte-identical — old draw FILES are
+ * refused by the binding v3 schema instead.
+ *
+ * Rev 2 (t61, codex F60-1): the context-surfacing hook no longer supplies a
+ * session-topic intent, so the transmitted rerank query for focused sessions
+ * changed (the `intent\n\nquery` prefix is gone from the hook path). Frozen
+ * eval draws are unaffected in content — the harness clears
+ * CLAWMEM_SESSION_FOCUS, so no draw ever carried an intent prefix — but the
+ * construction inputs changed and the rev pins construction.
+ */
+export const RERANK_REQUEST_REV = 2;
+
+/**
+ * The EXACT text transmitted to the rerank endpoint for a candidate —
+ * truncated to ~400 chars to fit the server's 512-token context (query +
+ * document must share one pair; ~2 chars/token for mixed content). Single
+ * definition: the transport site, the cache key, and the eval's
+ * transmitted-text manifest all call this, so "what the reranker scored" and
+ * "what the cache/manifest identify" can never drift (BUILD-3b).
+ */
+export function rerankTransmittedText(text: string): string {
+  return text.slice(0, 400);
+}
+
+/** sha256 (hex) of the transmitted projection of a candidate's text — the content-true member of the rerank cache key and of draw-binding manifests. */
+export function rerankTextHash(text: string): string {
+  const h = new Bun.CryptoHasher("sha256");
+  h.update(rerankTransmittedText(text));
+  return h.digest("hex");
+}
+
+/**
+ * Which SERVICE produced a rerank score — the cache-key namespace (codex
+ * turn-29 SPEC finding 4).
+ *
+ * The nominal `model` constant identifies nothing the endpoint honors: the
+ * rerank request transmits only `{query, documents}`, so whatever the URL is
+ * serving decides the scores. Two consequences the pre-BUILD-3b/3c key could
+ * not survive: a model swapped behind the SAME url served the previous
+ * provider's cached scores, and the remote endpoint shared one namespace with
+ * the in-process local fallback (two genuinely different scorers).
+ *
+ * `CLAWMEM_RERANK_PROVIDER_ID` is the operator's declared identity for what a
+ * URL currently serves — bump it when you change the model behind an
+ * unchanged endpoint. Absent it, the URL itself is the namespace.
+ *
+ * HONEST RESIDUAL: a same-URL model swap with no provider-id bump cannot be
+ * detected on the hot path by construction — detection needs a probe, and the
+ * hook's budget forbids one (`clawmem rerank-health` is that probe, run out of
+ * band). The provider id is the knob that makes the swap declarable.
+ */
+export function rerankProviderNamespace(kind: "remote" | "local", model: string, db?: Database): string | null {
+  return rerankIdentityState(kind, model, db).namespace;
+}
+
+/**
+ * The provider identity STATE of an endpoint — a cache namespace when one
+ * exists, and otherwise a token naming WHY there is none (codex turn-36 SPEC
+ * finding 1). `null` was previously overloaded as "identity irrelevant", but
+ * it is also the normal state for a never-attested, revoked, or expired
+ * endpoint: an invocation that began unidentified and finished attested (a
+ * concurrent health workflow, possibly following a deployment change) passed
+ * the atomicity guard for no better reason than that it started at null. The
+ * token changes on EVERY state transition, so the guard compares tokens.
+ */
+export function rerankIdentityState(kind: "remote" | "local", model: string, db?: Database): { namespace: string | null; token: string } {
+  if (kind === "local") {
+    const ns = `local:${model}`;
+    return { namespace: ns, token: ns };
+  }
+  const url = Bun.env.CLAWMEM_RERANK_URL?.trim() || "unset";
+  if (!db) return { namespace: null, token: `no-db:${url}` };
+  // ONE SNAPSHOT (codex turn-38): generation, tombstone and fingerprint are
+  // read by a SINGLE query. Reading them separately left a window in which a
+  // concurrent health process could complete A→B→A between the reads, so the
+  // function reconstructed the ORIGINAL token from an old generation and a
+  // final-A fingerprint and reported "unchanged". Writers commit the
+  // fingerprint/tombstone and the generation bump in one transaction, so no
+  // snapshot can observe a half-applied attestation.
+  let rows: { flag: string; value: string; updated_at: string }[];
+  try {
+    rows = db.prepare(`SELECT flag, value, updated_at FROM vault_flags WHERE flag IN (?, ?, ?)`)
+      .all(rerankGenerationFlag(url), rerankRevokedFlag(url), rerankProviderFlag(url)) as { flag: string; value: string; updated_at: string }[];
+  } catch {
+    return { namespace: null, token: `no-db:${url}` };
+  }
+  if (typeof rerankStateReadHook === "function") rerankStateReadHook();
+  const byFlag = new Map(rows.map(r => [r.flag, r]));
+  const genRow = byFlag.get(rerankGenerationFlag(url));
+  const genNum = Number(genRow?.value);
+  const gen = Number.isFinite(genNum) ? genNum : 0;
+  const stamp = (t: string): string => `${t}|g${gen}`;
+  if (byFlag.get(rerankRevokedFlag(url))?.value === "revoked") return { namespace: null, token: stamp(`revoked:${url}`) };
+  const raw = byFlag.get(rerankProviderFlag(url));
+  if (!raw) return { namespace: null, token: stamp(`absent:${url}`) };
+  const age = Date.now() - new Date(raw.updated_at).getTime();
+  const fresh = Number.isFinite(age) && age <= RERANK_PROVIDER_ATTESTATION_TTL_MS;
+  const observed = raw.value?.trim();
+  if (!fresh || !observed) return { namespace: null, token: stamp(`expired:${url}#${raw.value}`) };
+  const declared = Bun.env.CLAWMEM_RERANK_PROVIDER_ID?.trim();
+  const ns = declared ? `remote:${url}#${declared}@${observed}` : `remote:${url}#${observed}`;
+  return { namespace: ns, token: stamp(ns) };
+}
+
+/**
+ * TEST-ONLY seam fired immediately after the single state-snapshot query
+ * (codex turn-38 asked for a deterministic read-interleaving regression). A
+ * test mutates the identity here to prove the computed state came from the
+ * snapshot, not from re-reads that could straddle a concurrent write.
+ */
+let rerankStateReadHook: (() => void) | null = null;
+export function _setRerankStateReadHook(fn: (() => void) | null): void { rerankStateReadHook = fn; }
+
+/** vault_flags key holding the monotonic attestation GENERATION for an endpoint. */
+const rerankGenerationFlag = (url: string): string => `rerank_provider_gen:${url}`;
+
+/**
+ * Monotonic attestation generation — bumped on EVERY attestation and every
+ * revocation (codex turn-37 SPEC finding 1). The provider namespace and the
+ * attestation generation are different objects: an A→B→A sequence returns to
+ * the original namespace, so a namespace-derived token said "unchanged" while
+ * an invocation had in fact been scored across two providers. The generation
+ * never returns to a previous value, and it participates ONLY in the
+ * invocation-state token — the namespace keeps its content-addressed meaning
+ * so cache reuse across processes is unaffected. A counter, not a timestamp:
+ * two writes in the same millisecond must still differ.
+ */
+export function readRerankProviderGeneration(db: Database, url: string): number {
+  try {
+    const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(rerankGenerationFlag(url)) as { value: string } | null;
+    const n = Number(row?.value);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function bumpRerankProviderGeneration(db: Database, url: string): void {
+  const next = readRerankProviderGeneration(db, url) + 1;
+  db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
+    .run(rerankGenerationFlag(url), String(next), new Date().toISOString());
+}
+
+/** Raw attestation row (value + updated_at) with no expiry applied — the state token needs to see an EXPIRED attestation, which the read helper hides. */
+function rawRerankProviderRow(db: Database, url: string): { value: string; updated_at: string } | null {
+  try {
+    return (db.prepare(`SELECT value, updated_at FROM vault_flags WHERE flag = ?`).get(rerankProviderFlag(url)) as { value: string; updated_at: string } | null) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** vault_flags key holding the last observed behavioral fingerprint for a rerank endpoint. */
+const rerankProviderFlag = (url: string): string => `rerank_provider:${url}`;
+
+/**
+ * The durable provider identity for a rerank endpoint: the behavioral
+ * fingerprint `clawmem rerank-health` observed the last time it probed this
+ * URL. Written out of band by the probe (never on the hook's hot path) and
+ * consulted here as a single indexed row read — so a model swapped behind an
+ * unchanged URL changes the namespace at the next health run, and every score
+ * the old model produced is left behind in its own namespace.
+ */
+export function readRerankProviderFingerprint(db: Database, url: string): string | null {
+  try {
+    const row = db.prepare(`SELECT value, updated_at FROM vault_flags WHERE flag = ?`).get(rerankProviderFlag(url)) as { value: string; updated_at: string } | null;
+    const value = row?.value?.trim();
+    if (!value) return null;
+    // EXPIRING ATTESTATION (codex turn-31 SPEC finding 2): a behavioral
+    // observation is evidence about the deployment that answered it, and it
+    // decays — nothing stops a swap that nobody re-probes. Past the TTL the
+    // identity is treated as ABSENT, so caching switches off until a fresh
+    // `clawmem rerank-health` re-attests. The contract is therefore
+    // explicitly "correct after a successful health refresh", enforced
+    // rather than documented.
+    const age = Date.now() - new Date(row!.updated_at).getTime();
+    if (!Number.isFinite(age) || age > RERANK_PROVIDER_ATTESTATION_TTL_MS) return null;
+    return value;
+  } catch {
+    return null; // pre-migration vault: no identity, therefore no cache
+  }
+}
+
+/**
+ * How long a behavioral attestation is honored before the cache switches off
+ * pending a fresh probe. A swapped deployment that nobody re-probes is
+ * undetectable from an old observation alone, so the identity EXPIRES instead
+ * of being trusted indefinitely (codex turn-31 SPEC-2).
+ */
+export const RERANK_PROVIDER_ATTESTATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Record the behavioral fingerprint observed for a rerank endpoint (health probe only, out of band). */
+export function writeRerankProviderFingerprint(db: Database, url: string, fingerprint: string): void {
+  // ONE transaction: fingerprint, tombstone clear and generation bump commit
+  // together, so no reader can snapshot a half-applied attestation (codex
+  // turn-38).
+  const apply = db.transaction(() => {
+    db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
+      .run(rerankProviderFlag(url), fingerprint, new Date().toISOString());
+    // A successful re-attestation is the ONLY thing that clears a tombstone.
+    db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(rerankRevokedFlag(url));
+    bumpRerankProviderGeneration(db, url);
+  });
+  apply();
+}
+
+/**
+ * REVOKE a recorded identity — called when a health probe fails or cannot
+ * fingerprint the endpoint (codex turn-31 SPEC-2: leaving the previous flag
+ * intact let an unhealthy replacement's scores be written under the old
+ * provider's identity). Revocation disables caching until a healthy probe
+ * re-attests.
+ */
+export function revokeRerankProviderFingerprint(db: Database, url: string): void {
+  // A TOMBSTONE, not just a deletion: it overrides a declared
+  // CLAWMEM_RERANK_PROVIDER_ID as well as the observed fingerprint, and only
+  // a successful re-attestation clears it.
+  const now = new Date().toISOString();
+  const apply = db.transaction(() => {
+    db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(rerankProviderFlag(url));
+    db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
+      .run(rerankRevokedFlag(url), "revoked", now);
+    bumpRerankProviderGeneration(db, url);
+  });
+  apply();
+  // VERIFY, never assume (codex turn-32 finding 3): swallowing a busy or
+  // read-only failure while the CLI printed "revoked" would leave a stale
+  // identity active invisibly. A failure propagates.
+  const back = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(rerankRevokedFlag(url)) as { value: string } | null;
+  if (back?.value !== "revoked") {
+    throw new Error(`failed to revoke the rerank provider identity for ${url} — the tombstone did not persist, so the previous identity may still be serving cached scores`);
+  }
+}
+
+/** vault_flags key marking an endpoint's identity REVOKED until a healthy re-attestation. */
+const rerankRevokedFlag = (url: string): string => `rerank_provider_revoked:${url}`;
+
+/** True while an endpoint's identity is revoked — overrides both declared and observed identities. */
+export function isRerankProviderRevoked(db: Database, url: string): boolean {
+  try {
+    const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(rerankRevokedFlag(url)) as { value: string } | null;
+    return row?.value === "revoked";
+  } catch {
+    return true; // cannot read the revocation state ⇒ do not cache
+  }
+}
+
+/**
+ * Content-true rerank cache key (BUILD-3b, the turn-18 F2 full contract):
+ * {rev, provider, model, query, candidateKey, textHash}. A same-path content
+ * change produces a NEW key, so a stale cached score for edited content is
+ * structurally impossible — the pre-BUILD-3b key ({query, file, model})
+ * served whatever score the path last had, regardless of what the document
+ * says now. `provider` namespaces the key by the service that actually
+ * scores (codex turn-29 SPEC-4). Old-key entries simply never hit again
+ * (cold start, no migration; llm_cache self-prunes).
+ */
+export function rerankCacheKey(
+  rerankQuery: string,
+  file: string,
+  model: string,
+  text: string,
+  provider: string,
+  rev: number = RERANK_REQUEST_REV,
+): string {
+  return getCacheKey("rerank", { rev, provider, model, query: rerankQuery, file, textHash: rerankTextHash(text) });
+}
+
+/** Options for the reranker health probe and coverage-strict callers. Production QUERY callers omit all of these. */
 export type RerankProbeOptions = {
   /** Skip the rerank cache entirely — forces a live endpoint call (health probes). */
   noCache?: boolean;
-  /** Throw RerankCoverageError if any input doc was not scored by the reranker (checked before zero-fill). */
+  /**
+   * Throw RerankCoverageError if any input doc was not scored by the reranker
+   * (checked before zero-fill). Set by health probes AND by the
+   * context-surfacing hook (BUILD-2): the hook's rerank ordering lane applies
+   * only under full coverage, and the default zero-fill would disguise a
+   * partial remote response as full coverage.
+   */
   requireLiveCoverage?: boolean;
   /** Abort signal for the remote fetch. */
   signal?: AbortSignal;
   /** Convenience: derive AbortSignal.timeout(timeoutMs) for the remote fetch when no signal is given. */
-  timeoutMs?: number;
+  timeoutMs?: DurationMs;
+  /**
+   * BUILD-3a (C2c/C3): absolute wall-clock deadline (Date.now() epoch ms).
+   * Every remote batch is bounded to the remaining window, batches stop when
+   * the deadline passes, and the untimed local node-llama fallback is
+   * DISABLED — a deadline-carrying caller (the context-surfacing hook) must
+   * never start unbounded CPU inference; unscored docs surface as a
+   * RerankCoverageError under requireLiveCoverage and the caller's failure
+   * guard arbitrates.
+   */
+  deadlineAt?: LegacyWallDeadline;
+  /**
+   * Forbid the in-process local fallback for this call (codex turn-32
+   * finding 1). The health probe attesting a REMOTE url must fail when that
+   * url fails: otherwise a dead remote receives a "healthy" fingerprint
+   * derived from local inference and it is persisted under the remote's
+   * identity — violating both "remote and local never share an identity" and
+   * "the provider behind this url passed health".
+   */
+  requireRemote?: boolean;
 };
 
 /** Thrown by rerank() when requireLiveCoverage is set and the reranker did not score every input doc. */
@@ -4849,8 +5408,32 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const noCache = options?.noCache === true;
-  // Health probes thread a timeout to the remote fetch (the production path is otherwise untimed).
-  const fetchSignal = options?.signal ?? (options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined);
+  const deadlineAt = options?.deadlineAt;
+  // Health probes thread a whole-call timeout; the hook threads an absolute
+  // deadline (BUILD-3a). Both become absolute deadlines here — timeoutMs
+  // keeps its original whole-call meaning — and every remote batch is
+  // bounded to the remaining window, recomputed per batch so an earlier
+  // batch cannot spend a later batch's time.
+  const timeoutDeadlineAt = options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs as LegacyWallDeadline /* O1-DEBT-0005 */ : undefined;
+  const effectiveDeadlineAt = timeoutDeadlineAt !== undefined && deadlineAt !== undefined
+    ? Math.min(timeoutDeadlineAt, deadlineAt) as LegacyWallDeadline /* O1-DEBT-0006 */
+    : (timeoutDeadlineAt ?? deadlineAt);
+  // Cache namespace for the LOOKUP: a configured rerank URL means the remote
+  // service will score (and write) these keys; without one the local fallback
+  // does. Remote and local are different scorers and never share a namespace
+  // (codex turn-29 SPEC-4).
+  // ONE namespace decision per call, captured at request start and used for
+  // both lookup and write. noCache (health probes) yields null — "no cache in
+  // either direction" is exactly an absent namespace, so the probe can never
+  // write the scores it is judging.
+  const identityKind = Bun.env.CLAWMEM_RERANK_URL ? "remote" : "local";
+  const startIdentity = noCache ? null : rerankIdentityState(identityKind, model, db);
+  const lookupProvider = startIdentity?.namespace ?? null;
+  const batchSignal = (): AbortSignal | undefined => {
+    if (options?.signal) return options.signal;
+    if (effectiveDeadlineAt === undefined) return undefined;
+    return AbortSignal.timeout(Math.max(1, effectiveDeadlineAt - Date.now()));
+  };
 
   // Deduplicate identical chunk texts — same content from different files shares a single score
   const textToFiles = new Map<string, string[]>();
@@ -4867,23 +5450,51 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
+  // Which files were served from the CACHE — the scores whose trustworthiness
+  // depends on the provider identity not having moved (codex turn-34 SPEC
+  // finding 2).
+  const cacheServed = new Set<string>();
+  /** Is the provider identity still the one this invocation started under? */
+  // Compares STATE TOKENS, so an unidentified→attested transition is caught
+  // too (codex turn-36 SPEC-1). Only an explicit health probe (noCache), which
+  // deliberately has no identity relationship, bypasses the comparison.
+  const identityUnchanged = (): boolean =>
+    startIdentity === null || rerankIdentityState(identityKind, model, db).token === startIdentity.token;
 
   // Check cache for each unique document. noCache (health probes) skips the cache entirely so the
   // call always exercises the live endpoint — a cached probe would mask an endpoint silently
   // reverted to a broken reranker.
-  if (noCache) {
+  // lookupProvider === null: the endpoint has no durable identity, so the
+  // cache is bypassed in BOTH directions for this call (codex turn-30 SPEC-1).
+  if (noCache || lookupProvider === null) {
     for (const doc of uniqueDocs) uncachedDocs.push({ file: doc.file, text: doc.text });
   } else {
     for (const doc of uniqueDocs) {
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+      // The lookup namespace must match whichever service will write it: a
+      // configured URL means the remote scorer, otherwise the local fallback.
+      const cacheKey = rerankCacheKey(rerankQuery, doc.file, model, doc.text, lookupProvider);
       const cached = getCachedResult(db, cacheKey);
       if (cached !== null) {
         const score = parseFloat(cached);
         // Apply score to all files sharing this text
-        for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
+        for (const file of textToFiles.get(doc.text)!) { cachedResults.set(file, score); cacheServed.add(file); }
       } else {
         uncachedDocs.push({ file: doc.file, text: doc.text });
       }
+    }
+  }
+
+  // INVOCATION ATOMICITY (codex turn-34 SPEC finding 2): a concurrent
+  // re-attestation between the lookup and the live calls would otherwise let
+  // this call MIX old-provider cached scores with new-provider live ones — or
+  // return old-provider scores outright when everything hit the cache. On any
+  // change, every cached score is discarded and the complete set is scored
+  // live under the current reality.
+  if (cacheServed.size > 0 && !identityUnchanged()) {
+    for (const file of cacheServed) cachedResults.delete(file);
+    cacheServed.clear();
+    for (const doc of uniqueDocs) {
+      if (!uncachedDocs.some(d => d.file === doc.file)) uncachedDocs.push({ file: doc.file, text: doc.text });
     }
   }
 
@@ -4905,15 +5516,19 @@ export async function rerank(query: string, documents: { file: string; text: str
       try {
         // Process in batches of 4 to prevent VRAM exhaustion
         for (let i = 0; i < uncachedDocs.length; i += 4) {
+          // BUILD-3a: stop starting batches once the deadline has passed —
+          // already-scored docs keep their scores; the rest surface as a
+          // coverage error under requireLiveCoverage.
+          if (effectiveDeadlineAt !== undefined && Date.now() >= effectiveDeadlineAt) break;
           const batch = uncachedDocs.slice(i, i + 4);
           const resp = await fetch(`${rerankUrl}/v1/rerank`, {
             method: "POST",
             headers: rerankHeaders,
             body: JSON.stringify({
               query: rerankQuery,
-              documents: batch.map(d => d.text.slice(0, 400)),
+              documents: batch.map(d => rerankTransmittedText(d.text)),
             }),
-            signal: fetchSignal,
+            signal: batchSignal(),
           });
           if (resp.ok) {
             let data: { results: { index: number; relevance_score: number }[] };
@@ -4953,9 +5568,13 @@ export async function rerank(query: string, documents: { file: string; text: str
             for (const r of (Array.isArray(data?.results) ? data.results : [])) {
               const doc = batch[r.index];
               if (!doc || typeof r.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) continue;
-              if (!noCache) {
-                const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
-                setCachedResult(db, cacheKey, r.relevance_score.toString());
+              // Write under the namespace captured at REQUEST START, and only
+              // while the persisted identity is still that one (codex turn-31
+              // finding 1): re-reading the namespace per response let a
+              // concurrent health update file an in-flight OLD-provider
+              // response under the NEW provider's identity.
+              if (lookupProvider !== null && identityUnchanged()) {
+                setCachedResult(db, rerankCacheKey(rerankQuery, doc.file, model, doc.text, lookupProvider), r.relevance_score.toString());
               }
               // Apply score to all files sharing this text
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
@@ -4973,17 +5592,24 @@ export async function rerank(query: string, documents: { file: string; text: str
       }
     }
 
-    // Fallback to local node-llama-cpp
-    if (!scored) {
+    // Fallback to local node-llama-cpp. DISABLED for deadline-carrying
+    // callers (BUILD-3a: no untimed local fallback — local CPU inference
+    // cannot be bounded mid-run; the hook's unscored docs surface as a
+    // coverage error and its failure guard arbitrates).
+    if (!scored && deadlineAt === undefined && options?.requireRemote !== true) {
       const remaining = uncachedDocs.filter(d => !cachedResults.has(d.file));
       if (remaining.length > 0) {
         const llm = getDefaultLlamaCpp();
         const rerankResult = await llm.rerank(rerankQuery, remaining, { model });
         for (const result of rerankResult.results) {
           const doc = remaining.find(d => d.file === result.file);
-          if (!noCache) {
-            const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model });
-            setCachedResult(db, cacheKey, result.score.toString());
+          // Content-true key needs the doc's text (BUILD-3b) — a result whose
+          // file matches no input doc cannot be content-addressed, so it is
+          // applied for this call but never cached.
+          // Same rule for the local fallback: the namespace captured at
+          // request start, or no write at all.
+          if (doc && lookupProvider !== null && identityUnchanged()) {
+            setCachedResult(db, rerankCacheKey(rerankQuery, doc.file, model, doc.text, lookupProvider), result.score.toString());
           }
           // Apply score to all files sharing this text
           if (doc) {
@@ -4996,9 +5622,22 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Coverage check BEFORE the zero-fill below (health probes only, via requireLiveCoverage).
-  // After the map, an omitted score and a true 0 are indistinguishable, so a partial endpoint
-  // would otherwise look fully covered. See RERANKER-HEALTH-GUARD-DESIGN.md §5 (H1/M4).
+  // INVOCATION ATOMICITY, unconditionally (codex turn-35 SPEC finding 2): the
+  // guard must cover the whole scored invocation, not just cache-derived
+  // entries. An all-live pool larger than one batch can be scored by provider
+  // A, re-attested to B mid-run, and finish "fully covered" with a MIXED A/B
+  // ordering that even a strict caller would accept. If the identity moved at
+  // any point, the ENTIRE result set is discarded — strict callers then get
+  // RerankCoverageError and their failure guard arbitrates.
+  if (!identityUnchanged()) {
+    cachedResults.clear();
+    cacheServed.clear();
+  }
+
+  // Coverage check BEFORE the zero-fill below (health probes + the hook's BUILD-2 ordering
+  // seam, via requireLiveCoverage). After the map, an omitted score and a true 0 are
+  // indistinguishable, so a partial endpoint would otherwise look fully covered. See
+  // RERANKER-HEALTH-GUARD-DESIGN.md §5 (H1/M4).
   if (options?.requireLiveCoverage) {
     const missing = documents.filter(doc => !cachedResults.has(doc.file)).map(doc => doc.file);
     if (missing.length > 0) throw new RerankCoverageError(missing);
@@ -5527,6 +6166,35 @@ function insertUsageFn(db: Database, usage: UsageRecord): number {
   // so ad-hoc DBs constructed outside createStore() degrade gracefully
   // to the pre-v0.8.1 INSERT shape.
   const hasQueryText = contextUsageHasQueryTextCache.get(db) ?? false;
+  // t62 (codex F61-4): keyed idempotent insert for vault mirror rows. OR
+  // IGNORE + the partial unique index turn a retried insert into a no-op,
+  // and the conflict path returns the EXISTING row's id so recall events
+  // link to the one true mirror.
+  const hasDedupe = contextUsageHasDedupeKeyCache.get(db) ?? false;
+  if (usage.dedupeKey && hasDedupe) {
+    db.prepare(`
+      INSERT OR IGNORE INTO context_usage
+        (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index, query_text, dedupe_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      usage.sessionId,
+      usage.timestamp,
+      usage.hookName,
+      JSON.stringify(usage.injectedPaths),
+      usage.estimatedTokens,
+      usage.wasReferenced,
+      usage.turnIndex ?? 0,
+      usage.queryText ?? null,
+      usage.dedupeKey,
+    );
+    const changed = (db.prepare("SELECT changes() AS c").get() as { c: number }).c;
+    if (changed === 1) {
+      const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
+      return row.id;
+    }
+    const existing = db.prepare("SELECT id FROM context_usage WHERE dedupe_key = ?").get(usage.dedupeKey) as { id: number } | undefined;
+    return existing?.id ?? -1;
+  }
   if (hasQueryText) {
     db.prepare(`
       INSERT INTO context_usage
@@ -5564,6 +6232,22 @@ function getUsageForSessionFn(db: Database, sessionId: string): UsageRow[] {
 
 function markUsageReferencedFn(db: Database, id: number): void {
   db.prepare(`UPDATE context_usage SET was_referenced = 1 WHERE id = ?`).run(id);
+}
+
+/**
+ * BUILD-5 t60 (codex F59-2): the surfacing hook writes the alignment/query-
+ * history row EARLY (at retrieval commit, paths=[] tokens=0) so turn_index and
+ * query_text survive a deadline-skip; the injected paths/tokens are filled in
+ * later by the off-process bookkeeping drainer via this UPDATE. Touching only
+ * injected_paths/estimated_tokens keeps was_referenced/turn_index/query_text
+ * authoritative from their own writers.
+ */
+function updateUsageInjectionFn(db: Database, id: number, injectedPaths: string[], estimatedTokens: number, expect: { sessionId: string; turnIndex: number }): boolean {
+  db.prepare(`UPDATE context_usage SET injected_paths = ?, estimated_tokens = ?
+                WHERE id = ? AND session_id = ? AND turn_index = ? AND hook_name = 'context-surfacing'`)
+    .run(JSON.stringify(injectedPaths), estimatedTokens, id, expect.sessionId, expect.turnIndex);
+  const c = (db.prepare("SELECT changes() AS c").get() as { c: number }).c;
+  return c === 1;
 }
 
 // =============================================================================

@@ -229,7 +229,7 @@ builders operate on — so archiving documents legitimately lowers the total.
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
 - **Why not keep models warm?** Claude Code hooks spawn a fresh process per invocation (by design — hooks are shell commands). There is no persistent process between hook calls. The MCP server does keep models warm via a 5-minute inactivity timer, but that only benefits MCP tool calls, not hooks.
-- **Adjusting hook timeouts.** If you're using in-process Metal/Vulkan and hooks are timing out intermittently, you can increase the timeout in `~/.claude/settings.json`. Use the native `timeout` property (in seconds), not a shell `timeout` wrapper:
+- **Tuning the context-surfacing hook timeout.** Two knobs exist since v0.38.0: the hook's **internal budget** `CLAWMEM_HOOK_BUDGET_MS` (default 6000ms — the authoritative schedule every in-handler deadline derives from, including the deep-escalation and rerank windows and the 500ms finalization reserve) and the **host** `timeout` in `~/.claude/settings.json` (the outer kill switch — it must be ≥ 1.5s startup allowance + the internal budget; `clawmem setup hooks` writes both together and pins the budget into the installed command, and `clawmem doctor` checks the inequality). The budget bounds the **vector** leg only when the watcher's vector daemon serves the vault (`clawmem watch`) — the sqlite-vec MATCH is synchronous and cannot be interrupted in-process, so a hook that overruns on a cold scan without the watcher running is the expected watcher-free behavior, not a budget defect (v0.38.0 also fixes a stale daemon socket left by a crashed watcher silently preventing the next watcher from binding its daemon). `clawmem doctor` reports the daemon's liveness for the vault by a real round trip, and `clawmem vec-daemon-health` (exit 0 only when live) is the scriptable form. If you're using in-process Metal/Vulkan and hooks are timing out intermittently, raise the host timeout in `~/.claude/settings.json`. Use the native `timeout` property (in seconds), not a shell `timeout` wrapper:
   ```json
   {
     "type": "command",
@@ -277,13 +277,20 @@ builders operate on — so archiving documents legitimately lowers the total.
 - The context-surfacing hook filters aggressively. Common causes:
   - Prompt too short (< 20 chars; short memory-intent queries are exempt and force retrieval), starts with `/`, or matches the heartbeat/greeting filter
   - Duplicate prompt within the 600-second dedup window (SHA-256 hash match)
-  - Vector search silently failed (dimension mismatch, server down) and BM25-only results scored too low after composite scoring
-  - All results fell below the profile's minimum composite score threshold after recency decay, confidence weighting, and quality multiplier were applied
-- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Verify the embedding server is reachable if using a remote GPU. Try `CLAWMEM_PROFILE=deep` which lowers the score threshold from 0.45 to 0.25 and adds budget-aware query expansion + reranking. For vaults with older documents, the `balanced` profile's 0.45 threshold may filter out everything — `deep` compensates with a wider net.
+  - Vector search silently failed (dimension mismatch, server down), leaving a BM25-only candidate set that admission judged degenerate
+  - **Relevance admission abstained (v0.38.0):** no candidate had current-turn support (`no-current-support`), or no candidate had keyword-class agreement — FTS found nothing, the vector-only junk signature (`degenerate-basis`). The hook prefers emitting nothing over surfacing a weak or arbitrary list; on a gibberish or fully-off-vault prompt this is the designed outcome.
+  - **Turn-alignment write failed under database contention (v0.38.0):** the hook fails closed — no injection without its `context_usage` alignment row. Transient; the next turn recovers.
+- Fix: Check `clawmem status` for doc counts and `clawmem embed` for embedding coverage. Verify the embedding server is reachable if using a remote GPU. Try `CLAWMEM_PROFILE=deep`, which widens recall with budget-aware query expansion + reranking. To see *why* a specific prompt surfaced nothing, set `CLAWMEM_SURFACING_TRACE=1` and read the newest row in `surfacing_diagnostics` — it records every retrieval leg, the fusion envelope, and the admission decision with its abstain reason.
 
 **Context-surfacing returns results on `balanced` but not `speed`**
-- `speed` profile disables vector search entirely and uses a higher minimum score (0.55). Documents that rank well via hybrid search (BM25+vector) may not score high enough on BM25 alone.
+- `speed` profile disables vector search entirely, so documents that rank via the hybrid lanes (BM25 + vector agreement compounds fused mass) may not survive membership or admission on BM25 alone.
 - Not a bug — this is the intended tradeoff. Use `balanced` or `deep` for richer retrieval.
+
+**Recall attribution or injected-paths fill-in missing (`recall_events` empty for recent turns)**
+- Since v0.38.0 injection bookkeeping is applied off-process: the hook parks a job, hands it to a detached `clawmem spool-ingest` child, and the child persists it under `<db dir>/surfacing-spool/` (next to `index.sqlite`) then drains it into SQLite. The turn-alignment `context_usage` row is written in-hook and is never affected.
+- Bookkeeping is best-effort by design: if the handoff loses its 250ms flush race (pathological pipe) or the hook's deadline passed before packaging, that turn's learning data is dropped — alignment, prior-turn lookback, and the injection itself are unaffected.
+- Check for stuck jobs: `ls ~/.cache/clawmem/surfacing-spool/`. Plain `.json` files are unapplied jobs; `.json.claim-<pid>` files are claims (a dead drainer's claim is reclaimed automatically on the next drain). Run `clawmem spool-drain` to apply anything pending; jobs older than 24h are discarded as poison.
+- A persistently growing set of retained files means a unit keeps failing (e.g. a secondary-vault DB is unwritable) — run `clawmem spool-drain` in a terminal and read its stderr summary (`applied= discarded= retained=`).
 
 **Duplicate observations after every session**
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
@@ -356,6 +363,13 @@ builders operate on — so archiving documents legitimately lowers the total.
 - OpenClaw saw a `plugins.entries.clawmem: { enabled: true }` entry in its config but could not find a corresponding plugin directory under `~/.openclaw/extensions/`. This typically means the plugin directory was deleted or moved without running `openclaw config unset plugins.entries.clawmem`.
 - Fix: re-run `clawmem setup openclaw` to restore the plugin directory, then the stale entry resolves. Or, if you intentionally uninstalled the plugin and want to keep it gone, `openclaw config unset plugins.entries.clawmem` + `openclaw config unset plugins.slots.memory` (which restores the default `memory-core`).
 
+**"memory plugin not selected for the memory slot; skipping its indexing runtime and recall registration" (OpenClaw main from September 2026, #131779)**
+- Symptom: the gateway ready line lists `clawmem`, `openclaw plugins inspect clawmem` shows `Status: enabled`, hooks fire and the agent tools answer, but the startup journal carries the warning above. ClawMem loaded without its memory-capability runtime because another plugin owns `plugins.slots.memory`, or the slot was cleared.
+- What changed: on earlier OpenClaw releases an unselected `kind: memory` plugin was disabled outright and dropped from the ready line. From #131779 it stays loaded with its hooks and tools, and OpenClaw strips only the memory runtime. The failure moved from loud to quiet.
+- Verify: `openclaw config get plugins.slots.memory`. It must print `clawmem`. Anything else, or nothing, is the cause.
+- Fix: `openclaw plugins enable clawmem` re-applies slot selection and disables the competing memory plugin. Or set it directly: `openclaw config set plugins.slots.memory clawmem`. Restart the gateway and confirm the warning is gone.
+- ClawMem's memory runtime is currently a stub (`getMemorySearchManager` returns no manager; retrieval runs through `before_prompt_build`), so you lose little today. Fix it anyway. The slot is the contract OpenClaw uses to decide which plugin owns memory, and a later ClawMem release may put real work behind that runtime.
+
 **Older OpenClaw version notes**
 - **v2026.4.10:** fixed a config normalization bug where `plugins.slots.contextEngine` was silently dropped during config processing (openclaw/openclaw#64192). Only relevant on ClawMem < v0.10.0, which used the `contextEngine` slot. ClawMem v0.10.0+ uses the `memory` slot and is not affected by #64192.
 - **v2026.4.11:** introduced the new plugin discovery contract (`readdirSync({ withFileTypes: true })` + `dirent.isDirectory()`) and the plugin ownership check described above. Required for ClawMem v0.10.0+. Upgrade OpenClaw with `sudo npm i -g openclaw@latest`.
@@ -369,7 +383,7 @@ builders operate on — so archiving documents legitimately lowers the total.
 - Fix: Verify REST server: `curl http://localhost:7438/health`. Start it manually (`./bin/clawmem serve`) or via systemd.
 
 **Plugin registers but hooks don't fire**
-- Verify ClawMem is selected as the active context engine in OpenClaw config.
+- Verify ClawMem owns the memory slot: `openclaw config get plugins.slots.memory` must print `clawmem`. ClawMem v0.10.0+ uses the `memory` slot, not the older `contextEngine` slot.
 - If using hybrid mode, OpenClaw's native memory may be intercepting.
 
 **OpenClaw agent doesn't use ClawMem tools**

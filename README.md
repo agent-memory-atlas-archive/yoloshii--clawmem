@@ -32,9 +32,13 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Prevents context bleed in derived insights** — the Phase 3 deductive synthesis pipeline validates every draft against an anti-contamination wrapper (deterministic entity contamination check + LLM validator + dedupe) before writing cross-session deductive observations (v0.7.1)
 - **Frames surfaced facts as background knowledge** — `context-surfacing` wraps injected content in `<instruction>` + `<facts>` + `<relationships>` blocks, telling the model to treat facts as already-known and exposing memory-graph edges between surfaced docs directly in-prompt (v0.7.1)
 - **Injects knowledge-graph facts as structured triples** — when the user's prompt mentions entities already known to the vault, `context-surfacing` resolves them via a three-path prompt-only extractor (canonical IDs, proper nouns, lowercased n-grams), queries the SPO graph for current-state triples, and appends a `<vault-facts>` block of raw `subject predicate object` lines to `<vault-context>` — off for `speed`, 200 tokens on `balanced`, 250 on `deep`, token-truncated at the triple boundary (v0.9.0)
-- **Session-scoped focus topic boost** — `clawmem focus set "<topic>" --session-id <id>` writes a per-session focus file that steers query expansion, reranking, chunk selection, snippet extraction, and post-composite-score topic boosting (1.4× match / 0.75× demote) for that session only — session-isolated, fail-open, never writes to SQLite or lifecycle columns (v0.9.0)
+- **Session-scoped focus topic** — `clawmem focus set "<topic>" --session-id <id>` writes a per-session focus file used as a snippet-selection intent: surfaced docs prefer sentences matching the topic. Presentation only since v0.38.0 — a focus never changes expansion, reranking, scoring, ordering, or the surfaced set — session-isolated, fail-open, never writes to SQLite or lifecycle columns (v0.9.0, narrowed v0.38.0)
+- **Ranks hook injections on one channel-aware key** — every retrieval leg (BM25, vector, file-aware, gated prior-turn, expansion variants) contributes a ranked lane; weighted reciprocal-rank fusion yields a single ordering key (current-support band, fused mass) that decides membership, final order, AND admission — no mixed raw-score sorts, no metadata reordering (v0.38.0)
+- **Admits by relevance, abstains honestly** — the context-surfacing hook admits candidates by a relative floor on the fused ordering key and abstains at query level when current-turn support is missing or keyword-degenerate, instead of surfacing weak lists (v0.38.0)
+- **Guards the deep rerank lane** — cross-encoder scores apply only under full candidate coverage AND a discriminating score set (degeneracy gate); the reranker joins the final order as a rank-fused lane, and remote rerank scores are cached only under an attested provider identity (`clawmem rerank-health`) (v0.38.0)
+- **Keeps the hook's write path off your prompt latency** — turn alignment is one early fail-closed row; recall attribution, token accounting, and vault mirrors are handed to a detached drainer process through an on-disk spool after the payload is emitted (v0.38.0)
 - **Scores document quality** using structure, keywords, and metadata richness signals
-- **Boosts co-accessed documents** — notes frequently surfaced together get retrieval reinforcement
+- **Boosts co-accessed documents** — notes frequently surfaced together get retrieval reinforcement on the composite MCP surfaces (removed from hook ordering in v0.38.0 — the injected order is the channel-aware fusion key alone)
 - **Decomposes complex queries** into typed retrieval clauses (BM25/vector/graph) for multi-topic questions
 - **Cleans stale embeddings** automatically before embed runs, removing orphans from deleted/changed documents
 - **Transaction-safe indexing** — crash mid-index leaves zero partial state (atomic commit with rollback)
@@ -622,7 +626,7 @@ Hooks installed by `clawmem setup hooks`:
 
 | Hook | Event | What It Does |
 |---|---|---|
-| `context-surfacing` | UserPromptSubmit | Hybrid search → FTS supplement → file-aware search (E13) → snooze filter → spreading activation (E11) → memory type diversification (E10) → tiered injection (HOT/WARM/COLD) → `<vault-context>` + `<vault-routing>` hint. Profile-driven budget/results/timeout. |
+| `context-surfacing` | UserPromptSubmit | Retrieval gate → lane-based hybrid search (BM25 + vector + file-aware (E13) + gated prior-turn + deep expansion variants) → weighted RRF fusion onto one channel-aware ordering key → snooze/noise filters → relevance admission with query-level abstention (v0.38.0) → tiered injection (HOT/WARM/COLD) → `<vault-context>` + `<vault-routing>` hint. Profile-driven budget/results/timeout; `CLAWMEM_HOOK_BUDGET_MS` is the authoritative internal deadline. |
 | `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
@@ -1033,14 +1037,14 @@ Built on the shoulders of:
 
 | Status | Feature | Description |
 |--------|---------|-------------|
-| :white_check_mark: | Adaptive thresholds | Ratio-based filtering that adapts to vault characteristics (v0.1.3) |
+| :white_check_mark: | Relevance admission | Distribution-relative admission on the fused ordering key with query-level abstention — replaced the v0.1.3 adaptive composite thresholds (v0.38.0) |
 | :white_check_mark: | Deep escalation | Budget-aware query expansion + cross-encoder reranking for `deep` profile |
 | :white_check_mark: | Cloud embedding providers | Jina, OpenAI, Voyage, Cohere with batch embedding + TPM pacing |
 | :construction: | Calibration probes | One-time `clawmem calibrate` command that measures your vault's score distribution and tunes thresholds automatically |
-| :construction: | Rolling threshold learning | Learns optimal activation floor from actual usage patterns (which surfaced content gets referenced vs ignored) |
+| :white_check_mark: | Judged hook eval harness | `clawmem eval hook-run` — labeled replay of the real hook with paired A/B counterfactuals, replicated draws, and acceptance gates (v0.38.0) |
 | :memo: | Multi-vault namespacing | Isolated vaults with independent calibration and lifecycle policies |
 | :memo: | REST API authentication | Token-scoped access for multi-agent deployments |
-| :memo: | Streaming rerank | Cross-encoder reranking within the hook timeout budget for larger candidate sets |
+| :white_check_mark: | Budget-bounded rerank lane | Deep-profile cross-encoder rerank inside the hook budget with full-coverage + degeneracy contracts (v0.38.0) |
 
 :white_check_mark: Shipped&ensp; :construction: Planned&ensp; :memo: Exploring
 

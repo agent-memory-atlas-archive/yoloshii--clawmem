@@ -95,6 +95,24 @@ describe("isHeartbeatPrompt", () => {
     expect(isHeartbeatPrompt("explain the architecture")).toBe(false);
     expect(isHeartbeatPrompt("fix the authentication bug")).toBe(false);
   });
+
+  it("does not classify words CONTAINING a heartbeat token as heartbeats", () => {
+    // Regression: bare substring matching gated every prompt containing
+    // "scoping" / "mapping" / "shipping" via includes("ping") — found by the
+    // hook replay harness (BUILD-0) on a real prompt.
+    expect(isHeartbeatPrompt("design the target scoping notes for the harness")).toBe(false);
+    expect(isHeartbeatPrompt("fix the source mapping in the build")).toBe(false);
+    expect(isHeartbeatPrompt("shipping the release tomorrow morning")).toBe(false);
+    expect(isHeartbeatPrompt("typing indicators for the chat pane")).toBe(false);
+  });
+
+  it("still detects word-bounded heartbeat tokens inside sentences", () => {
+    expect(isHeartbeatPrompt("just a ping to check in")).toBe(true);
+    expect(isHeartbeatPrompt("ping?")).toBe(true);
+    // A bad-boundary occurrence must not mask a later word-bounded one.
+    expect(isHeartbeatPrompt("scoping ping")).toBe(true);
+    expect(isHeartbeatPrompt("automated health check from the monitor")).toBe(true);
+  });
 });
 
 // ─── wasPromptSeenRecently ──────────────────────────────────────────

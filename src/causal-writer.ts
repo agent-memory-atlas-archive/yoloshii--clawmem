@@ -31,6 +31,7 @@
  *    fingerprint rechecked null-safely under the write lock.
  */
 
+import type { LegacyWallDeadline } from "./clock-legacy.ts";
 import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type { Store } from "./store.ts";
@@ -503,7 +504,7 @@ export async function runCausalStep(
     sessionId: string | null;
     mode: "shadow" | "on";
     newObservations: ObservationWithDoc[];
-    deadlineAt: number;
+    deadlineAt: LegacyWallDeadline;
     /** Config anomalies detected by the handler (bad budget/window env values),
      *  audited as document-scope `invalid_config` events on this run. */
     invalidConfigNotes?: string[];

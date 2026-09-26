@@ -17,7 +17,8 @@
  *      downstream secondary-vault path keys off the `_fromVault` tag the
  *      gated block sets, so the single gate must starve them all.
  *   3. ON: the same seed surfaces secondary-vault content, and the recall
- *      mirror writes — proving the gate enables, not just disables.
+ *      mirror writes once the parked bookkeeping job is applied (t60: the
+ *      drainer's code path) — proving the gate enables, not just disables.
  *
  * Hermetic per the topic-boost suite's pattern: CLAWMEM_CONFIG_DIR points at
  * a per-test tmp dir, CLAWMEM_VAULTS registers a per-test tmp vault file,
@@ -30,6 +31,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextSurfacing } from "../../src/hooks/context-surfacing.ts";
+import { consumePendingSurfacingBookkeeping, applySurfacingBookkeeping } from "../../src/hooks/surfacing-bookkeeping.ts";
 import { createTestStore } from "../helpers/test-store.ts";
 import {
   createStore,
@@ -188,6 +190,18 @@ describe("secondary-vault surfacing gate — config contract", () => {
   });
 });
 
+/**
+ * t60 (codex F59-1): the handler no longer writes the recall mirror inline —
+ * it parks a bookkeeping job for the off-process drainer. Applying the parked
+ * job here is the drainer's exact code path, so the mirror assertions below
+ * still exercise the production writes (and the OFF case proves the gate
+ * starves the job of any secondary-vault group even when the job IS applied).
+ */
+function drainBookkeeping(general: Store): void {
+  const job = consumePendingSurfacingBookkeeping();
+  if (job) applySurfacingBookkeeping(general, job);
+}
+
 describe("secondary-vault surfacing gate — hook-level", () => {
   it("OFF (default): a configured, matching secondary vault reaches neither the output nor the recall mirror", async () => {
     const vaultPath = seedSecondaryVault("vault-off.sqlite");
@@ -199,6 +213,7 @@ describe("secondary-vault surfacing gate — hook-level", () => {
       prompt: PROMPT,
       sessionId: "sess-gate-off",
     } as any);
+    drainBookkeeping(general); // t60: mirror writes land via the off-process drainer — apply them here
     const ctx = additionalContext(out);
 
     // The hook itself worked — general-vault content surfaced…
@@ -222,6 +237,7 @@ describe("secondary-vault surfacing gate — hook-level", () => {
       prompt: PROMPT,
       sessionId: "sess-gate-on",
     } as any);
+    drainBookkeeping(general); // t60: mirror writes land via the off-process drainer — apply them here
     const ctx = additionalContext(out);
 
     // Both vaults surface: the gate enables — it is not a permanent off switch.

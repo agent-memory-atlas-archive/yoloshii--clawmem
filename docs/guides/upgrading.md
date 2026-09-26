@@ -59,6 +59,26 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.38.0: channel-aware hook ranking, relevance admission, off-process bookkeeping
+
+**Drop-in.** Schema migrations are additive and auto-apply on first open: `dedupe_key` columns (with partial unique indexes) on `context_usage` and `recall_events` for idempotent off-process bookkeeping, and the `surfacing_diagnostics` table (created lazily the first time `CLAWMEM_SURFACING_TRACE=1` persists a trace). No reindex, no re-embed, no graph rebuild. MCP tools are unchanged — everything below is the context-surfacing hook.
+
+**Behavior changes to expect:**
+
+- **The surfaced set and its order can differ from v0.37.0.** Membership, final order, and admission now all run on one channel-aware ordering key (current-support band + weighted-RRF fused mass) — see [relevance admission](../concepts/hooks-vs-mcp.md#relevance-admission). The composite score no longer orders or admits hook output; it sizes the injection tiers only. Consequences: pins, co-activation, recency, and quality multipliers no longer change *which* documents the hook surfaces or their order (they still act on the composite MCP surfaces); the spreading-activation and memory-type-diversification stages are removed.
+- **The hook abstains instead of surfacing weak lists.** Two new empty-output classes: no current-turn support, and a keyword-degenerate basis (FTS agreed on nothing — the junk signature of gibberish or fully-off-vault prompts). An empty `<vault-context>` there is the designed outcome, not a regression.
+- **Session focus is presentation-only.** A focus topic now steers snippet selection only; the 1.4×/0.75× post-composite topic boost and the expansion/rerank intent threading are removed. The surfaced set and order are byte-identical with or without a focus.
+- **Turn alignment is fail-closed; bookkeeping left the hook.** The hook writes its `context_usage` alignment row at retrieval commit; if that write cannot land (writer contention), the hook emits nothing for that turn rather than injecting untracked context. Recall events, injected-paths fill-in, and secondary-vault mirrors are applied by a detached drainer through an on-disk spool (`<db dir>/surfacing-spool/`, new) — best-effort learning data, never turn alignment. `clawmem spool-drain` applies pending jobs manually; details in [architecture → Off-process surfacing bookkeeping](../concepts/architecture.md#off-process-surfacing-bookkeeping-v0380).
+- **Rerank caching is provider-identity-gated, and existing rerank cache entries invalidate once.** Remote rerank scores are cached only under an attested provider identity — run `clawmem rerank-health` once per endpoint to attest (7-day expiry; a failed probe revokes). Independently, the rerank request-construction revision was bumped (`RERANK_REQUEST_REV=2` — session focus removed from rerank intent), so previously cached rerank scores no longer match: the first deep-profile queries after upgrading re-score cold. Expected, not a defect.
+
+**Recommended (not required):** re-run `clawmem setup hooks` — it now derives the host hook timeout from the internal budget (`CLAWMEM_HOOK_BUDGET_MS`, default 6000ms; host ≥ 1.5s startup + budget), pins the budget into the installed hook command, and never reduces an existing larger timeout. `clawmem doctor` checks the inequality.
+
+**Restart the watcher after upgrading** (`systemctl --user restart clawmem-watcher.service`, or wherever `clawmem watch` runs). The hook's vector deadline is scoped to a watcher/daemon-backed deployment in v0.38.0, and `clawmem doctor` / `clawmem vec-daemon-health` attest the watcher's vector daemon by a ping round trip that only a v0.38 `clawmem watch` answers in full. A watcher still running pre-v0.38 code keeps serving vector queries but reports `live-legacy` (DB and pid unattested) until it is restarted on the new code, after which it reports `live` and advertises the `hydrated-v1` response protocol. The restart is also what activates the deadline-holding vector path: the v0.38 hook asks the daemon to hydrate and project results server-side (`hydrated-v1` — snippets, rerank text, and filter verdicts computed in the daemon, bodies never crossing the wire), so the hook performs no synchronous sqlite work inside its vector deadline. Against a pre-v0.38 daemon the hook transparently falls back to raw hits with client-side hydration — correct results, but the old timing shape.
+
+New knobs: `CLAWMEM_HOOK_BUDGET_MS`, `CLAWMEM_ADMISSION_POLICY` (eval control arm), `CLAWMEM_RERANK_DEGENERACY_GATE`, `CLAWMEM_RERANK_LANE_WEIGHT`, `CLAWMEM_RERANK_PROVIDER_ID`, `CLAWMEM_SURFACING_TRACE`, `CLAWMEM_PRIOR_VECTOR_INPROC` — see [configuration](../reference/configuration.md). New eval surface: `clawmem eval hook-run` / `hook-aggregate` — see [eval-harness](eval-harness.md#hook-replay-clawmem-eval-hook-run).
+
+---
+
 ## v0.37.0: reachable-but-wrong inference endpoints degrade instead of silently dying
 
 **No migration** — no schema change, no reindex, no re-embed. One behaviour change to

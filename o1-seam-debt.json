@@ -1,0 +1,175 @@
+{
+  "generated": "2026-08-27T11:26:57.363Z",
+  "note": "O1 brand debt (constructions + marked erasures) and the pre-existing diagnostics baseline (multiset, control-flow-contextual). One entry per debt marker (bijection). --write is retire-only. Activation requires ZERO entries.",
+  "entries": [
+    {
+      "id": "O1-DEBT-0001",
+      "kind": "construction",
+      "file": "src/hooks/context-surfacing.ts",
+      "scope": "contextSurfacing.internalDeadlineAt",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "29e306c6",
+      "text": "startTime + HOOK_BUDGET_MS as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0002",
+      "kind": "construction",
+      "file": "src/hooks/context-surfacing.ts",
+      "scope": "contextSurfacing.workDeadlineAt",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "861a61fc",
+      "text": "internalDeadlineAt - FINALIZATION_RESERVE_MS as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0003",
+      "kind": "construction",
+      "file": "src/hooks/context-surfacing.ts",
+      "scope": "contextSurfacing.vectorDeadline",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "ea9d2774",
+      "text": "Math.min(Date.now() + profile.vectorTimeout, workDeadlineAt - CANDIDATE_FLOOR_RESERVE_MS) as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0004",
+      "kind": "construction",
+      "file": "src/hooks/context-surfacing.ts",
+      "scope": "contextSurfacing.priorDeadline",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "5d611404",
+      "text": "Math.min(priorLegStart + priorTimeout, workDeadlineAt) as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0005",
+      "kind": "construction",
+      "file": "src/store.ts",
+      "scope": "rerank.timeoutDeadlineAt",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "7a5c3965",
+      "text": "Date.now() + options.timeoutMs as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0006",
+      "kind": "construction",
+      "file": "src/store.ts",
+      "scope": "rerank.effectiveDeadlineAt",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "b854faa5",
+      "text": "Math.min(timeoutDeadlineAt, deadlineAt) as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0007",
+      "kind": "construction",
+      "file": "src/vector-daemon.ts",
+      "scope": "startVectorDaemon.handleRequest",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "6bb6ea42",
+      "text": "parsed as VecReq"
+    },
+    {
+      "id": "O1-DEBT-0010",
+      "kind": "construction",
+      "file": "src/health/rerank-health.ts",
+      "scope": "probeRerankHealth.timeoutMs",
+      "brands": [
+        "DurationMs"
+      ],
+      "hash": "6dce7110",
+      "text": "(opts.timeoutMs ?? RERANK_PROBE_TIMEOUT_MS) as DurationMs"
+    },
+    {
+      "id": "O1-DEBT-0011",
+      "kind": "erasure",
+      "file": "src/vector-daemon.ts",
+      "scope": "daemonVecMatch.socket.open",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "c3f7bdf5",
+      "text": "req"
+    },
+    {
+      "id": "O1-DEBT-0012",
+      "kind": "construction",
+      "file": "src/hooks/decision-extractor.ts",
+      "scope": "decisionExtractor.deadlineAt",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "8c133174",
+      "text": "Date.now() + stopBudget.budgetMs as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0013",
+      "kind": "construction",
+      "file": "src/hooks/decision-extractor.ts",
+      "scope": "detectContradictions.searchDeadline",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "11cb229b",
+      "text": "deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0014",
+      "kind": "construction",
+      "file": "src/hooks/decision-extractor.ts",
+      "scope": "decisionExtractor.mergeResult",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "11cb229b",
+      "text": "deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline"
+    },
+    {
+      "id": "O1-DEBT-0015",
+      "kind": "construction",
+      "file": "src/hooks/decision-extractor.ts",
+      "scope": "decisionExtractor.antiMerge",
+      "brands": [
+        "LegacyWallDeadline"
+      ],
+      "hash": "11cb229b",
+      "text": "deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline"
+    }
+  ],
+  "knownDiagnostics": [
+    {
+      "file": "src/consolidation.ts",
+      "code": 2345,
+      "message": "Argument of type '[number[] | Float32Array<ArrayBufferLike>, number]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [Float32Array<ArrayBufferLike>] | [Uint8Array<ArrayBufferLike>] | ... 10 more ... | [...]'.   Type '[number[] | Float32Array<ArrayBufferLike>, number]' is not assignable to type 'SQLQueryBindings[]'.     Type 'number | number[] | Float32Array<ArrayBufferLike>' is not assignable to type 'SQLQueryBindings'.       Type 'number[]' is not assignable to type 'SQLQueryBindings'.         Type 'number[]' is not assignable to type 'Record<string, string | number | bigint | boolean | TypedArray<ArrayBufferLike> | null>'.           Index signature for type 'string' is missing in type 'number[]'.",
+      "scope": "computeSurprisalScores",
+      "context": "for(const doc of docs)>try",
+      "fingerprint": "aeb10638"
+    },
+    {
+      "file": "src/conversation-synthesis.ts",
+      "code": 2322,
+      "message": "Type '({ targetTitle: string; relationType: string; weight: number; } | null)[]' is not assignable to type 'ExtractedFactLink[]'.   Type '{ targetTitle: string; relationType: string; weight: number; } | null' is not assignable to type 'ExtractedFactLink'.     Type 'null' is not assignable to type 'ExtractedFactLink'.",
+      "scope": "normalizeExtractedFact",
+      "context": "",
+      "fingerprint": "45958b98"
+    },
+    {
+      "file": "src/conversation-synthesis.ts",
+      "code": 2677,
+      "message": "A type predicate's type must be assignable to its parameter's type.   Type 'ExtractedFactLink' is not assignable to type '{ targetTitle: string; relationType: string; weight: number; }'.     Types of property 'weight' are incompatible.       Type 'number | undefined' is not assignable to type 'number'.         Type 'undefined' is not assignable to type 'number'.",
+      "scope": "normalizeExtractedFact",
+      "context": "",
+      "fingerprint": "45958b98"
+    }
+  ]
+}

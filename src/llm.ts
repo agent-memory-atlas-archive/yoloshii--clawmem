@@ -25,6 +25,7 @@ type LlamaToken = any;
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
+import type { LegacyWallDeadline } from "./clock-legacy.ts";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -296,9 +297,13 @@ export interface LLM {
 
   /**
    * Expand a search query into multiple variations for different backends.
-   * Returns a list of Queryable objects.
+   * Returns a list of Queryable objects. deadlineAt (BUILD-3a): absolute
+   * epoch-ms deadline — the remote generation gets a real abort and
+   * unabortable local inference is structurally skipped (codex turn-25
+   * finding 1: the concrete class carried the option; the interface must
+   * expose the contract to typed consumers).
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string, deadlineAt?: LegacyWallDeadline }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -401,7 +406,12 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
 const ALLOWED_REMOTE_LLM_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 
-function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
+/**
+ * Exported so run-identity fingerprints record the SAME normalized value the
+ * inference layer honors (an unsupported effort normalizes to null here and
+ * must not fingerprint as a distinct topology — codex turn-10 finding 4).
+ */
+export function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
   const raw = (value || "").trim().toLowerCase();
   if (!raw) return null;
   if (!ALLOWED_REMOTE_LLM_REASONING_EFFORTS.has(raw)) {
@@ -1492,7 +1502,7 @@ export class LlamaCpp implements LLM {
     }
   }
 
-  private async expandQueryRemote(query: string, includeLexical: boolean, context?: string, intent?: string): Promise<Queryable[]> {
+  private async expandQueryRemote(query: string, includeLexical: boolean, context?: string, intent?: string, signal?: AbortSignal): Promise<Queryable[]> {
     // QMD-faithful terse prompt. The qmd-query-expansion-1.7B finetune was trained
     // on "/no_think Expand this search query: X" (cf. QMD src/llm.ts:1467). The prior
     // verbose prose prompt was out-of-distribution: the model echoed the template
@@ -1502,7 +1512,7 @@ export class LlamaCpp implements LLM {
       : `/no_think Expand this search query: ${query}`;
     if (context) prompt += `\nContext: ${context}`;
 
-    const result = await this.generateRemote(prompt, 500, 0.7);
+    const result = await this.generateRemote(prompt, 500, 0.7, signal);
     if (!result?.text) {
       return expansionFallback(query, includeLexical);
     }
@@ -1544,17 +1554,33 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string, deadlineAt?: LegacyWallDeadline } = {}): Promise<Queryable[]> {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
     const intent = options.intent;
+    // BUILD-3a (codex turn-24 finding 3): a deadline-carrying caller (the
+    // context-surfacing hook) gets a REAL abort on the remote fetch — an
+    // abandoned Promise.race does not stop the transport, and the pending
+    // work holds the hook PROCESS alive past its budget (the host waits on
+    // the process, not the handler's return).
+    const deadlineAt = options.deadlineAt;
+    const expandSignal = deadlineAt !== undefined
+      ? AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))
+      : undefined;
 
     // Remote LLM path — no grammar constraint, parse output instead
     if (this.remoteLlmUrl && !this.isRemoteLlmDown()) {
-      const result = await this.expandQueryRemote(query, includeLexical, context, intent);
+      const result = await this.expandQueryRemote(query, includeLexical, context, intent, expandSignal);
       // Check if transport failure set cooldown during this call
       if (!this.isRemoteLlmDown()) return result;
       // Transport failure — fall through to local grammar path
+    }
+
+    // A deadline-carrying caller must NEVER start unabortable local
+    // inference (codex turn-24 finding 3 — structural, not launcher-
+    // dependent): return the typed passthrough set instead.
+    if (deadlineAt !== undefined) {
+      return expansionFallback(query, includeLexical);
     }
 
     // Remote is in cooldown (pre-existing or just set) — fall through to local

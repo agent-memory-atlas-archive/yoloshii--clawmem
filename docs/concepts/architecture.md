@@ -331,7 +331,12 @@ The in-process `isRunning` reentrancy guard remains as the cheap first defense t
 
 ## Multi-turn prior-query lookback (v0.8.1)
 
-A single-prompt retrieval query is wrong when the user's current turn is short. "Do the same thing for X", "Explain that in more depth", and "Now talk about refresh tokens in the same design" are all legitimate questions whose intent lives in the *previous* turn, not the current one. v0.8.1 teaches `context-surfacing` to build its retrieval query from the current prompt plus up to two recent same-session prior prompts, so short follow-up turns inherit the vocabulary of earlier turns. Everything else (composite scoring, snippet extraction, reranking, dedupe, routing hints, recall attribution) continues to use the raw current prompt unchanged — only the discovery path sees the multi-turn query.
+A single-prompt retrieval query is wrong when the user's current turn is short. "Do the same thing for X", "Explain that in more depth", and "Now talk about refresh tokens in the same design" are all legitimate questions whose intent lives in the *previous* turn, not the current one. v0.8.1 introduced multi-turn lookback as a concatenated discovery query; **v0.38.0 reworked it into gated, discounted prior lanes** — concatenation let polluted thread vocabulary anchor the whole candidate set, and on the FTS leg (AND semantics) a joined query could only ever *narrow* recall. The mechanics now:
+
+- **A deterministic anaphora gate decides.** The prior leg runs only when the *current* prompt delegates its meaning to earlier turns: anaphoric/deictic markers, continuation openers, explicit conversation back-references, and strong continuation moves ("go deeper", "expand", "continue"). Weak discourse openers ("now", "so", "ok") stay behind a content-token threshold, so a self-contained imperative that merely opens with "now" never drags priors in.
+- **Priors are their own lanes, never a joined query.** Up to two recent same-session prior prompts (10-minute window, read from `context_usage.query_text`) each run their own BM25 list (`prior-fts` — one list per prior, because a joined FTS query is strictly narrower under AND semantics); the vector leg embeds the joined priors once (`prior-vector`), bounded to 400ms and **daemon-only** — without the vector-query daemon the leg is skipped rather than risk an unbounded synchronous in-process scan (`CLAWMEM_PRIOR_VECTOR_INPROC=1` is the eval/debug override).
+- **Discounted in fusion, band-separated in the output.** Prior lanes join the weighted RRF at a rank discount under the same mass cap + protected current-class slots as expansion lanes, and prior-only survivors carry band 1 — ordered strictly below every current-supported candidate and admitted only on the certified-prior edge (the current lanes returned nothing AND the gate certified delegation).
+- **Everything else stays on the raw current prompt** — query expansion, cross-encoder rerank, composite scoring, snippet extraction, file-path supplements, routing hints, recall attribution, dedupe, and heartbeat detection all see exactly what the user typed.
 
 The helper lives in `src/hooks/context-surfacing.ts` and is backed by a new nullable `query_text` column on `context_usage`.
 
@@ -347,14 +352,12 @@ Guarded with `PRAGMA table_info(context_usage)` the same way the existing `turn_
 
 Raw prompt text has privacy implications. Two classes of `logEmptyTurn` call site exist in `contextSurfacing`, and they get different treatment:
 
-- **Pre-retrieval gates** — slash commands (`prompt.startsWith("/")`), too-short prompts (`< MIN_PROMPT_LENGTH` — unless the prompt matches the memory-intent `FORCE_RETRIEVE_PATTERNS`, which are checked before every skip gate so short queries like "what did I say?" still reach retrieval), `shouldSkipRetrieval` hits (greetings, shell commands, affirmations), and `wasPromptSeenRecently` / `isHeartbeatPrompt` dedupe. These are not meaningful user questions and carry a higher sensitivity profile (they often contain incidental tool output or noise). They write a `context_usage` row with `query_text = NULL` to keep `turn_index` aligned with the transcript but not persist the raw text.
-- **Post-retrieval empty paths** — empty result set, all results in `FILTERED_PATHS`, all results snoozed, activation floor not met, adaptive threshold filter, and empty `buildContext`. These are legitimate user questions that simply didn't match anything. They write a row with `query_text = prompt` so a follow-up turn ("try again" / "what about Y") can still use the intent via multi-turn lookback.
+- **Pre-retrieval gates** — slash commands (`prompt.startsWith("/")`), too-short prompts (`< MIN_PROMPT_LENGTH` — unless the prompt matches the memory-intent `FORCE_RETRIEVE_PATTERNS`, which are checked before every skip gate so short queries like "what did I say?" still reach retrieval), and `shouldSkipRetrieval` hits (greetings, shell commands, affirmations). These are not meaningful user questions and carry a higher sensitivity profile (they often contain incidental tool output or noise). They write a `context_usage` row with `query_text = NULL` to keep `turn_index` aligned with the transcript but not persist the raw text. Heartbeat prompts and recent-duplicate prompts write **no row at all** — they are not transcript-visible user turns.
+- **Every turn that reaches retrieval** — since v0.38.0 the hook writes its alignment row **early, at retrieval commit**, with `query_text = prompt` and empty paths. One row covers every downstream outcome (successful injection, empty result set, filtered/snoozed-out sets, admission abstention, deadline skip), so a follow-up turn ("try again" / "what about Y") can always use the intent via multi-turn lookback. If the alignment insert cannot land (writer contention past the hook's bounded `busy_timeout`), the hook **fails closed** — it emits nothing for that turn rather than injecting untracked context, and the row count is unchanged so the next successful turn takes the vacated index. The injected-paths/token fill-in for the happy path is applied afterward by the off-process bookkeeping drainer (see [Recall tracking](#recall-tracking)) via a guarded `UPDATE` that verifies the exact row identity.
 
-The happy path (successful injection) also persists `query_text = prompt`.
+### Prior-query retrieval
 
-### Retrieval query construction
-
-`buildMultiTurnSurfacingQuery(store, sessionId, currentQuery, lookback=2, maxAgeMinutes=10, maxChars=2000)` fetches recent `query_text` rows via:
+`fetchRecentPriorQueries(store, sessionId, currentQuery, lookback=2, maxAgeMinutes=10)` — shared with the legacy `buildMultiTurnSurfacingQuery` helper, which is retained for compatibility but no longer used by the hook — fetches recent `query_text` rows via:
 
 ```sql
 SELECT query_text FROM context_usage
@@ -374,38 +377,9 @@ The self-match filter lives in SQL because pushing it into application code unde
 
 Fallback paths: missing `sessionId`, empty current prompt, missing `query_text` column on a pre-migration schema (SELECT throws → caught), and any other DB error all return the current prompt unchanged. The function never throws.
 
-### Current-first truncation
+### Which stages see prior turns
 
-The combined query format is:
-
-```
-<current prompt>
-
-<newest prior>
-
-<older prior>
-```
-
-(blank lines between segments). If the assembled string exceeds `maxChars` (default 2000), the algorithm drops older priors one at a time rather than truncating the head. The current prompt is **always** present verbatim in the result so the user's actual question anchors the retrieval. Only when the current prompt alone already exceeds `maxChars` (rare, because the handler enforces `MAX_QUERY_LENGTH` earlier) does the function return the truncated current prompt with priors omitted entirely.
-
-### Which retrieval stages use the combined query
-
-| Stage | Query used | Rationale |
-|---|---|---|
-| `searchVec` | combined | Discovery — inherit prior-turn vocabulary |
-| `searchFTS` (fast path) | combined | Discovery |
-| `searchFTS` (expanded variants) | combined | Discovery — expansion already reads from the combined query |
-| `expandQuery` | combined | The LLM expansion benefits from context |
-| File-path FTS supplements | raw current | File names live in the current prompt only; priors would pollute this channel |
-| Cross-encoder rerank | **raw current** | Rerank asks "how well does this doc match the user's current question" — diluting with older turns blurs the final ordering |
-| Composite scoring | raw current | Recency intent / content-type weighting is per-current-turn |
-| Snippet extraction | raw current | Highlighting should point at the user's current question |
-| Routing hint detection | raw current | "why did we decide X" is about the current turn's intent |
-| `hashQuery` for recall attribution | raw current | Each event should attribute to the specific turn that surfaced it |
-| `wasPromptSeenRecently` dedupe | raw current | Dedupe key is about the actual submitted text |
-| `isHeartbeatPrompt` check | raw current | Heartbeat detection runs on the raw input |
-
-This split keeps multi-turn lookback a discovery-only enhancement and ensures every downstream signal that depends on "what did the user actually type right now" continues to see exactly that.
+Only the two gated prior lanes (`prior-fts`, `prior-vector`) ever consume prior-turn text. Every current-class lane (vector, FTS, file-aware) and every downstream signal — query expansion, cross-encoder rerank, composite scoring, snippet extraction, routing hints, recall attribution (`hashQuery`), dedupe, heartbeat detection — runs on the raw current prompt. This keeps prior-turn lookback a gated, discounted discovery supplement: it can add candidates that the current turn's vocabulary missed, but it can never re-anchor the query, outvote current-turn support in fusion, or leak into relevance scoring of the user's actual question.
 
 ## Retrieval tiers
 
@@ -421,7 +395,18 @@ See [Hooks vs MCP](hooks-vs-mcp.md) for details.
 
 ClawMem tracks which documents are surfaced by retrieval, which queries surfaced them, and whether the assistant actually cited them. This data feeds lifecycle decisions (pin/snooze candidates) and provides empirical signals beyond raw search relevance.
 
-The `recall_events` table is an append-only log. Each time context-surfacing injects documents, it writes one event per injected doc with the query hash, search score, session ID, and turn index. The `feedback-loop` hook later marks which events were actually referenced in the assistant's response, using per-turn transcript segmentation to attribute references to specific turns rather than the session globally.
+The `recall_events` table is an append-only log. Each time context-surfacing injects documents, one event per injected doc is recorded with the query hash, search score, session ID, and turn index. The `feedback-loop` hook later marks which events were actually referenced in the assistant's response, using per-turn transcript segmentation to attribute references to specific turns rather than the session globally. Since v0.38.0 these rows are written by the off-process bookkeeping drainer (below) carrying per-row idempotency keys (`dedupe_key`, enforced by a partial unique index), so a crashed-and-retried job can never double-count a surfacing.
+
+### Off-process surfacing bookkeeping (v0.38.0)
+
+In normal production mode (`CLAWMEM_SURFACING_TRACE` off) the context-surfacing hook performs **zero SQLite or filesystem bookkeeping after its payload is assembled**, and its only in-lifetime write is the early alignment `context_usage` row at retrieval commit (turn index + prompt text, empty paths) — fail-closed: no row, no injection. (The one disclosed exception: with the diagnostic `CLAWMEM_SURFACING_TRACE=1` armed, the hook synchronously persists a `surfacing_diagnostics` trace after both clocks stop — outside every budget and reserve, which is why it is a diagnostic mode.) Everything else is learning data, and it leaves the process:
+
+1. **Park** — after emitting stdout, the CLI wrapper consumes the parked job (paths, token estimate, per-vault doc groups) and serializes it under a 32 KB cap (an oversized job is dropped fail-open).
+2. **Handoff** — the job is piped to a detached, unref'd `clawmem spool-ingest` child. The flush is raced against 250 ms; if the race is lost (a pathological pipe), the sink is unref'd and the child killed — the hook's lifetime is never extended by its own bookkeeping, at the cost of that turn's optional learning data. The alignment row is already durable either way.
+3. **Persist + drain** — the child does a bounded stdin read (aborts at the cap), validates the complete job shape, persists it to `<db dir>/surfacing-spool/` (tmp file + atomic rename), and drains the spool.
+4. **Apply** — draining claims each job by atomic rename (`<job>.json` → `.json.claim-<pid>`), then applies per **unit**: the guarded alignment `UPDATE` first, then recall events per vault group and the secondary-vault `context_usage` mirrors. Recall events and mirrors carry dedupe keys, so retries are idempotent; a thrown update defers all event units to the retry (events are never committed ahead of a settled update outcome); a definitively failed update (row absent or identity mismatch) writes events **unlinked** rather than attributing them to the wrong row. Completed units are checkpointed into the retained claim, dead-pid claims are reclaimed, and jobs older than 24 h are discarded as poison.
+
+`clawmem spool-drain` runs the same drain manually and is safe at any time — claim-by-rename makes concurrent drainers non-duplicating. The design trade is explicit: recall attribution and fill-in are **best-effort** off-process work; turn alignment and prompt history are not.
 
 The `recall_stats` table is a derived summary recomputed by the consolidation worker. It tracks per-document:
 

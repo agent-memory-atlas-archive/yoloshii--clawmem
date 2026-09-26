@@ -52,11 +52,13 @@ export function writeRecallEvents(
   queryHash: string,
   docs: { displayPath: string; searchScore: number }[],
   usageId?: number,
-  turnIndex?: number
+  turnIndex?: number,
+  /** t61 (codex F60-3): idempotency-key base — per-event key becomes `${base}:${docId}` and the store INSERT OR IGNOREs on it, so a drainer retry after a partial apply can never double-write an event. Omitted (non-drainer callers) = pre-t61 plain insert. */
+  opts?: { dedupeKeyBase?: string }
 ): number {
   if (!sessionId || docs.length === 0) return 0;
 
-  const resolved: { docId: number; queryHash: string; searchScore: number; sessionId: string }[] = [];
+  const resolved: { docId: number; queryHash: string; searchScore: number; sessionId: string; usageId?: number; turnIndex?: number; dedupeKey?: string }[] = [];
 
   for (const doc of docs) {
     const parts = doc.displayPath.split("/");
@@ -76,6 +78,7 @@ export function writeRecallEvents(
       sessionId,
       usageId,
       turnIndex,
+      ...(opts?.dedupeKeyBase ? { dedupeKey: `${opts.dedupeKeyBase}:${found.id}` } : {}),
     });
   }
 

@@ -7,7 +7,7 @@
  */
 
 import type { Store, SearchResult } from "../store.ts";
-import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
+import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore, rerankTextHash, isProjectedVecResult } from "../store.ts";
 import { searchVecBounded } from "../vector-daemon.ts";
 import { getVaultPath, getActiveProfile, surfaceSecondaryVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
@@ -29,21 +29,117 @@ import {
 } from "../memory.ts";
 import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
-import { shouldSkipRetrieval, hasForceRetrieveIntent, isRetrievedNoise } from "../retrieval-gate.ts";
+import { shouldSkipRetrieval, hasForceRetrieveIntent, isRetrievedNoise, needsPriorContext, contentTokenSet } from "../retrieval-gate.ts";
+import { selectCandidatePool, dropUnarbitrated, candidateKey, finalOrderingKeys, fuseRerankLane, compareOrderingKeys, relevanceAdmission, resolveAdmissionBasis, ADMISSION_PARAMS, ADMISSION_POLICY_ACTIVE, RERANK_LANE_ACTIVE, RERANK_DEGENERACY_GATE_ACTIVE, type LaneList, type FusionMembership, type OrderingKey } from "./surfacing-fusion.ts";
+import { assessRerankDegeneracy } from "../health/rerank-health.ts";
+import { vectorDaemonLikelyAvailable, searchVecDaemonRequired, type VecExecStatus, type VecResponseProtocol } from "../vector-daemon.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
-import { writeRecallEvents, hashQuery } from "../recall-buffer.ts";
-import { resolveSessionTopic, applyTopicBoost } from "../session-focus.ts";
+import { parseEvalNowTimestamp } from "../eval/run-identity.ts";
+import { hashQuery } from "../recall-buffer.ts";
+import { setPendingSurfacingBookkeeping, type SurfacingBookkeepingVaultGroup } from "./surfacing-bookkeeping.ts";
+import { resolveSessionTopic } from "../session-focus.ts";
 import {
   extractPromptEntities,
   buildVaultFactsBlock,
   type VaultFactsTriple,
 } from "../vault-facts.ts";
+import {
+  newSurfacingTrace,
+  traceLegHits,
+  liveSurfacingTraceEnabled,
+  persistSurfacingTrace,
+  type SurfacingTrace,
+  type TraceEmptyReason,
+} from "../eval/hook-trace.ts";
+import { PROFILES } from "../config.ts";
+import type { LegacyWallDeadline } from "../clock-legacy.ts";
 
 // =============================================================================
 // Config
 // =============================================================================
 
 // Profile-driven defaults (overridden by CLAWMEM_PROFILE env var via E14)
+/**
+ * The rerank request-construction revision moved to store.ts with BUILD-3b
+ * (it now also keys the rerank cache, and store.ts owns the transport
+ * projection the rev pins). Re-exported here so eval/test importers keep
+ * their import path.
+ */
+export { RERANK_REQUEST_REV } from "../store.ts";
+
+/**
+ * BUILD-3a (C2c/C3): the hook's AUTHORITATIVE internal time budget. The
+ * handler derives every deadline from THIS value — never from host settings
+ * (the host timeout is an outer kill switch, not the schedule). Invalid,
+ * non-finite, or non-positive values fall back to the default — the budget
+ * can never be disabled, only sized. Values below MIN_HOOK_BUDGET_MS clamp
+ * up (a sub-second budget cannot complete even the fast path honestly).
+ */
+export const DEFAULT_HOOK_BUDGET_MS = 6000;
+export const MIN_HOOK_BUDGET_MS = 1000;
+export function resolveHookBudgetMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_HOOK_BUDGET_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_HOOK_BUDGET_MS;
+  return Math.max(MIN_HOOK_BUDGET_MS, Math.floor(n));
+}
+export const HOOK_BUDGET_MS = resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
+
+/**
+ * Tail of the budget reserved for finalization (failure guard, filters,
+ * enrich, composite, admission, ordering, buildContext, injection writes,
+ * facts/relations, emit):
+ * workDeadlineAt = internalDeadlineAt − this reserve, and EVERY
+ * pre-finalization stage (vector legs, prior leg, expansion, rerank) is
+ * bounded by workDeadlineAt — no stage may spend the tail (codex turn-24
+ * finding 4). The constant is VALIDATED by the eval harness — not just the
+ * aggregate finalizationMs against the reserve gate, but the per-substage
+ * breakdown (trace.timings.finalizationSubstages, BUILD-3d.4) so the harness
+ * measures WHERE the tail is spent, never a bare assertion (codex turn-47
+ * finding 2). It is not adaptively read on the hot path — a DB read at hook
+ * start would spend the budget it protects.
+ *
+ * 500ms, sized to the measured NON-STALL finalization after the co-activation
+ * write was batched into one transaction (the per-pair autocommit fsync had
+ * dominated the injection tail at ~3s; recordCoActivation in store.ts). Across
+ * probes 3-4 on the prod-scale snapshot, deep finalization is ~120-335ms
+ * (enrich + filter + inject + facts, all output-critical) — 500ms covers it
+ * with margin while leaving 5500ms of the 6000ms budget for candidate gen.
+ *
+ * HONEST LIMIT (codex turn-48 finding 3): NO fixed reserve deadline-bounds a
+ * synchronous SQLite commit — a rare fsync/WAL stall under host I/O contention
+ * still exceeds any value (one probe-4 rep hit inject=2780ms). BUILD-5 + t60
+ * (codex F59-1/2) landed the structural closure: the ONLY SQLite write left in
+ * the handler is the early alignment/query-history row at retrieval commit
+ * (bounded by the hook process's busy_timeout, and required for turn_index /
+ * prior-lookback correctness); the injection bookkeeping (paths/tokens UPDATE,
+ * recall events, per-vault mirror) is handed off after payload assembly to an
+ * off-process drainer via surfacing-bookkeeping.ts — a stalled commit blocks
+ * the DRAINER, never hook output. finalizationMs (what this reserve bounds)
+ * measures output-critical construction only; the in-handler handoff cost is
+ * measured separately as postOutputMs, outside the reserve contract.
+ */
+export const FINALIZATION_RESERVE_MS = 500;
+
+/**
+ * Cold-start allowance the HOST timeout must provide ON TOP of the internal
+ * budget (fresh Bun process + sqlite open before handlerStart). Installer
+ * writes hostTimeout ≥ (this + HOOK_BUDGET_MS); doctor enforces it.
+ */
+export const STARTUP_ALLOWANCE_MS = 1500;
+
+/**
+ * The guaranteed candidate FLOOR (codex turn-25 finding 2): the primary FTS
+ * leg and fusion are the hook's usefulness floor — both synchronous and
+ * <10ms — and their time is CARVED OUT of the current-vector cap (the vector
+ * leg ends this much before the work deadline), so the floor always runs
+ * with reserved time rather than abstaining. OPTIONAL candidate legs (prior
+ * FTS/vector, the secondary-vault open+search, file-aware FTS) are instead
+ * SKIPPED once the work window has closed — supplements degrade, the floor
+ * does not.
+ */
+export const CANDIDATE_FLOOR_RESERVE_MS = 50;
+
 const DEFAULT_TOKEN_BUDGET = 800;
 const DEFAULT_MAX_RESULTS = 10;
 const DEFAULT_MIN_SCORE = 0.45;
@@ -62,6 +158,27 @@ const FILTERED_PATHS = ["_PRIVATE/", "experiments/", "_clawmem/"];
 
 // Memory nudge: prompt agent to use lifecycle tools after N prompts without use
 const NUDGE_INTERVAL = parseInt(process.env.CLAWMEM_NUDGE_INTERVAL || "15", 10);
+/**
+ * BUILD-4 turn-55 (codex turn-54 finding 3): frozen evaluation clock —
+ * eval-only. CLAWMEM_EVAL_NOW (ISO timestamp) pins the composite
+ * recency/confidence clock so both arms of an admission_policy pair compute
+ * IDENTICAL composite policy inputs from the shared snapshot; without it,
+ * wall-clock drift between the arms perturbs recency and defeats strict
+ * admission-ledger comparison. Unset or unparsable (production) = wall
+ * clock (null). Recorded in the run identity (eval_now) so a clock mismatch
+ * refuses the pair.
+ */
+export function resolveEvalNow(): Date | null {
+  const raw = process.env.CLAWMEM_EVAL_NOW;
+  if (!raw) return null;
+  // STRICT canonical parse (codex t55 CR-6) — the same parser identity
+  // validation uses. An invalid value resolves null HERE because a
+  // production hook fails open; an EVAL RUN refuses it before scoring
+  // (assertEvalNowConfig in hook-run), so a typo can never silently select
+  // wall time inside an experiment.
+  return parseEvalNowTimestamp(raw);
+}
+
 const LIFECYCLE_HOOK_NAMES = ["memory_pin", "memory_forget", "memory_snooze", "lifecycle-archive"];
 const NUDGE_TEXT = "You haven't managed memory recently. If vault-context is surfacing noise → snooze it. If a critical decision was just made → pin it. If stale knowledge appeared → forget it.";
 
@@ -96,11 +213,97 @@ const FILE_PATH_RE = /(?:^|\s)((?:\/[\w.@-]+)+(?:\.\w+)?|[\w.@-]+\.(?:ts|js|py|m
 // Handler
 // =============================================================================
 
+/**
+ * Options for `contextSurfacing`. `trace` is the BUILD-0 provenance envelope:
+ * when supplied (hook replay-eval harness) the handler records per-stage
+ * ground truth into it. Collection is observation-only — it never changes
+ * retrieval, ranking, admission, or output. When absent, the live
+ * CLAWMEM_SURFACING_TRACE knob can self-arm a trace that is persisted into
+ * `surfacing_diagnostics` on completion.
+ */
+export interface ContextSurfacingOptions {
+  trace?: SurfacingTrace;
+}
+
 export async function contextSurfacing(
   store: Store,
-  input: HookInput
+  input: HookInput,
+  opts?: ContextSurfacingOptions
 ): Promise<HookOutput> {
   let prompt = input.prompt?.trim();
+
+  // BUILD-0 provenance trace (observation-only). Self-armed live persistence
+  // only when the caller did NOT supply a trace — a harness-owned trace is the
+  // harness's to keep, never written into the vault under diagnosis.
+  const selfArmed = !opts?.trace && liveSurfacingTraceEnabled();
+  const trace = opts?.trace ?? (selfArmed ? newSurfacingTrace() : undefined);
+  const traceT0 = Date.now();
+  // BUILD-3a: set when the deep escalation block concludes (success or
+  // catch) — everything after it is finalization, measured against
+  // FINALIZATION_RESERVE_MS by the observed eval invariant.
+  let escalationEndAt: number | null = null;
+  // BUILD-3d.4: substage stamps across the finalization window (escalation
+  // end → emit). finStamp records a monotonic boundary timestamp; finish()
+  // turns the reached stamps into per-substage deltas so the harness can see
+  // WHERE the reserve is spent (codex turn-47 finding 2). Recording is
+  // unconditional (Date.now() is free); the breakdown is computed only for
+  // deep reps (escalationEndAt !== null), matching finalizationMs.
+  const finStamps: Record<string, number> = {};
+  const finStamp = (label: string): void => { finStamps[label] = Date.now(); };
+  const finish = (out: HookOutput, outcome: "injected" | "empty", emptyReason?: TraceEmptyReason): HookOutput => {
+    if (trace) {
+      trace.outcome = outcome;
+      trace.emptyReason = emptyReason ?? null;
+      trace.timings.totalMs = Date.now() - traceT0;
+      // t60 (codex F59-3): postOutputMs is a property of the PAYLOAD boundary,
+      // not of the deep finalization clock — measure payload-assembled → emit
+      // for every payload-bearing profile (balanced/speed included). Stays
+      // null when no payload was assembled (empty outcomes).
+      {
+        const emitAt = Date.now();
+        const payloadAt = finStamps["payload"];
+        trace.timings.postOutputMs = payloadAt !== undefined ? emitAt - payloadAt : null;
+      }
+      if (escalationEndAt !== null) {
+        const emitAt = Date.now();
+        // BUILD-5 (the t48 option-B contract change, codex-authorized):
+        // finalizationMs bounds escalation end → PAYLOAD ASSEMBLED — the
+        // output-critical construction the reserve exists to protect. The
+        // post-output bookkeeping writes are measured separately as
+        // postOutputMs and are NOT part of the reserve contract (no fixed
+        // reserve deadline-bounds a synchronous SQLite commit). An empty
+        // return never assembles a payload; its finalization runs to emit.
+        const payloadAt = finStamps["payload"];
+        const finalEndAt = payloadAt ?? emitAt;
+        trace.timings.finalizationMs = finalEndAt - escalationEndAt;
+        // Deltas from escalation end through whichever boundaries were
+        // reached (an early empty return sets fewer stamps). "tail" is the
+        // remainder after the last boundary up to the payload boundary.
+        const order = ["filters", "enrich", "scoring", "ordering", "buildContext", "facts"];
+        const sub: Record<string, number> = {};
+        let prev = escalationEndAt;
+        for (const k of order) {
+          const t = finStamps[k];
+          if (t === undefined) break;
+          sub[k] = t - prev;
+          prev = t;
+        }
+        sub.tail = finalEndAt - prev;
+        trace.timings.finalizationSubstages = sub;
+      }
+      if (selfArmed) {
+        // DIAGNOSTIC-MODE ONLY (CLAWMEM_SURFACING_TRACE armed, no caller-supplied
+        // trace). This synchronous persist (table-create + insert + prune + JSON)
+        // runs AFTER totalMs/finalizationMs are stamped, so it is deliberately
+        // OUTSIDE both the reserve and budget clocks and is NOT covered by the
+        // deadline guarantee (codex turn-48 finding 4). It never runs in the eval
+        // harness (which supplies its own trace) or in production hooks with the
+        // knob off — arming it is a debugging choice that accepts the extra tail.
+        persistSurfacingTrace(store.db, input.sessionId, (input as any)._turnIndex, trace);
+      }
+    }
+    return out;
+  };
 
   // Compute turn_index FIRST, before any early returns.
   // Every transcript-visible early return must log an empty context_usage row
@@ -123,8 +326,9 @@ export async function contextSurfacing(
   // say?") must reach retrieval; only short prompts WITHOUT memory intent
   // take the length early-return. Empty prompts still return unconditionally.
   if (!prompt || (prompt.length < MIN_PROMPT_LENGTH && !hasForceRetrieveIntent(prompt))) {
+    const reason: TraceEmptyReason = !prompt ? "gate:empty-prompt" : "gate:short-prompt";
     logEmptyTurn(store, input);
-    return makeEmptyOutput("context-surfacing");
+    return finish(makeEmptyOutput("context-surfacing"), "empty", reason);
   }
 
   // Bound query length to prevent DoS on search indices
@@ -133,26 +337,40 @@ export async function contextSurfacing(
   // Skip slash commands — log empty turn for alignment
   if (prompt.startsWith("/")) {
     logEmptyTurn(store, input);
-    return makeEmptyOutput("context-surfacing");
+    return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:slash-command");
   }
 
   // Adaptive retrieval gate: skip greetings, shell commands, affirmations, etc.
   if (shouldSkipRetrieval(prompt)) {
     logEmptyTurn(store, input);
-    return makeEmptyOutput("context-surfacing");
+    return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:skip-retrieval");
   }
 
   // Heartbeat / duplicate suppression (IO4) — NOT transcript-visible user turns
-  if (isHeartbeatPrompt(prompt)) return makeEmptyOutput("context-surfacing");
+  if (isHeartbeatPrompt(prompt)) return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:heartbeat");
   if (wasPromptSeenRecently(store, "context-surfacing", prompt)) {
-    return makeEmptyOutput("context-surfacing");
+    return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:recent-duplicate");
   }
 
   // Load active performance profile (E14)
   const profile = getActiveProfile();
   const maxResults = profile.maxResults;
   const tokenBudget = profile.tokenBudget;
-  const startTime = Date.now();
+  // BUILD-3a (C2c/C3): the budget clock anchors at HANDLER ENTRY (traceT0 —
+  // turn-index, gating and dedup work spend the budget too; codex turn-23
+  // finding 3), and every deadline in this handler derives from the internal
+  // budget. The rerank window ends a FINALIZATION_RESERVE before the
+  // internal deadline so a full-window rerank still leaves time for the
+  // guard/ordering/emit tail.
+  const startTime = traceT0;
+  const internalDeadlineAt = startTime + HOOK_BUDGET_MS as LegacyWallDeadline /* O1-DEBT-0001 */;
+  const workDeadlineAt = internalDeadlineAt - FINALIZATION_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0002 */;
+
+  if (trace) {
+    // Mirror getActiveProfile's name resolution (unknown names fall back to balanced).
+    const envProfile = process.env.CLAWMEM_PROFILE || "balanced";
+    trace.profileName = envProfile in PROFILES ? envProfile : "balanced";
+  }
 
   // High-fix (B3): the hook's writes to the MAIN store are bounded by the
   // busy_timeout cmdHook set for this process (1500ms for context-surfacing).
@@ -169,15 +387,50 @@ export async function contextSurfacing(
   } catch { /* keep default */ }
   const skillStoreOpts = { busyTimeout: hookBusyTimeout };
 
+  // BUILD-5 t60 (codex F59-2): the turn's context_usage row is ALIGNMENT-
+  // CRITICAL, not optional bookkeeping — turn_index derives from this table's
+  // row count and the next turn's prior-context leg reads query_text from it.
+  // Write it HERE, at retrieval commit (every pre-retrieval gate has passed),
+  // with the raw prompt and empty paths, so a later deadline-skip or crash
+  // loses only the injected-paths/tokens fill-in (learning signal, applied
+  // off-process by the bookkeeping drainer) and never the turn alignment or
+  // the prompt history. Bounded: the write waits at most this process's
+  // busy_timeout (1500ms under cmdHook). The prior-leg lookback excludes the
+  // current turn by query_text inequality, so this earlier write is invisible
+  // to it.
+  //
+  // t61 (codex F60-2): the write is bounded, NOT guaranteed — busy_timeout
+  // bounds lock waits, and a commit/WAL/fsync stall or lockout makes it fail
+  // open. When that happens the hook FAILS THE INJECTION (empty return,
+  // "alignment-unavailable") instead of injecting an untracked turn: an
+  // injected turn without its context_usage row corrupts count-derived
+  // turn_index for every later turn and silently drops this prompt from
+  // prior-context retrieval — the alignment defect F59-2 exists to prevent.
+  // No row could be written, so the failed turn leaves the count unchanged
+  // and the NEXT successful turn takes the index this one would have had —
+  // alignment holds by construction: no injection without its row.
+  let alignmentUsageId = -1;
+  if (input.sessionId) {
+    alignmentUsageId = logInjection(store, input.sessionId, "context-surfacing", [], 0, (input as any)._turnIndex ?? 0, prompt);
+    if (alignmentUsageId <= 0) {
+      return finish(makeEmptyOutput("context-surfacing"), "empty", "alignment-unavailable");
+    }
+  }
+
   // §11.4: Resolve session-scoped focus topic. Primary signal is the
   // per-session focus file at ~/.cache/clawmem/sessions/<id>.focus
   // (file > env var precedence via resolveSessionTopic). Env var
   // CLAWMEM_SESSION_FOCUS is a debug-only override and does NOT
-  // provide per-session scoping on multi-session hosts. Used as
-  // (a) optional `intent` on expandQuery/rerank/extractSnippet call
-  // sites below, and (b) the driver for the post-composite topic
-  // boost stage. Fail-open: missing / unreadable / corrupt / empty /
-  // oversized focus file → undefined → every consumer no-ops.
+  // provide per-session scoping on multi-session hosts.
+  //
+  // t61 (codex F60-1): PRESENTATION ONLY. The topic feeds extractSnippet
+  // (snippet selection inside buildContext) and nothing else. It is NOT
+  // passed to expandQuery or rerank: expansion variants change candidate
+  // MEMBERSHIP and rerank intent changes fused mass/order, so a session
+  // preference reaching either is a metadata signal crossing into ordering —
+  // the same class C5 deleted with the topic boost. Fail-open: missing /
+  // unreadable / corrupt / empty / oversized focus file → undefined →
+  // snippet selection no-ops.
   const sessionTopic = resolveSessionTopic(
     input.sessionId,
     process.env.CLAWMEM_SESSION_FOCUS
@@ -186,39 +439,99 @@ export async function contextSurfacing(
   const isRecency = hasRecencyIntent(prompt);
   const minScore = isRecency ? MIN_COMPOSITE_SCORE_RECENCY : profile.minScore;
 
-  // Ext 6b: Build the retrieval query from the current prompt plus up to
-  // MULTI_TURN_LOOKBACK recent same-session prior prompts. Used only for
-  // the discovery path (vector, FTS, query expansion, reranking) so that
-  // a short "do that" / "same for X" turn can inherit the vocabulary of
-  // earlier turns. All other prompt-dependent signals (recency intent,
-  // composite scoring, recall attribution, snippet highlighting, routing
-  // hints, dedupe, heartbeat check) continue to use the raw current
-  // prompt. If the session has no priors in the window, the helper
-  // returns the current prompt unchanged.
-  const retrievalQuery = input.sessionId
-    ? buildMultiTurnSurfacingQuery(store, input.sessionId, prompt)
-    : prompt;
+  if (trace) {
+    trace.sessionTopic = sessionTopic ?? null;
+    trace.isRecencyIntent = isRecency;
+  }
 
-  // Search: try vector first (if profile allows), fall back to BM25
-  // When vector succeeds, also supplement with FTS for keyword-exact recall
-  let results: SearchResult[] = [];
+  // BUILD-1 (C1) — supersedes the Ext 6b concatenation: every retrieval leg
+  // now queries the CURRENT prompt; prior turns enter as their own gated,
+  // discounted lanes fused below it. Concatenating priors let polluted
+  // thread vocabulary anchor the whole candidate set (Addendum 4), and on
+  // the FTS leg (AND semantics) could only ever NARROW recall. The prior
+  // leg is enabled ONLY by the deterministic anaphora/underspecification
+  // test on the current prompt (CONTRACT-1e). All other prompt-dependent
+  // signals (recency intent, composite scoring, recall attribution, snippet
+  // highlighting, routing hints, dedupe, heartbeat check) continue to use
+  // the raw current prompt, as before.
+  const priorDecision = needsPriorContext(prompt);
+  const priors = input.sessionId ? fetchRecentPriorQueries(store, input.sessionId, prompt) : [];
+  const priorLegEnabled = priorDecision.enabled && priors.length > 0;
+  if (trace) {
+    trace.retrievalQuery = { current: prompt, priors: priorLegEnabled ? [...priors] : [], combined: prompt, multiTurn: priorLegEnabled, truncated: false };
+    trace.priorLeg = { enabled: priorLegEnabled, reason: priorDecision.reason, priorsUsed: priorLegEnabled ? priors.length : 0 };
+  }
+
+  // Search — C1 lane collection: every leg contributes a ranked list; pool
+  // MEMBERSHIP is decided by weighted fusion with the C1c mass cap and
+  // protected current-supported slots (surfacing-fusion.ts). Ordering of the
+  // pool downstream stays composite until BUILD-2.
+  const lanes: LaneList[] = [];
+  const currentContentTokens = contentTokenSet(prompt);
+  // Per-candidate gate tokens (CONTRACT-1d, codex turn-7 SPEC-3): the current
+  // prompt's content tokens; on a pure-anaphora prompt (zero content tokens)
+  // the PRIOR turns' tokens, so the gate checks candidates against the
+  // context the prompt delegates to instead of passing vacuously. Both empty
+  // → the gate fails closed inside passesCurrentQueryGate.
+  let gateTokens: ReadonlySet<string> = currentContentTokens;
+  let gateTokenSource: "current" | "prior" | "none" = currentContentTokens.size > 0 ? "current" : "none";
+  if (currentContentTokens.size === 0 && priorLegEnabled) {
+    const priorTokens = contentTokenSet(priors.join(" "));
+    if (priorTokens.size > 0) {
+      gateTokens = priorTokens;
+      gateTokenSource = "prior";
+    }
+  }
+
+  // Vector execution protocol (codex t76): daemon-REQUIRED under the replay-eval's daemon-backed
+  // protocol; otherwise the production contract (daemon when live, in-process fallback when not).
+  // Read per call — the eval arms it at run time, after this module was imported.
+  const vectorDaemonRequired = process.env.CLAWMEM_VECTOR_DAEMON_REQUIRED === "1";
+  const recordVectorLeg = (leg: "primary" | "prior" | "deep") => (path: VecExecStatus, protocol?: VecResponseProtocol): void => {
+    if (trace) (trace.vectorLegs ??= []).push({ leg, path, ...(protocol ? { protocol } : {}) });
+  };
+  // hydrated-v1 request inputs (codex #28 t87 F4): snippet construction runs against the RAW
+  // CURRENT PROMPT + resolved session topic on EVERY leg — the prior leg searches with joined
+  // priors and deep legs with expansion variants, but presentation is always the current prompt.
+  const hydration = { presentationQuery: prompt, intent: sessionTopic };
+  // Codex t81 P1+P2: one measured record per COMPLETED vector invocation — its
+  // finish vs its OWN absolute deadline (over_ms > 0 ⇒ finished LATE, INCLUDING
+  // the synchronous client hydrate), and the duration it was actually allotted.
+  const recordVectorLegDeadline = (leg: "primary" | "prior" | "deep", deadlineAbs: LegacyWallDeadline, startedAt: number): void => {
+    if (trace) (trace.vectorLegDeadlines ??= []).push({ leg, over_ms: Date.now() - deadlineAbs, budget_ms: deadlineAbs - startedAt });
+  };
+
+  // Current vector leg (if profile allows)
+  let vectorResults: SearchResult[] = [];
   if (profile.useVector) {
     let vectorTimer: ReturnType<typeof setTimeout> | undefined;
+    let primaryDeadlineAbs: LegacyWallDeadline | undefined;
+    const vectorT0 = Date.now();
     try {
       // Pass a wall-clock deadline into searchVec: the Promise.race below abandons the vector
       // promise on timeout but cannot CANCEL it (and cannot interrupt its synchronous scan). The
       // deadline makes searchVec self-abort before the blocking MATCH, so a slow embed cannot let
       // an already-timed-out vector leg resume and re-block the hook after it fell back to FTS.
-      const vectorDeadline = Date.now() + profile.vectorTimeout;
+      // Capped by the work deadline MINUS the candidate floor reserve
+      // (codex turn-23 finding 3 + turn-25 finding 2): the vector leg can
+      // never eat the primary-FTS/fusion floor's reserved slice.
+      const vectorDeadline = Math.min(Date.now() + profile.vectorTimeout, workDeadlineAt - CANDIDATE_FLOOR_RESERVE_MS) as LegacyWallDeadline /* O1-DEBT-0003 */;
+      primaryDeadlineAbs = vectorDeadline;
       // searchVecBounded runs Step 1 (the blocking MATCH) in the vector daemon when it is live, so the
       // Promise.race timer below can ACTUALLY fire (this event loop stays free during the scan). When the
       // daemon is absent it falls back to the in-process searchVec unchanged; when the daemon is
       // busy/errors it returns [] and we drop to FTS below.
-      const vectorPromise = searchVecBounded(store, retrievalQuery, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline);
+      // CLAWMEM_VECTOR_DAEMON_REQUIRED=1 (the replay-eval's daemon-backed protocol, codex t76
+      // constraint 4): the leg is daemon-REQUIRED — an absent/stale daemon returns [] (the evaluator
+      // refuses the run as daemon loss) and the in-process synchronous scan is never entered, so the
+      // timer above is authoritative by construction. Production hooks never set it.
+      const vectorPromise = vectorDaemonRequired
+        ? searchVecDaemonRequired(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, recordVectorLeg("primary"), hydration)
+        : searchVecBounded(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, recordVectorLeg("primary"), hydration);
       const timeoutPromise = new Promise<SearchResult[]>((_, reject) => {
-        vectorTimer = setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout);
+        vectorTimer = setTimeout(() => reject(new Error("vector timeout")), Math.max(1, vectorDeadline - Date.now()));
       });
-      results = await Promise.race([vectorPromise, timeoutPromise]);
+      vectorResults = await Promise.race([vectorPromise, timeoutPromise]);
     } catch (e) {
       // Vector search unavailable, timed out, or errored — fall back to BM25. A vault-wide
       // embedding-model mismatch is a persistent config error, not a transient miss: surface it
@@ -228,20 +541,84 @@ export async function contextSurfacing(
       // Clear the timer when the vector promise won the race: a pending (ref'd) setTimeout keeps the
       // Bun hook process alive for the full vectorTimeout after results are already in hand.
       if (vectorTimer) clearTimeout(vectorTimer);
+      // Recorded on EVERY path — the timed-out leg is exactly the one whose
+      // wall time the replay-eval must see (success-only stamping left it
+      // null whenever the race timer won against the daemon's own deadline).
+      if (trace) trace.timings.vectorMs = Date.now() - vectorT0;
+      // Codex t81 P2: the primary leg's finish vs its OWN deadline (the min()
+      // above), measured in the finally so the late client hydrate is included.
+      if (primaryDeadlineAbs !== undefined) recordVectorLegDeadline("primary", primaryDeadlineAbs, vectorT0);
     }
   }
+  if (vectorResults.length > 0) lanes.push({ lane: "vector", results: vectorResults });
 
-  if (results.length === 0) {
-    results = store.searchFTS(retrievalQuery, maxResults);
+  // Current FTS leg: full fallback when vector returned nothing, keyword-exact
+  // supplement alongside it otherwise (<10ms either way). DELIBERATELY not
+  // work-deadline-guarded: this is the guaranteed candidate FLOOR — its time
+  // is reserved out of the vector cap (CANDIDATE_FLOOR_RESERVE_MS), chosen
+  // over abstaining (codex turn-25 finding 2's explicit policy question).
+  if (vectorResults.length === 0) {
+    const ftsFallback = store.searchFTS(prompt, maxResults);
+    if (ftsFallback.length > 0) lanes.push({ lane: "fts-fallback", results: ftsFallback });
   } else {
-    // Supplement vector results with FTS for keyword-exact matches (<10ms)
-    const seen = new Set(results.map(r => r.filepath));
-    const ftsSupplemental = store.searchFTS(retrievalQuery, 5);
-    for (const r of ftsSupplemental) {
-      if (!seen.has(r.filepath)) {
-        seen.add(r.filepath);
-        results.push(r);
-      }
+    const ftsSupplemental = store.searchFTS(prompt, 5);
+    if (ftsSupplemental.length > 0) lanes.push({ lane: "fts-supplement", results: ftsSupplemental });
+  }
+
+  // Prior-turns leg (CONTRACT-1e): runs ONLY when the anaphora gate certified
+  // that the current prompt delegates its meaning to earlier turns. Each
+  // prior gets its own BM25 list (AND semantics make a joined FTS query
+  // strictly narrower — never join); the vector leg embeds the joined priors
+  // once under a tight bound.
+  // Skipped once the work window has closed (codex turn-25 finding 2) — the
+  // prior leg is a supplement; a pathological earlier overrun (a sync scan
+  // the race could not interrupt) must not also spend the reserved tail.
+  if (priorLegEnabled && Date.now() < workDeadlineAt) {
+    for (const p of priors) {
+      // Re-checked before EVERY search (codex turn-26): a first synchronous
+      // search that crosses the deadline must not let the remaining ones
+      // start inside the finalization reserve.
+      if (Date.now() >= workDeadlineAt) break;
+      try {
+        const hits = store.searchFTS(p, 5);
+        if (hits.length > 0) lanes.push({ lane: "prior-fts", results: hits, variantQuery: p });
+      } catch { /* non-fatal */ }
+    }
+    // Daemon-only (codex turn-6 S1 + turn-7 STANDARDS-1): without the vector
+    // daemon, the in-process fallback's synchronous MATCH blocks the event
+    // loop and the race timer below cannot fire — the 400ms bound would not
+    // be real. The prior leg is supplementary, so it is skipped rather than
+    // risked; its FTS lists above still run. The existsSync pre-check is only
+    // a fast skip — the leg goes through searchVecDaemonRequired, which
+    // returns [] on a STALE socket (connect refused) instead of falling back
+    // to the in-process scan. CLAWMEM_PRIOR_VECTOR_INPROC=1 is the
+    // eval/testing override (the replay harness measures the leg on
+    // daemon-less snapshots with it) — only it may take the in-process path.
+    const priorVecInproc = process.env.CLAWMEM_PRIOR_VECTOR_INPROC === "1";
+    const priorVectorAllowed = priorVecInproc || vectorDaemonLikelyAvailable(store.dbPath);
+    // Re-checked immediately before starting (codex turn-26): the FTS loop
+    // above may have consumed the window.
+    if (profile.useVector && priorVectorAllowed && Date.now() < workDeadlineAt) {
+      const joinedPriors = priors.join("\n\n").slice(0, MULTI_TURN_MAX_CHARS);
+      const priorTimeout = Math.min(400, profile.vectorTimeout);
+      let priorTimer: ReturnType<typeof setTimeout> | undefined;
+      // Hoisted out of the try so the finally can attribute the leg's deadline (codex t81 P2).
+      const priorLegStart = Date.now();
+      const priorDeadline = Math.min(priorLegStart + priorTimeout, workDeadlineAt) as LegacyWallDeadline /* O1-DEBT-0004 */;
+      try {
+        const priorVecPromise = priorVecInproc
+          ? searchVecBounded(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, recordVectorLeg("prior"), hydration)
+          : searchVecDaemonRequired(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, recordVectorLeg("prior"), hydration);
+        const priorTimeoutPromise = new Promise<SearchResult[]>((_, reject) => {
+          priorTimer = setTimeout(() => reject(new Error("vector timeout")), Math.max(1, priorDeadline - Date.now()));
+        });
+        const priorVec = await Promise.race([priorVecPromise, priorTimeoutPromise]);
+        if (priorVec.length > 0) lanes.push({ lane: "prior-vector", results: priorVec, variantQuery: joinedPriors });
+      } catch (e) { warnOnceOnVectorModelMismatch(e); /* prior leg is supplementary — non-fatal */ }
+      finally {
+          if (priorTimer) clearTimeout(priorTimer);
+          recordVectorLegDeadline("prior", priorDeadline, priorLegStart); // codex t81 P2: prior leg vs its own dynamic deadline
+        }
     }
   }
 
@@ -252,15 +629,15 @@ export async function contextSurfacing(
   // Every downstream secondary-vault path (snooze routing, enrichment, the recall
   // mirror) keys off the `_fromVault` tag set here, so this single gate starves
   // them all when disabled.
-  if (surfaceSecondaryVaults() && getVaultPath("skill")) {
+  if (surfaceSecondaryVaults() && getVaultPath("skill") && Date.now() < workDeadlineAt) {
     try {
       const skillStore = resolveStore("skill", skillStoreOpts);
-      const skillResults = skillStore.searchFTS(retrievalQuery, 5);
+      const skillResults = skillStore.searchFTS(prompt, 5);
       // Tag skill vault results for identification in output
       for (const r of skillResults) {
         (r as any)._fromVault = "skill";
       }
-      results = [...results, ...skillResults];
+      if (skillResults.length > 0) lanes.push({ lane: "secondary-vault", results: skillResults });
     } catch {
       // Skill vault unavailable — continue with general results only
     }
@@ -271,109 +648,267 @@ export async function contextSurfacing(
   // File-path extraction stays on the raw current prompt so priors cannot
   // pollute the file-specific discovery channel with stale filenames.
   const fileMatches = [...prompt.matchAll(FILE_PATH_RE)].map(m => m[1]!.trim()).filter(Boolean);
-  if (fileMatches.length > 0) {
-    const seen = new Set(results.map(r => r.filepath));
+  if (fileMatches.length > 0 && Date.now() < workDeadlineAt) {
     for (const fp of fileMatches.slice(0, 3)) {
+      // Re-checked before EVERY search (codex turn-26) — same rule as the
+      // prior loop: one crossing search must not admit the rest.
+      if (Date.now() >= workDeadlineAt) break;
       try {
         const fileResults = store.searchFTS(fp, 2);
-        for (const r of fileResults) {
-          if (!seen.has(r.filepath)) {
-            seen.add(r.filepath);
-            results.push(r);
-          }
-        }
+        if (fileResults.length > 0) lanes.push({ lane: "file-aware", results: fileResults, variantQuery: fp });
       } catch { /* non-fatal */ }
     }
   }
 
-  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
+  // C1c membership: weighted fusion decides who competes downstream.
+  let membership: FusionMembership = selectCandidatePool(lanes, maxResults, priorLegEnabled, gateTokens, gateTokenSource);
+  let results: SearchResult[] = membership.pool;
+
+  if (results.length === 0) {
+    recordCandidateLanes(trace, lanes, membership);
+    return finish(makeEmptyOutput("context-surfacing"), "empty", "no-results");
+  }
 
   // Budget-aware deep escalation (deep profile only):
   // If the fast path finished quickly and found results, spend remaining time budget
   // on query expansion (discovers new candidates) and cross-encoder reranking (reorders).
-  // Ext 6b: expansion + FTS variants use the multi-turn retrieval query so
-  // short current prompts still inherit prior-turn vocabulary. Reranking
-  // continues to use the RAW current prompt so relevance scoring is not
-  // diluted by older turns — the cross-encoder is asked "how well does
-  // this doc match the user's current question", not "how well does it
-  // match the last 10 minutes of questions".
+  // BUILD-1 (C1): expansion runs on the CURRENT prompt — never a concatenated
+  // multi-turn query — and its variants are recall-only lanes at a rank
+  // discount, re-fused through the same C1c membership (mass cap + protected
+  // slots). Reranking continues to use the RAW current prompt so relevance
+  // scoring is not diluted by older turns — the cross-encoder is asked "how
+  // well does this doc match the user's current question".
+  let rerankBlended = false;
+  let rerankedKeysDesc: string[] | null = null;
+  let expansionLanesAdded = false;
   if (profile.deepEscalation && results.length >= 2) {
     const elapsed = Date.now() - startTime;
-    if (elapsed < profile.escalationBudgetMs) {
+    // Entry needs BOTH the profile's escalation window AND the whole-handler
+    // budget still open (codex turn-23 finding 3).
+    if (elapsed < profile.escalationBudgetMs && Date.now() < workDeadlineAt) {
+      let expandTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        // Phase 1: Query expansion — discover candidates BM25+vector missed
-        const expanded = await store.expandQuery(retrievalQuery, DEFAULT_QUERY_MODEL, sessionTopic);
+        // Phase 1: Query expansion — discover candidates BM25+vector missed.
+        // Bounded by the remaining budget (codex turn-23 finding 3): the LLM
+        // call itself is not signal-aware, so the race abandons it on expiry
+        // — the rejection lands in the escalation catch (expansion recorded
+        // failed, the guard arbitrates), same pattern as the vector legs.
+        const expandRemaining = workDeadlineAt - Date.now();
+        const expandTimeout = new Promise<never>((_, reject) => {
+          expandTimer = setTimeout(() => reject(new Error("expansion timeout")), Math.max(1, expandRemaining));
+        });
+        // deadlineAt gives the expansion transport a REAL abort and
+        // structurally disables local inference (codex turn-24 finding 3) —
+        // the race alone abandons the promise but the pending work would
+        // hold the hook PROCESS past its budget.
+        const expanded = await Promise.race([store.expandQuery(prompt, DEFAULT_QUERY_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never expansion intent */, { deadlineAt: workDeadlineAt }), expandTimeout]);
+        if (expandTimer) clearTimeout(expandTimer);
+        if (trace) {
+          trace.expansion = {
+            attempted: true,
+            variants: expanded.map(eq => ({ type: eq.type, query: eq.query, used: false })),
+            failed: false,
+          };
+        }
         if (expanded.length > 0) {
-          const seen = new Set(results.map(r => r.filepath));
           for (const eq of expanded.slice(0, 3)) {
-            if (Date.now() - startTime > 6000) break; // hard stop at 6s
+            if (Date.now() >= workDeadlineAt) break; // hard stop at the work deadline (reserve preserved)
+            if (trace?.expansion) {
+              const v = trace.expansion.variants[expanded.indexOf(eq)];
+              if (v) v.used = true;
+            }
             // Typed routing: lex → FTS; vec/hyde → vector (deep profile + time budget only).
             let hits: SearchResult[] = [];
             if (eq.type === 'lex') {
               hits = store.searchFTS(eq.query, 5);
             } else if (profile.useVector) {
-              // Bound BOTH the async embed wait (Promise.race on the remaining 6s budget) AND the
+              // Bound BOTH the async embed wait (Promise.race on the remaining budget) AND the
               // late synchronous MATCH (the deadline arg makes the abandoned promise self-abort
               // before the scan) — mirroring the balanced leg above. The loop guard only breaks
               // BETWEEN iterations, so without the race a slow embed here can still blow the budget.
-              const remainingMs = startTime + 6000 - Date.now();
+              const deepLegStart = Date.now();
+              const remainingMs = workDeadlineAt - deepLegStart;
               if (remainingMs <= 0) break;
               let deepTimer: ReturnType<typeof setTimeout> | undefined;
               try {
-                const deepVec = searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, startTime + 6000);
+                // Daemon-REQUIRED under the eval's daemon-backed protocol (codex t76 constraint 4:
+                // primary AND deep), same contract as the primary leg above.
+                const deepVec = vectorDaemonRequired
+                  ? searchVecDaemonRequired(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadlineAt, recordVectorLeg("deep"), hydration)
+                  : searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadlineAt, recordVectorLeg("deep"), hydration);
                 const deepTimeout = new Promise<SearchResult[]>((_, reject) => {
                   deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
                 });
                 hits = await Promise.race([deepVec, deepTimeout]);
               } catch (e) { warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
-              finally { if (deepTimer) clearTimeout(deepTimer); }  // don't let a pending timer keep the hook process alive
-            }
-            for (const r of hits) {
-              if (!seen.has(r.filepath)) {
-                seen.add(r.filepath);
-                results.push(r);
+              finally {
+                if (deepTimer) clearTimeout(deepTimer);  // don't let a pending timer keep the hook process alive
+                recordVectorLegDeadline("deep", workDeadlineAt, deepLegStart); // codex t81 P2: each deep invocation vs the work deadline it was bounded by
               }
             }
+            if (hits.length > 0) {
+              lanes.push({ lane: eq.type === "lex" ? "expansion-lex" : "expansion-vec", results: hits, variantQuery: eq.query });
+              expansionLanesAdded = true;
+            }
+          }
+          if (expansionLanesAdded) {
+            // Re-run C1c membership over ALL lanes so expansion candidates
+            // compete under the same mass cap + protected slots.
+            membership = selectCandidatePool(lanes, maxResults, priorLegEnabled, gateTokens, gateTokenSource);
+            results = membership.pool;
           }
         }
 
-        // Phase 2: Cross-encoder reranking — reorder with deeper relevance signal
-        // Sort by score first so reranking covers the best candidates, not just
-        // the first-inserted (expansion hits appended later would otherwise be missed)
-        if (Date.now() - startTime < 6000 && results.length >= 3) {
-          results.sort((a, b) => b.score - a.score);
-          const toRerank = results.slice(0, 15).map(r => ({
-            file: r.filepath,
-            text: (r.body || "").slice(0, 2000),
+        // Phase 2: Cross-encoder reranking — the deep profile's strongest
+        // relevance channel. BUILD-2 (C2): the pool arrives in FUSED order
+        // (the channel-aware weighted RRF key), so the preselect takes the
+        // top of that order — the old sort-by-raw-score here compared cosine
+        // against the BM25 transform, numerically incomparable channels.
+        // The rerank result is consumed by the FINAL ORDERING step below as
+        // a rank-fused lane (fuseRerankLane) — never blended into raw
+        // channel scores. It applies ONLY under FULL coverage of the
+        // candidate set: a partially-covered pool must never be partially
+        // reordered (CONTRACT-3), and a discarded rerank leaves the pool
+        // unarbitrated (the failure guard runs).
+        // BUILD-3a: the rerank attempt is admitted only while ITS window is
+        // open — the internal deadline minus the finalization reserve. A
+        // rerank that would eat the reserve is not attempted at all (the
+        // failure guard arbitrates instead).
+        if (Date.now() < workDeadlineAt && results.length >= 3) {
+          // Rerank ids are the VAULT-QUALIFIED identity (candidateKey) so a
+          // cross-vault same-path pair never receives each other's scores
+          // (codex turn-7 SPEC-5). The id is opaque to the reranker. The
+          // COMPLETE pool is sent (bounded by poolBound = maxResults+5): a
+          // fixed 15-slice made full coverage structurally impossible on
+          // deep's 20-candidate pools (codex turn-14 finding 5).
+          const toRerank = results.map(r => ({
+            file: candidateKey(r),
+            // A projected candidate's rerankText IS body.slice(0, 2000) computed daemon-side —
+            // identical bytes, so rerankTextHash and the draw-binding manifests are unchanged
+            // (codex #28 t86).
+            text: isProjectedVecResult(r) ? r.rerankText : (r.body || "").slice(0, 2000),
           }));
-          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL, sessionTopic);
+          if (trace) {
+            // sentTextHashes: content identity of the TRANSMITTED text per
+            // candidate (store-side projection of this 2000-char slice) —
+            // the eval's draw-binding manifest is built from these, so the
+            // binding identifies exactly what the reranker scored (BUILD-3b).
+            trace.rerank = { attempted: true, sentPaths: toRerank.map(d => d.file), sentTextHashes: toRerank.map(d => rerankTextHash(d.text)), coveredPaths: [], scores: [], coverageComplete: false, orderingApplied: false, failed: false };
+          }
+          // requireLiveCoverage: the store's default contract ZERO-FILLS any
+          // document the reranker omitted and returns the complete list, so a
+          // partial remote response would arrive here as apparent full
+          // coverage and partially reorder the pool (codex turn-14 finding
+          // 1). Under the flag the store THROWS on incomplete coverage
+          // (before the zero-fill), which lands in the escalation catch —
+          // the rerank is discarded and the failure guard arbitrates.
+          // deadlineAt bounds every remote batch to the remaining rerank
+          // window AND disables the untimed local fallback inside
+          // store.rerank (BUILD-3a: no untimed local fallback — missing
+          // scores surface as a coverage error and the guard arbitrates).
+          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never rerank intent (RERANK_REQUEST_REV bumped) */, { requireLiveCoverage: true, deadlineAt: workDeadlineAt });
           if (reranked.length > 0) {
             const rerankedMap = new Map(reranked.map(r => [r.file, r.score]));
-            // Blend: 60% original score + 40% reranker score for stability
-            for (const r of results) {
-              const rerankScore = rerankedMap.get(r.filepath);
-              if (rerankScore !== undefined) {
-                r.score = 0.6 * r.score + 0.4 * rerankScore;
-              }
+            if (trace?.rerank) {
+              trace.rerank.scores = reranked.map(r => ({ filepath: r.file, score: r.score }));
+              trace.rerank.coveredPaths = toRerank.filter(d => rerankedMap.has(d.file)).map(d => d.file);
             }
-            results.sort((a, b) => b.score - a.score);
+            // Belt-and-braces coverage check (the store already threw on a
+            // partial LIVE response; this also guards cache-shape drift and
+            // future store-contract changes).
+            const uncovered = results.filter(r => !rerankedMap.has(candidateKey(r)));
+            if (uncovered.length === 0) {
+              // BUILD-3d: under full coverage the score set must still
+              // DISCRIMINATE (turn-15 F3: trust only behind coverage AND
+              // degeneracy validation — an attested provider can still emit
+              // a collapsed/inert set for one query, and a fully-covered
+              // inert response must not have its arbitrary ordering
+              // trusted). The ASSESSMENT always runs and is always traced
+              // (a gate-off control arm still measures firing rate); only
+              // the discard ACTION is behind the toggle.
+              const degeneracy = assessRerankDegeneracy(reranked.map(r => r.score));
+              const discardDegenerate = RERANK_DEGENERACY_GATE_ACTIVE && degeneracy.degenerate;
+              if (trace?.rerank) {
+                // Coverage is the guard-level truth (the reranker ANSWERED);
+                // ordering application additionally requires a positive lane
+                // weight — a zero-weight lane is skipped by the shared RRF
+                // and must not claim application (codex turn-17 finding 1) —
+                // and a non-degenerate score set under an active gate.
+                trace.rerank.coverageComplete = true;
+                trace.rerank.degeneracy = { gated: RERANK_DEGENERACY_GATE_ACTIVE, ...degeneracy };
+              }
+              if (!discardDegenerate) {
+                rerankBlended = true;
+                rerankedKeysDesc = [...rerankedMap.entries()]
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([file]) => file);
+                if (trace?.rerank) trace.rerank.orderingApplied = RERANK_LANE_ACTIVE;
+              }
+              // Degenerate discard: rerankBlended stays false, so the
+              // failure guard below arbitrates exactly as it does for a
+              // failed rerank — orderingApplied stays false and the trace
+              // carries the reason (degeneracy.reason).
+            }
+            // Partial coverage: scores are recorded for diagnosis but the
+            // ordering ignores them and the failure guard below arbitrates.
           }
         }
+        if (trace) trace.timings.escalationMs = Date.now() - startTime;
       } catch {
         // Escalation failed (GPU down, timeout, etc.) — continue with fast-path results
+        if (expandTimer) clearTimeout(expandTimer); // pending race timer must not keep the hook process alive
+        if (trace) {
+          // Failure = the rerank never COMPLETED coverage (orderingApplied is
+          // legitimately false on a completed zero-weight rerank).
+          if (trace.rerank && !trace.rerank.coverageComplete) trace.rerank.failed = true;
+          else if (trace.expansion == null) trace.expansion = { attempted: true, variants: [], failed: true };
+        }
       }
+      escalationEndAt = Date.now();
     }
+    // A deep case whose window closed BEFORE escalation must still measure
+    // the finalization tail — otherwise pre-escalation overruns silently
+    // lose their reserve sample (codex turn-24 finding 4).
+    if (escalationEndAt === null) escalationEndAt = Date.now();
   }
 
+  // Failure guard (CONTRACT-1d): prior-only and expansion-only candidates
+  // were admitted on the premise that either the reranker would arbitrate
+  // them or the per-candidate current-query gate vouches for them. With no
+  // USABLE rerank arbitration, candidates lacking BOTH current support and a
+  // passed gate must not reach the main block — the anaphora gate enables
+  // the prior LANE but cannot certify its individual documents (codex turn-6
+  // SPEC-2). USABLE means the lane actually influences ordering: coverage
+  // alone is transport completeness — a reranker merely returning scores
+  // does not qualify candidates when those scores affect neither order nor
+  // admission (codex turn-18 finding 3: at weight 0, full coverage skipped
+  // this guard and gate-failing discounted-only docs were injected).
+  // Enforcement is trace-independent by construction.
+  if (!(rerankBlended && RERANK_LANE_ACTIVE)) {
+    results = dropUnarbitrated(results, membership.fusion);
+  }
+
+  // Single provenance-recording point for candidate generation: every lane's
+  // raw hits, flagged with membership admission.
+  recordCandidateLanes(trace, lanes, membership);
+
+  if (results.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "no-results"); }
+
   // Filter out private/excluded paths
+  const beforePrivate = trace ? results : null;
   results = results.filter(r =>
     !FILTERED_PATHS.some(p => r.displayPath.includes(p))
   );
+  if (trace && beforePrivate) {
+    const kept = new Set(results);
+    trace.filters.privateDropped = beforePrivate.filter(r => !kept.has(r)).map(r => r.displayPath);
+  }
 
-  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
+  if (results.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "all-filtered"); }
 
   // Filter out snoozed documents
   const now = new Date();
+  const beforeSnooze = trace ? results : null;
   results = results.filter(r => {
     // filepath is a virtual path (clawmem://collection/path) but findActiveDocument
     // expects the collection-relative path, not the full virtual path
@@ -385,21 +920,37 @@ export async function contextSurfacing(
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
     return true;
   });
+  if (trace && beforeSnooze) {
+    const kept = new Set(results);
+    trace.filters.snoozedDropped = beforeSnooze.filter(r => !kept.has(r)).map(r => r.displayPath);
+  }
 
-  if (results.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
+  if (results.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "all-snoozed"); }
 
-  // Deduplicate by filepath (keep best score per path)
+  // Deduplicate by vault-qualified identity (keep best score per identity) —
+  // bare-filepath keying collapsed two DISTINCT cross-vault documents sharing
+  // one collection/path into an arbitrary survivor (codex turn-7 SPEC-5).
   const deduped = new Map<string, SearchResult>();
   for (const r of results) {
-    const existing = deduped.get(r.filepath);
+    const key = candidateKey(r);
+    const existing = deduped.get(key);
     if (!existing || r.score > existing.score) {
-      deduped.set(r.filepath, r);
+      deduped.set(key, r);
     }
   }
+  if (trace) trace.filters.dedupeCollapsed = results.length - deduped.size;
   results = [...deduped.values()];
 
   // Filter out noise results (agent denials, too-short snippets) before enrichment
-  results = results.filter(r => !r.body || !isRetrievedNoise(r.body));
+  const beforeNoise = trace ? results : null;
+  // Projected candidates (codex #28 t86) carry the daemon-precomputed verdicts of the SAME
+  // predicates the body branch runs — `hasBody` mirrors the `!r.body` truthiness exactly.
+  results = results.filter(r => isProjectedVecResult(r) ? (!r.hasBody || !r.noise) : (!r.body || !isRetrievedNoise(r.body)));
+  if (trace && beforeNoise) {
+    const kept = new Set(results);
+    trace.filters.noiseDropped = beforeNoise.filter(r => !kept.has(r)).map(r => r.displayPath);
+  }
+  finStamp("filters"); // guard + private/snooze/dedupe/noise filters (per-candidate findActiveDocument reads)
 
   // Enrich with SAME metadata — route skill-vault results through their own store
   const generalResults = results.filter(r => !(r as any)._fromVault);
@@ -414,77 +965,212 @@ export async function contextSurfacing(
       enriched = [...enriched, ...enrichResults(store, skillResults, prompt)];
     }
   }
+  finStamp("enrich"); // enrichResults SAME-metadata reads per candidate (both vaults)
 
   // Apply composite scoring
-  const allScored = applyCompositeScoring(enriched, prompt);
-
-  // §11.4: Session-scoped topic boost — post-composite, pre-threshold.
-  // Boosts docs whose title/path/body match all tokens of the declared
-  // session focus topic (1.4×); demotes non-matching docs (0.75×, floor
-  // 50%). Mutates compositeScore in place and re-sorts. Fail-open: no
-  // topic set → no-op (byte-identical pre-§11.4 output).
-  if (sessionTopic) {
-    applyTopicBoost(allScored, sessionTopic, { boostFactor: 1.4, demoteFactor: 0.75 });
+  const evalNow = resolveEvalNow();
+  const allScored = applyCompositeScoring(enriched, prompt, undefined, evalNow ? { now: evalNow } : undefined);
+  if (trace) {
+    trace.composite = allScored.map(r => ({
+      filepath: r.filepath,
+      displayPath: r.displayPath,
+      searchScore: r.score,
+      compositeScore: r.compositeScore,
+    }));
   }
 
-  // Threshold filtering — adaptive (ratio-based) or absolute (legacy)
+  // §11.4 topic boost: REMOVED (BUILD-5, C5). BUILD-2 made it order-inert
+  // (the final key sort ignores composite) and BUILD-4 removed its admission
+  // authority; its only residual effect was tier DEPTH via the composite
+  // multiplier — a metadata signal crossing presentation. sessionTopic
+  // itself stays (traced + buildContext snippet intent — presentation, not
+  // ordering); trace.topicBoost stays null.
+
+  // BUILD-4 (C4): RELEVANCE ADMISSION on the final ordering basis — the same
+  // channel-aware key that orders the output (current-anchor band, weighted
+  // RRF mass; deep: rerank lane rank-fused when applied) is the single
+  // admission authority. The composite score no longer admits or rejects
+  // anything (turn-17 finding 4: composite admission rejected on-topic docs
+  // ~0.280 against its ~0.338 floor while admitting junk 0.418–0.752); it
+  // retains tier sizing (getTierConfig) and the BUILD-5-scoped reorder
+  // stages only. Floors are RELATIVE to the query's own top mass and
+  // abstention is signature-based (zero current support, or a flat band-0
+  // basis with zero keyword-class agreement) — never an absolute score
+  // cutoff (Addendum 6: embeddinggemma-300M's flat cosine band 0.66–0.69
+  // makes absolute per-document floors meaningless).
+  //
+  // The ordering keys are computed HERE, before admission, and reused
+  // unchanged by the final ordering sort below — one computation, one
+  // authority. Ordering application requires an ACTIVE lane (weight > 0):
+  // the shared RRF skips zero-weight lists, so fusing at weight 0 would be
+  // a no-op that still CLAIMED "rerank" as the ranking key — the trace must
+  // report the ordering that actually ran (codex turn-17 finding 1). The
+  // failure guard above uses the SAME usable-arbitration condition
+  // (coverage AND active lane) — coverage alone is transport completeness
+  // and qualifies nothing (codex turn-18 finding 3).
+  const rerankArbitrated = rerankBlended && rerankedKeysDesc !== null;
+  const rerankOrderingApplied = rerankArbitrated && RERANK_LANE_ACTIVE;
+  let orderingKeys = finalOrderingKeys(membership.fusion);
+  if (rerankOrderingApplied) {
+    orderingKeys = fuseRerankLane(orderingKeys, rerankedKeysDesc!);
+  }
+  const presentKeys = allScored.map(r => candidateKey(r));
+  const admissionBasis = resolveAdmissionBasis(membership.fusion, rerankOrderingApplied, presentKeys, orderingKeys);
+  // BUILD-4 turn-54/55 (codex turn-53 finding 3 + turn-54 finding 3): the
+  // ADMISSION-INPUT LEDGER, recorded IMMEDIATELY BEFORE the policy branch so
+  // it is arm-symmetric by construction. Each entry carries the COMPLETE
+  // per-candidate policy input of both arms — the ordering key {band, mass}
+  // the relevance policy judges, and the compositeScore the composite
+  // control judges (frozen across arms by CLAWMEM_EVAL_NOW) — so an
+  // admission-only pair proves the arms judged the SAME inputs, not merely
+  // the same identities. The pair audit compares it for admission-only
+  // experiments and treatment exposure reads it; the treatment-downstream
+  // admitted/rejected split is never consulted.
+  if (trace) {
+    trace.admissionInput = {
+      candidates: allScored
+        .map(r => {
+          const key = candidateKey(r);
+          const k = orderingKeys.get(key);
+          return { key, band: (k?.band ?? 1) as 0 | 1, mass: k?.mass ?? 0, compositeScore: r.compositeScore };
+        })
+        .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
+    };
+  }
   let scored: typeof allScored;
-  if (profile.thresholdMode === "adaptive") {
-    // Use max composite score across the set (not positional [0], which may be
-    // reordered by recency-intent sorting in applyCompositeScoring)
-    const bestScore = allScored.length > 0
-      ? Math.max(...allScored.map(r => r.compositeScore))
-      : 0;
-
-    // Activation floor: if even the best result is too weak, bail entirely
-    if (bestScore < profile.activationFloor) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
-
-    const adaptiveMin = Math.max(bestScore * profile.minScoreRatio, profile.absoluteFloor);
-    scored = allScored.filter(r => r.compositeScore >= adaptiveMin);
-  } else {
-    // Legacy absolute threshold (backward compat)
-    scored = allScored.filter(r => r.compositeScore >= minScore);
-  }
-
-  if (scored.length === 0) { logEmptyTurn(store, input, prompt); return makeEmptyOutput("context-surfacing"); }
-
-  // Spreading activation (E11): boost results co-activated with top HOT results
-  if (scored.length > 3) {
-    const hotPaths = scored.slice(0, 3)
-      .filter(r => r.compositeScore > 0.8)
-      .map(r => r.displayPath);
-
-    for (const hotPath of hotPaths) {
-      try {
-        const coActs = store.getCoActivated(hotPath, 3);
-        for (const ca of coActs) {
-          const existing = scored.find(r => r.displayPath === ca.path);
-          if (existing && existing.compositeScore <= 0.8) {
-            // Boost by 0.1 per co-activation count, capped at +0.2
-            existing.compositeScore += Math.min(0.2, 0.1 * Math.min(ca.count, 2));
-          }
+  if (ADMISSION_POLICY_ACTIVE === "composite") {
+    // BUILD-4 registered-treatment CONTROL ARM (CLAWMEM_ADMISSION_POLICY=
+    // composite — eval-only, never the default): the pre-BUILD-4 composite
+    // gate kept verbatim, so the admission_policy paired A/B compares two
+    // arms of ONE code state (the BUILD-3d registered-treatment protocol).
+    if (profile.thresholdMode === "adaptive") {
+      const bestScore = allScored.length > 0
+        ? Math.max(...allScored.map(r => r.compositeScore))
+        : 0;
+      if (bestScore < profile.activationFloor) {
+        if (trace) {
+          trace.admission = {
+            mode: "adaptive", bestScore, activationFloor: profile.activationFloor,
+            admitted: [], rejected: allScored.map(r => ({ candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore })),
+            abstained: true,
+          };
         }
-      } catch {
-        // co_activations table may not exist yet
+        return finish(makeEmptyOutput("context-surfacing"), "empty", "activation-floor");
+      }
+      const adaptiveMin = Math.max(bestScore * profile.minScoreRatio, profile.absoluteFloor);
+      scored = allScored.filter(r => r.compositeScore >= adaptiveMin);
+      if (trace) {
+        trace.admission = {
+          mode: "adaptive", bestScore, activationFloor: profile.activationFloor, adaptiveMin,
+          admitted: scored.map(r => ({ candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore })),
+          rejected: allScored.filter(r => r.compositeScore < adaptiveMin).map(r => ({ candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore })),
+          abstained: false,
+        };
+      }
+    } else {
+      scored = allScored.filter(r => r.compositeScore >= minScore);
+      if (trace) {
+        const bestScore = allScored.length > 0 ? Math.max(...allScored.map(r => r.compositeScore)) : 0;
+        trace.admission = {
+          mode: "absolute", bestScore, activationFloor: profile.activationFloor, minScore,
+          admitted: scored.map(r => ({ candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore })),
+          rejected: allScored.filter(r => r.compositeScore < minScore).map(r => ({ candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore })),
+          abstained: false,
+        };
       }
     }
-    scored.sort((a, b) => b.compositeScore - a.compositeScore);
+    if (scored.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "threshold"); }
+  } else {
+    const decision = relevanceAdmission(presentKeys, orderingKeys, membership.fusion, admissionBasis);
+    const bestScore = allScored.length > 0 ? Math.max(...allScored.map(r => r.compositeScore)) : 0;
+    const admissionEntry = (r: (typeof allScored)[number], reason?: string) => {
+      const k = orderingKeys.get(candidateKey(r));
+      return {
+        candidate: candidateKey(r), displayPath: r.displayPath, compositeScore: r.compositeScore,
+        mass: k?.mass ?? 0, band: (k?.band ?? 1) as 0 | 1,
+        ...(reason !== undefined ? { reason } : {}),
+      };
+    };
+    const recordAdmission = (admittedRows: typeof allScored, abstained: boolean) => {
+      if (!trace) return;
+      const admittedRowSet = new Set(admittedRows);
+      const reasonByKey = new Map(decision.rejected.map(rj => [rj.key, rj.reason]));
+      trace.admission = {
+        mode: "relevance", bestScore, basis: admissionBasis,
+        topMass: decision.stats.topMass, spreadRel: decision.stats.spreadRel,
+        keywordAgreed: decision.stats.keywordAgreed,
+        floorRatio: ADMISSION_PARAMS[admissionBasis].floorRatio,
+        abstainReason: decision.abstain,
+        admitted: admittedRows.map(r => admissionEntry(r)),
+        rejected: allScored.filter(r => !admittedRowSet.has(r)).map(r => admissionEntry(r, reasonByKey.get(candidateKey(r)))),
+        abstained,
+      };
+    };
+    if (decision.abstain) {
+      recordAdmission([], true);
+      return finish(
+        makeEmptyOutput("context-surfacing"), "empty",
+        decision.abstain === "no-current-support" ? "admission-no-current" : "admission-degenerate"
+      );
+    }
+    const admittedKeys = new Set(decision.admitted);
+    scored = allScored.filter(r => admittedKeys.has(candidateKey(r)));
+    recordAdmission(scored, false);
+    if (scored.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "admission-floor"); }
   }
+  finStamp("scoring"); // composite scoring + admission (CPU; topic boost removed at BUILD-5)
 
-  // Memory type diversification (E10): ensure procedural results aren't crowded out
-  // If top results are all semantic, promote the best procedural result
-  if (scored.length > 3) {
-    const top3Types = scored.slice(0, 3).map(r => inferMemoryType(r.displayPath, r.contentType, r.body));
-    const hasProc = top3Types.includes("procedural");
-    if (!hasProc) {
-      const procIdx = scored.findIndex(r => inferMemoryType(r.displayPath, r.contentType, r.body) === "procedural");
-      if (procIdx > 3) {
-        // Move the best procedural result to position 3
-        const [proc] = scored.splice(procIdx, 1);
-        scored.splice(3, 0, proc!);
-      }
-    }
+  // E11 spreading activation + E10 memory-type diversification: REMOVED
+  // (BUILD-5, C5). Co-activation is out of ordering ENTIRELY — the
+  // injection-time signal was rich-get-richer trained on the hook's own
+  // injections, and its getCoActivated reads + composite mutation + resort
+  // sat on the deadline path for nothing the final key sort would honor.
+  // The diversification splice was provably output-inert since BUILD-2 (the
+  // key sort below re-orders). trace.spreadingActivation stays empty and
+  // trace.diversification stays null; the trace fields remain so historical
+  // traces keep their shape.
+
+  // BUILD-2 (C2): FINAL ORDERING = the channel-aware key (band, mass).
+  // The membership fusion already computed one rank-derived, scale-free mass
+  // per candidate (current-anchored lanes; the secondary vault as its own
+  // list — its FTS scores are corpus-statistics-incomparable with the
+  // general vault's). The BAND is the current anchor, UNCONDITIONALLY:
+  // discounted-only survivors order strictly BELOW every current-supported
+  // candidate (codex turn-14 finding 4 — the aggregate mass cap alone lets a
+  // three-variant expansion-only doc out-mass the best current hit). On the
+  // deep profile the applied rerank is fused in as one more lane, but it adds
+  // MASS ONLY inside the bands — full coverage proves the reranker answered,
+  // not that it discriminated, so it never elevates a band (codex turn-15
+  // finding). This sort is the single ordering authority, and since BUILD-4
+  // the relevance ADMISSION above is judged on this SAME key — the composite
+  // score retains tier sizing only, and the
+  // metadata reorder machinery (topic boost, spreading activation,
+  // diversification) is DELETED as of BUILD-5 (C5) — composite retains tier
+  // sizing and the eval-only control arm; the metadata-band-only invariant
+  // enforces the ZERO-WIDTH band (equal-key neighbors must follow the
+  // candidateKey tie-break exactly). Tie-break: the vault-qualified
+  // identity, deterministic and metadata-free.
+  // BUILD-4: rerankOrderingApplied + orderingKeys were computed BEFORE the
+  // relevance admission (one computation, one authority — the key that
+  // admitted is the key that orders); reused here unchanged.
+  const FLOOR_KEY: OrderingKey = { band: 1, mass: 0 };
+  scored.sort((a, b) => {
+    const cmp = compareOrderingKeys(
+      orderingKeys.get(candidateKey(a)) ?? FLOOR_KEY,
+      orderingKeys.get(candidateKey(b)) ?? FLOOR_KEY
+    );
+    if (cmp !== 0) return cmp;
+    const ca = candidateKey(a), cb = candidateKey(b);
+    return ca < cb ? -1 : ca > cb ? 1 : 0;
+  });
+  if (trace) {
+    trace.rankingKey = rerankOrderingApplied ? "rerank" : "rrf";
+    trace.finalOrder = scored.map(r => {
+      const k = orderingKeys.get(candidateKey(r)) ?? FLOOR_KEY;
+      return { candidate: candidateKey(r), displayPath: r.displayPath, band: k.band, keyValue: k.mass };
+    });
   }
+  finStamp("ordering"); // final ordering sort (E10/E11 machinery removed at BUILD-5)
 
   // Build context within token budget (profile-driven).
   // Ext 6a: Reserve budget for the always-on instruction line so the final
@@ -492,67 +1178,13 @@ export async function contextSurfacing(
   // in afterward using whatever budget remains and are the first thing
   // truncated when the payload would overflow.
   const factsBudget = Math.max(0, tokenBudget - INSTRUCTION_TOKEN_COST);
-  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget, sessionTopic);
+  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget, sessionTopic, trace);
+  finStamp("buildContext"); // output construction: body reads + tiered entry assembly
 
   if (!context) {
-    logEmptyTurn(store, input, prompt);
-    return makeEmptyOutput("context-surfacing");
+    return finish(makeEmptyOutput("context-surfacing"), "empty", "budget");
   }
 
-  // Use pre-computed turn_index from top of function
-  if (input.sessionId) {
-    const turnIndex = (input as any)._turnIndex ?? 0;
-
-    // Log the injection — returns usage_id for recall event linkage.
-    // Ext 6b: persist the raw prompt as query_text so future turns in
-    // the same session can reconstitute a multi-turn retrieval query.
-    const usageId = logInjection(store, input.sessionId, "context-surfacing", paths, tokens, turnIndex, prompt);
-
-    // Record recall events ONLY for docs that made it into the injected context
-    // (post-budget). Docs trimmed by token budget were never seen by the model.
-    // Each event links to its context_usage row via usage_id + turn_index.
-    // Multi-vault: route docs to origin vault's store. Mirror context_usage there too.
-    try {
-      const qHash = hashQuery(prompt);
-      const injectedSet = new Set(paths);
-      const injectedScored = scored.filter(r => injectedSet.has(r.displayPath));
-
-      // Group by vault origin (undefined = general vault)
-      const byVault = new Map<string | undefined, typeof injectedScored>();
-      for (const r of injectedScored) {
-        const vault = (r as any)._fromVault as string | undefined;
-        let group = byVault.get(vault);
-        if (!group) { group = []; byVault.set(vault, group); }
-        group.push(r);
-      }
-
-      const validUsageId = usageId > 0 ? usageId : undefined;
-      for (const [vault, docs] of byVault) {
-        const mappedDocs = docs.map(r => ({ displayPath: r.displayPath, searchScore: r.compositeScore }));
-        if (!vault) {
-          writeRecallEvents(store, input.sessionId, qHash, mappedDocs, validUsageId, turnIndex);
-        } else {
-          try {
-            const vaultStore = resolveStore(vault, skillStoreOpts);
-            // Mirror context_usage row into named vault for correct FK + attribution
-            const vaultPaths = docs.map(r => r.displayPath);
-            const vaultUsageId = vaultStore.insertUsage({
-              sessionId: input.sessionId,
-              timestamp: new Date().toISOString(),
-              hookName: "context-surfacing",
-              injectedPaths: vaultPaths,
-              estimatedTokens: 0,
-              wasReferenced: 0,
-              turnIndex,
-            });
-            writeRecallEvents(vaultStore, input.sessionId, qHash, mappedDocs, vaultUsageId > 0 ? vaultUsageId : undefined, turnIndex);
-          } catch { /* vault unavailable — skip */ }
-        }
-      }
-    } catch {
-      // Non-critical — don't block context surfacing on recall tracking errors
-    }
-  }
 
   // Routing hint: detect query intent signals and prepend a tool routing directive
   // This makes routing instructions salient at the moment of tool selection (per research)
@@ -583,8 +1215,8 @@ export async function contextSurfacing(
 
   // §11.1 (v0.9.0): `<vault-facts>` KG injection.
   //
-  // Stage ordering (frozen in BACKLOG.md §11.1): retrieval + rerank +
-  // scoring + topic boost (§11.4) + threshold + diversification → build
+  // Stage ordering (BACKLOG.md §11.1, amended at BUILD-4/5): retrieval +
+  // rerank + scoring + relevance admission + key-ordered output → build
   // <facts>/<relationships> → compute remaining facts-block budget →
   // inject <vault-facts> if entities resolve AND budget allows.
   //
@@ -637,7 +1269,62 @@ export async function contextSurfacing(
   parts.push(`<vault-context>\n${vaultInnerWithFacts}\n</vault-context>`);
   if (nudge) parts.push(`<vault-nudge>${NUDGE_TEXT}</vault-nudge>`);
 
-  return makeContextOutput("context-surfacing", parts.join("\n"));
+  const finalOut = makeContextOutput("context-surfacing", parts.join("\n"));
+  finStamp("facts"); // <relationships> (fetchRelationSnippets) + <vault-facts> KG reads
+  finStamp("payload"); // TRUE post-output boundary: the final payload is fully assembled
+  if (trace) {
+    trace.blocks = { relationships: relationSnippets.length, vaultFacts: vaultInnerWithFacts !== vaultInner };
+    trace.finalPaths = [...paths];
+  }
+  // BUILD-5 t60 (codex F59-1 — the off-process closure of t48 option B): the
+  // handler performs NO SQLite work after payload assembly. The injection
+  // bookkeeping (paths/tokens UPDATE onto the early alignment row, recall
+  // events, per-vault mirror) is packaged as an in-memory job and PARKED for
+  // the CLI layer, which — after the hook output is already on stdout —
+  // spools it to disk and spawns a detached drainer process
+  // (surfacing-bookkeeping.ts). A WAL/fsync stall in those writes therefore
+  // blocks the DRAINER, never hook output or hook process exit. The alignment
+  // row itself was written at retrieval commit (F59-2), so a deadline-skip
+  // here loses only the learning signal. Injection-time co-activation logging
+  // left the path entirely at BUILD-5 (C5). postOutputMs measures this
+  // handoff (pure memory work), outside the finalization reserve.
+  if (Date.now() >= internalDeadlineAt) {
+    if (trace) trace.timings.postOutputSkipped = true;
+  } else if (input.sessionId) {
+    try {
+      const turnIndex = (input as any)._turnIndex ?? 0;
+      const injectedSet = new Set(paths);
+      const injectedScored = scored.filter(r => injectedSet.has(r.displayPath));
+
+      // Group by vault origin (null = general vault). Recall events cover
+      // ONLY docs that made it into the injected context (post-budget) —
+      // docs trimmed by token budget were never seen by the model.
+      const byVault = new Map<string | null, { displayPath: string; searchScore: number }[]>();
+      for (const r of injectedScored) {
+        const vault = ((r as any)._fromVault as string | undefined) ?? null;
+        let group = byVault.get(vault);
+        if (!group) { group = []; byVault.set(vault, group); }
+        group.push({ displayPath: r.displayPath, searchScore: r.compositeScore });
+      }
+      const vaults: SurfacingBookkeepingVaultGroup[] = [...byVault].map(([vault, docs]) => ({ vault, docs }));
+
+      setPendingSurfacingBookkeeping({
+        v: 1,
+        kind: "surfacing-bookkeeping",
+        jobId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        sessionId: input.sessionId,
+        turnIndex,
+        usageId: alignmentUsageId,
+        queryHash: hashQuery(prompt),
+        injectedPaths: [...paths],
+        estimatedTokens: tokens,
+        vaults,
+      });
+    } catch {
+      // Non-critical — never block context surfacing on bookkeeping packaging
+    }
+  }
+  return finish(finalOut, "injected");
 }
 
 // =============================================================================
@@ -645,24 +1332,52 @@ export async function contextSurfacing(
 // =============================================================================
 
 /**
- * Log an empty context_usage row for a skipped turn.
+ * Record every lane's raw hits into the trace with membership admission as
+ * the `pooled` flag, plus the full fusion arithmetic (BUILD-1). One call per
+ * invocation — after candidate generation settles — so per-leg provenance and
+ * the mass-cap audit read one consistent snapshot.
+ */
+function recordCandidateLanes(
+  trace: SurfacingTrace | undefined,
+  lanes: LaneList[],
+  membership: FusionMembership
+): void {
+  if (!trace) return;
+  trace.fusion = membership.fusion;
+  // Fusion identity is vault-qualified (candidateKey) — record leg hits under
+  // the same identity so pooled-flag matching and the invariant audit line up
+  // across vaults (general docs keep the bare filepath unchanged).
+  const admitted = new Set(
+    membership.fusion.candidates.filter(c => c.admitted).map(c => c.filepath)
+  );
+  for (const l of lanes) {
+    traceLegHits(trace, l.lane, l.results.map(r => ({
+      filepath: candidateKey(r),
+      displayPath: r.displayPath,
+      source: r.source,
+      score: r.score,
+    })), admitted, l.variantQuery);
+  }
+}
+
+/**
+ * Log an empty context_usage row for a PRE-RETRIEVAL gated turn.
  * Keeps turn_index aligned with transcript turns so per-turn recall
  * attribution doesn't drift when some prompts are gated.
  *
- * Ext 6b: `queryText` is optional. Callers that gated BEFORE the
- * retrieval stage (slash commands, heartbeat dedupe, too-short prompts,
- * `shouldSkipRetrieval`) pass nothing — those turns are not meaningful
- * user questions and their raw text is not worth persisting for future
- * multi-turn lookback. Callers that gated AFTER retrieval (empty result
- * set, threshold filter, budget) pass the prompt so a follow-up turn
- * can still reuse the intent even though the current turn surfaced
- * nothing.
+ * Ext 6b / t60: pre-retrieval gates (slash commands, too-short prompts,
+ * `shouldSkipRetrieval`) log WITHOUT query_text — those turns are not
+ * meaningful user questions and their raw text is not worth persisting
+ * for multi-turn lookback. Every turn that PASSES those gates gets its
+ * row (with query_text) from the retrieval-commit alignment write in the
+ * handler body (codex F59-2), so post-retrieval empty returns no longer
+ * call this helper.
  */
-function logEmptyTurn(store: Store, input: HookInput, queryText?: string): void {
+function logEmptyTurn(store: Store, input: HookInput): void {
   if (!input.sessionId) return;
   try {
     const turnIndex = (input as any)._turnIndex ?? 0;
-    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex, queryText);
+    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex);
   } catch { /* non-fatal */ }
 }
 
@@ -696,10 +1411,12 @@ function buildContext(
   scored: ScoredResult[],
   query: string,
   budget: number = DEFAULT_TOKEN_BUDGET,
-  intent?: string
+  intent?: string,
+  trace?: SurfacingTrace
 ): { context: string; paths: string[]; tokens: number } {
   const lines: string[] = [];
   const paths: string[] = [];
+  const traceEntries: { candidate: string; displayPath: string; tier: string; tokens: number }[] = [];
   let totalTokens = 0;
 
   for (const r of scored) {
@@ -718,14 +1435,23 @@ function buildContext(
 
     if (tier.snippetLen > 0) {
       // HOT or WARM: include snippet
-      const bodyStr = r.body || "";
-      const sanitized = sanitizeSnippet(bodyStr);
-      if (sanitized === "[content filtered for security]") continue;
-
-      const snippet = smartTruncate(
-        extractSnippet(sanitized, query, tier.snippetLen, r.chunkPos, intent).snippet,
-        tier.snippetLen
-      );
+      let snippet: string;
+      if (isProjectedVecResult(r)) {
+        // Daemon-projected candidate (codex #28 t86): the snippet was computed server-side by
+        // the SAME functions on the SAME inputs — sanitizeSnippet(body) then
+        // extractSnippet(sanitized, presentationQuery=prompt, len, chunkPos, intent=sessionTopic)
+        // — so this branch is byte-equivalent to the body branch below.
+        if (r.sanitizeFiltered) continue;
+        snippet = smartTruncate(r.snippets[tier.snippetLen] ?? "", tier.snippetLen);
+      } else {
+        const bodyStr = r.body || "";
+        const sanitized = sanitizeSnippet(bodyStr);
+        if (sanitized === "[content filtered for security]") continue;
+        snippet = smartTruncate(
+          extractSnippet(sanitized, query, tier.snippetLen, r.chunkPos, intent).snippet,
+          tier.snippetLen
+        );
+      }
       entry = `**${safeTitle}**${typeTag}\n${safePath}\n${snippet}`;
     } else {
       // COLD: title + path only, no snippet
@@ -737,8 +1463,11 @@ function buildContext(
 
     lines.push(entry);
     paths.push(r.displayPath);
+    traceEntries.push({ candidate: candidateKey(r), displayPath: r.displayPath, tier: tier.tier, tokens: entryTokens });
     totalTokens += entryTokens;
   }
+
+  if (trace) trace.injection = { entries: traceEntries, totalTokens };
 
   return {
     context: lines.join("\n\n---\n\n"),
@@ -894,36 +1623,20 @@ export function buildVaultContextInner(
 // =============================================================================
 
 /**
- * Build the retrieval query from the current prompt plus up to `lookback`
- * recent prior prompts from the same session within `maxAgeMinutes`.
- *
- * Returns the current prompt unchanged when:
- *  - no `sessionId` (nothing to scope by)
- *  - the `query_text` column is missing (pre-migration store)
- *  - no prior rows within the window / all NULL
- *  - any DB error (fail-open — never throws)
- *
- * The combined query format is
- *   `<current>\n\n<newest prior>\n\n<older prior>...`
- * truncated to `MULTI_TURN_MAX_CHARS` with **current content preserved
- * first** — so even when older priors would push the current prompt
- * past the char limit, the truncation drops the tail (older priors),
- * not the head. This guarantees the retrieval query always contains the
- * user's current question verbatim.
- *
- * Exported for direct unit testing.
+ * Fetch the recent same-session prior prompts inside the multi-turn window
+ * (newest first). This is the shared retrieval that BOTH the gated prior leg
+ * (BUILD-1) and the legacy `buildMultiTurnSurfacingQuery` helper use. Returns
+ * [] on missing sessionId, empty current query, pre-migration store (no
+ * query_text column), or any DB error — fail-open, never throws.
  */
-export function buildMultiTurnSurfacingQuery(
+export function fetchRecentPriorQueries(
   store: Store,
   sessionId: string,
   currentQuery: string,
   lookback: number = MULTI_TURN_LOOKBACK,
   maxAgeMinutes: number = MULTI_TURN_MAX_AGE_MINUTES,
-  maxChars: number = MULTI_TURN_MAX_CHARS,
-): string {
-  if (!sessionId || currentQuery.length === 0) return currentQuery;
-
-  let priors: string[] = [];
+): string[] {
+  if (!sessionId || currentQuery.length === 0) return [];
   try {
     // ISO 8601 cutoff computed in JS (same lesson as the v0.8.0
     // countRecentContextUsages fix — datetime('now', ...) returns a
@@ -949,32 +1662,87 @@ export function buildMultiTurnSurfacingQuery(
         ORDER BY id DESC
         LIMIT ?`,
     ).all(sessionId, cutoff, currentQuery, lookback) as { query_text: string }[];
-
-    for (const row of rows) {
-      if (!row.query_text) continue;
-      priors.push(row.query_text);
-    }
+    return rows.map(r => r.query_text).filter(Boolean);
   } catch {
     // query_text column may be missing on a pre-migration store, or
-    // the DB might be in a corrupted state — fall back to current-only.
-    return currentQuery;
+    // the DB might be in a corrupted state — fall back to no priors.
+    return [];
   }
+}
 
-  if (priors.length === 0) return currentQuery;
+/**
+ * Build the retrieval query from the current prompt plus up to `lookback`
+ * recent prior prompts from the same session within `maxAgeMinutes`.
+ *
+ * Returns the current prompt unchanged when:
+ *  - no `sessionId` (nothing to scope by)
+ *  - the `query_text` column is missing (pre-migration store)
+ *  - no prior rows within the window / all NULL
+ *  - any DB error (fail-open — never throws)
+ *
+ * The combined query format is
+ *   `<current>\n\n<newest prior>\n\n<older prior>...`
+ * truncated to `MULTI_TURN_MAX_CHARS` with **current content preserved
+ * first** — so even when older priors would push the current prompt
+ * past the char limit, the truncation drops the tail (older priors),
+ * not the head. This guarantees the retrieval query always contains the
+ * user's current question verbatim.
+ *
+ * LEGACY as of BUILD-1 (C1): the context-surfacing handler no longer calls
+ * this — concatenation let polluted thread vocabulary anchor the candidate
+ * set, and on the FTS leg (AND semantics) could only ever narrow recall.
+ * Prior turns now enter as gated, discounted lanes (`fetchRecentPriorQueries`
+ * + surfacing-fusion.ts). Kept exported for compatibility and tests.
+ *
+ * Exported for direct unit testing.
+ */
+export function buildMultiTurnSurfacingQuery(
+  store: Store,
+  sessionId: string,
+  currentQuery: string,
+  lookback: number = MULTI_TURN_LOOKBACK,
+  maxAgeMinutes: number = MULTI_TURN_MAX_AGE_MINUTES,
+  maxChars: number = MULTI_TURN_MAX_CHARS,
+  trace?: SurfacingTrace,
+): string {
+  // BUILD-0 provenance: record what the retrieval query was built from —
+  // `priorsUsed` holds only the priors that actually made it into the
+  // combined string (truncation can drop the tail).
+  const setRQ = (priorsUsed: string[], combined: string, truncated: boolean): void => {
+    if (!trace) return;
+    trace.retrievalQuery = {
+      current: currentQuery,
+      priors: priorsUsed,
+      combined,
+      multiTurn: priorsUsed.length > 0,
+      truncated,
+    };
+  };
+
+  if (!sessionId || currentQuery.length === 0) { setRQ([], currentQuery, false); return currentQuery; }
+
+  // Shared window fetch (fail-open: [] on pre-migration store or DB error).
+  const priors = fetchRecentPriorQueries(store, sessionId, currentQuery, lookback, maxAgeMinutes);
+
+  if (priors.length === 0) { setRQ([], currentQuery, false); return currentQuery; }
 
   // Assemble newest-first: current first, then newest prior, then older.
   // The SQL already ordered rows DESC by id, so `priors[0]` is the newest.
   const segments = [currentQuery, ...priors];
   const combined = segments.join("\n\n");
 
-  if (combined.length <= maxChars) return combined;
+  if (combined.length <= maxChars) { setRQ(priors, combined, false); return combined; }
 
   // Over budget. Current query ALWAYS wins — include the full current
   // prompt first, then add priors newest-first until the budget runs out.
   // If the current prompt alone is already over budget, return it
   // truncated (same as pre-v0.8.1 behavior — MAX_QUERY_LENGTH is
   // enforced earlier in the handler so this branch is rare).
-  if (currentQuery.length >= maxChars) return currentQuery.slice(0, maxChars);
+  if (currentQuery.length >= maxChars) {
+    const clamped = currentQuery.slice(0, maxChars);
+    setRQ([], clamped, true);
+    return clamped;
+  }
 
   const parts: string[] = [currentQuery];
   let used = currentQuery.length;
@@ -985,7 +1753,9 @@ export function buildMultiTurnSurfacingQuery(
     parts.push(prior);
     used += cost;
   }
-  return parts.join(separator);
+  const assembled = parts.join(separator);
+  setRQ(parts.slice(1), assembled, true);
+  return assembled;
 }
 
 /**

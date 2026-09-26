@@ -93,6 +93,109 @@ export function shouldSkipRetrieval(prompt: string): boolean {
 }
 
 // =============================================================================
+// Prior-turn leg gate (C1, RANKING-DEFECT-HANDOFF Addendum 5)
+// =============================================================================
+
+// Anaphoric / deictic markers: the prompt refers to something it doesn't name.
+const ANAPHORA_MARKERS = /\b(that|this|it|its|them|those|these|same|previous|above|earlier|aforementioned)\b/i;
+
+// Continuation openers: the prompt is a follow-up move, not a fresh question.
+const CONTINUATION_OPENERS = /^(ok|okay|and|but|also|now|then|so|next|again|more|expand|elaborate|continue|go (on|deeper|further|back)|keep going|deeper|further|why not|what about|how about|same (for|with))\b/i;
+
+// Explicit back-references to the conversation itself.
+const CONVERSATION_BACKREF = /\b(as (i|we|you) (said|mentioned|discussed|noted))\b|\b(the|your) (above|previous|last|earlier) (one|point|question|answer|step|suggestion)\b/i;
+
+// A deictic that points BACK at prior content as the OBJECT of a back-
+// reference preposition ("on that", "about this", "into it") or an explicit
+// "the previous/last/earlier …" phrase. NOTE: this cannot distinguish the
+// pronoun use ("about this") from a determiner+noun ("about this middleware")
+// — which is why the token-count-independent branch below additionally
+// requires a STRONG continuation move, not any opener (codex turn-17).
+const DEICTIC_BACKREF_OBJECT = /\b(on|about|into|regarding|from|of|to)\s+(that|this|those|these|it)\b|\bthe\s+(above|previous|last|earlier|prior|preceding)\b/i;
+
+// STRONG continuation moves — verbs/moves whose whole purpose is to extend
+// prior discussion ("go deeper", "expand", "continue", "elaborate", "more").
+// Only these may enable the prior leg REGARDLESS of content-token count; weak
+// discourse openers (now/so/and/ok…) stay behind the content threshold, since
+// they routinely open self-contained imperatives ("now write a security
+// report about this authentication middleware…" — codex turn-17). An optional
+// leading discourse particle is tolerated ("ok, go deeper on that…").
+const STRONG_CONTINUATION_MOVE = /^(?:(?:ok|okay|and|but|also|now|then|so|yes|right|great)[,\s]+)?(?:expand|elaborate|continue|more|go (?:on|deeper|further|back)|keep going|deeper|further)\b/i;
+
+// Stopwords + anaphora markers excluded when counting content tokens.
+const CONTENT_STOPWORDS = new Set([
+  "a", "an", "the", "of", "in", "on", "at", "to", "for", "from", "with", "by", "and", "or", "but",
+  "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "can", "could", "should",
+  "would", "will", "shall", "may", "might", "must", "have", "has", "had", "i", "we", "you", "he",
+  "she", "they", "me", "us", "my", "our", "your", "their", "what", "which", "who", "how", "when",
+  "where", "why", "please", "bit", "little", "very", "really", "just", "some", "any", "more",
+  "that", "this", "it", "its", "them", "those", "these", "same", "previous", "above", "earlier",
+  "ok", "okay", "also", "now", "then", "so", "again", "expand", "elaborate", "continue", "explain",
+  "tell", "about", "not", "no", "yes",
+]);
+
+/** Content tokens = words carrying topical signal (stopwords + anaphora scaffolding removed). */
+export function contentTokenSet(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(t => t.length > 1 && !CONTENT_STOPWORDS.has(t))
+  );
+}
+
+export function countContentTokens(prompt: string): number {
+  return contentTokenSet(prompt).size;
+}
+
+export interface PriorContextDecision {
+  enabled: boolean;
+  reason: string;
+}
+
+/**
+ * Deterministic underspecification/anaphora test on the CURRENT prompt —
+ * the ONLY enabler of the prior-turns retrieval leg (CONTRACT-1e). A prompt
+ * that fully specifies its own topic gets a current-only retrieval; a prompt
+ * that delegates its meaning to earlier turns ("expand on that", "ok but
+ * why…", "same for X") gets the prior leg fused BELOW the current leg.
+ * Topic-continuity may later act as a VETO on top of this — never as an
+ * independent enabler. Deliberately conservative and deterministic; promote
+ * to a classifier only if the replay set shows material missed follow-ups.
+ */
+export function needsPriorContext(prompt: string): PriorContextDecision {
+  const trimmed = normalizePrompt(prompt);
+  const contentTokens = countContentTokens(trimmed);
+
+  if (CONVERSATION_BACKREF.test(trimmed)) {
+    return { enabled: true, reason: "conversation-backref" };
+  }
+  // A STRONG continuation move that points BACK at prior content ("go deeper
+  // on that …", "expand on this …", "more about that …") depends on the
+  // earlier turns no matter how much elaboration follows — the content-token
+  // count must NOT veto it (codex turn-16: a detailed "go deeper on that" is
+  // a follow-up, not a fresh question — the required doc was starved from the
+  // pool because the prior leg never fired). Restricted to STRONG moves only
+  // (codex turn-17): a weak opener plus a preposition+determiner+noun ("now
+  // write a security report about this authentication middleware…") is a
+  // self-contained imperative, so weak now/so/and forms stay behind the
+  // content threshold below.
+  if (STRONG_CONTINUATION_MOVE.test(trimmed) && DEICTIC_BACKREF_OBJECT.test(trimmed)) {
+    return { enabled: true, reason: "continuation-deictic" };
+  }
+  if (CONTINUATION_OPENERS.test(trimmed) && contentTokens < 8) {
+    return { enabled: true, reason: "continuation-opener" };
+  }
+  if (ANAPHORA_MARKERS.test(trimmed) && contentTokens < 6) {
+    return { enabled: true, reason: "anaphora-low-content" };
+  }
+  if (contentTokens < 3) {
+    return { enabled: true, reason: "underspecified" };
+  }
+  return { enabled: false, reason: "self-sufficient" };
+}
+
+// =============================================================================
 // Noise Filter — Post-retrieval result filtering
 // =============================================================================
 

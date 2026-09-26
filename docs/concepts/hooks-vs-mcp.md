@@ -8,7 +8,7 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 
 | Hook | Trigger | Budget | What it does |
 |------|---------|--------|-------------|
-| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens + factsTokens sub-budget) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with four inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), `<relationships>` (memory-graph edges between surfaced docs, v0.7.1), and `<vault-facts>` (raw SPO triples for prompt-seeded entities, v0.9.0 §11.1). Also applies a session-scoped topic boost when a focus file is set for the session (v0.9.0 §11.4). |
+| `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens + factsTokens sub-budget) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with four inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), `<relationships>` (memory-graph edges between surfaced docs, v0.7.1), and `<vault-facts>` (raw SPO triples for prompt-seeded entities, v0.9.0 §11.1). A session focus file (v0.9.0 §11.4) steers snippet selection as presentation intent; since v0.38.0 it no longer changes scoring or ordering. |
 | `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
@@ -19,18 +19,17 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 ### How context-surfacing works
 
 1. Validate prompt (skip slash commands, greetings, heartbeats, duplicates)
-2. Load performance profile (`speed` / `balanced` / `deep`) for budget and thresholds
-3. **Resolve session focus topic** (v0.9.0 §11.4) — read `~/.cache/clawmem/sessions/<id>.focus` if present. If set, thread as `intent` hint to the next stages
+2. Load performance profile (`speed` / `balanced` / `deep`) — token/facts budgets, result limit, vector behavior + timeout, deep escalation (its score thresholds apply only under the eval-only `CLAWMEM_ADMISSION_POLICY=composite` control arm)
+3. **Resolve session focus topic** (v0.9.0 §11.4) — read `~/.cache/clawmem/sessions/<id>.focus` if present. If set, used as the snippet-selection `intent` only (presentation — since v0.38.0 a focus never reaches expansion, rerank, scoring, or ordering)
 4. Search: vector (if profile enables it, with profile-driven timeout) + BM25 supplement
 5. Filter: exclude private paths, snoozed documents, noise
 6. Score: composite scoring (relevance + recency + confidence + quality)
-7. **Apply session focus topic boost** (v0.9.0 §11.4) — if a focus topic was resolved, multiply matching docs' compositeScore by 1.4× and non-matching by 0.75× (floor 50%). NO-OP when zero docs match — the baseline ordering passes through unchanged, so the threshold filter never shrinks the result set because of a non-matching topic
-8. Adaptive threshold + memory-type diversification
-9. Build facts block within `tokenBudget - instructionCost` so the always-on `<instruction>` frame fits
-10. Fetch relationship snippets from `memory_relations` for edges where BOTH endpoints are in the surfaced doc set — these become a `<relationships>` block, the first thing dropped when the payload would overflow budget
-11. **Seed entities from the prompt** (v0.9.0 §11.1) — three-path extraction (canonical-id regex → proper-noun validation via `resolveEntityTypeExact` → longer-first n-gram scan). Prompt-only: seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block
-12. **Query SPO triples for seeded entities**, dedupe by `(subject, predicate, object)` across all entities, emit a token-bounded `<vault-facts>` block using the dedicated `factsTokens` sub-budget (speed=0 disables the stage, balanced=200, deep=250). Truncate at triple boundary, never mid-triple, never emit an empty block. Fail-open on every error path
-13. Inject as `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships><vault-facts>...</vault-facts></vault-context>` XML in the prompt
+7. Relevance admission on the final ordering key (band, fused mass — with query-level abstention)
+8. Build facts block within `tokenBudget - instructionCost` so the always-on `<instruction>` frame fits
+9. Fetch relationship snippets from `memory_relations` for edges where BOTH endpoints are in the surfaced doc set — these become a `<relationships>` block, the first thing dropped when the payload would overflow budget
+10. **Seed entities from the prompt** (v0.9.0 §11.1) — three-path extraction (canonical-id regex → proper-noun validation via `resolveEntityTypeExact` → longer-first n-gram scan). Prompt-only: seeds NEVER come from surfaced doc bodies, so an off-topic surfaced doc cannot pollute the facts block
+11. **Query SPO triples for seeded entities**, dedupe by `(subject, predicate, object)` across all entities, emit a token-bounded `<vault-facts>` block using the dedicated `factsTokens` sub-budget (speed=0 disables the stage, balanced=200, deep=250). Truncate at triple boundary, never mid-triple, never emit an empty block. Fail-open on every error path
+12. Inject as `<vault-context><instruction>...</instruction><facts>...</facts><relationships>...</relationships><vault-facts>...</vault-facts></vault-context>` XML in the prompt
 
 The `<instruction>` frame tells the model to treat the surfaced facts as background knowledge it already holds unless the user corrects them, reducing prompt-level ambiguity about how to use the injected context. The `<relationships>` block exposes the vault's knowledge graph (semantic, supporting, contradicts, causal, temporal edges) directly in-prompt so the model can reason over document connections without having to call `intent_search`. The `<vault-facts>` block adds raw SPO triples for prompt-seeded entities so the model has structured "what is currently true about these entities" without needing an explicit `kg_query`. `<vault-facts>` / `<relationships>` landed in v0.9.0 / v0.7.1 respectively.
 
@@ -46,35 +45,33 @@ Set `CLAWMEM_PROFILE` to adjust the context-surfacing hook's behavior:
 
 `factsTokens` is a dedicated sub-budget for the `<vault-facts>` KG injection block (v0.9.0 §11.1) that cannot steal from the main `tokenBudget`. Setting `factsTokens: 0` on a profile disables the stage entirely.
 
+The **Score ratio** and **Activation floor** columns apply only to the composite admission control arm (`CLAWMEM_ADMISSION_POLICY=composite` — eval-only since v0.38.0). The default relevance admission is profile-independent; see the next section.
+
 Profiles only affect the automatic context-surfacing hook. MCP tools are not affected — agents control their own `limit`, `compact`, and tool selection per call.
 
-### Adaptive thresholds
+### Relevance admission
 
-Context-surfacing uses adaptive ratio-based thresholds that adjust to your vault's score distribution instead of fixed absolute values. The filter works in two steps:
+Since v0.38.0 the hook's keep/drop decision is judged on the same channel-aware ordering key that orders the injection — never on the composite score. The fusion stage produces one key per candidate: a **band** (0 = supported by the current turn's own lanes; 1 = discounted-lane-only survivor) and a **mass** (its weighted reciprocal-rank fusion contribution). Admission then works per query:
 
-1. **Activation floor** — if the best result in the entire set scores below the activation floor (e.g., 0.20 for balanced), the hook returns empty. This prevents surfacing all-weak results where even the top hit isn't relevant enough to be useful.
+1. **Query-level abstention** — if no candidate has current-turn support (band 0 empty), the hook emits nothing (`no-current-support`), unless the prior-turn leg was certified by the anaphora gate and is the only signal, in which case the certified-prior candidates are judged under their own relative floor. If band 0 exists but not a single candidate has keyword-class agreement (FTS found nothing — the vector-only junk signature of gibberish and abstract-register prompts), the hook abstains (`degenerate-basis`) rather than surface an arbitrary embedding-band list.
 
-2. **Score ratio** — results are kept if they score within the ratio of the best result's composite score. For balanced at 55%, a best score of 0.60 keeps everything above 0.33 (`0.60 * 0.55`). An absolute floor (0.15 for balanced) prevents the ratio from going too low when the best score is itself marginal.
+2. **Relative floor** — within band 0, a candidate is admitted when its fused mass is at least 50% of the top candidate's mass (`floorRatio 0.5`, per-basis in `ADMISSION_PARAMS`). Multi-lane agreement compounds mass, so vector-only tails fall below a keyword-agreed top without any absolute threshold. When band 0 exists, band-1 (discounted-only) candidates are never admitted.
 
-This adapts to vault size (smaller vaults produce higher absolute scores), embedding model (different cosine similarity distributions), document quality (the 0.7x-1.3x quality multiplier shifts all scores), and content age (recency decay affects absolute scores but the ratio stays stable).
-
-For backward compatibility, set `thresholdMode: "absolute"` in the profile to use fixed `minScore` values instead. MCP tools always use absolute thresholds since agents control their own limits directly.
+This is distribution-relative by construction — rank-derived fusion mass is scale-free, so no absolute score-scale calibration (per vault size, embedding model, document quality, or content age) is needed. The relative floor ratio itself is a calibrated quantity: it is per-basis in `ADMISSION_PARAMS` (initially 0.5 across bases) and tuned by the judged evaluation, not user-tunable. The composite score retains **tier sizing only** (HOT/WARM/COLD snippet lengths). The pre-v0.38.0 composite gate (activation floor + best-score ratio per profile) survives solely as the eval control arm behind `CLAWMEM_ADMISSION_POLICY=composite`; the product default is `relevance`. MCP tools are unaffected — they use absolute `minScore` thresholds the agent controls directly.
 
 ### Deep escalation (deep profile only)
 
-On the `deep` profile, context-surfacing uses a budget-aware escalation strategy. After the fast path (BM25 + vector search) completes, the hook checks how much of its 8-second timeout remains. If the fast path finished in under 4 seconds, the remaining time is spent on two additional phases:
+On the `deep` profile, context-surfacing runs a budget-aware escalation after the fast path (BM25 + vector lanes). Every deadline derives from the hook's authoritative internal budget (`CLAWMEM_HOOK_BUDGET_MS`, default 6000ms): the work deadline is the internal deadline minus a 500ms finalization reserve — a margin sized from measured payload-assembly cost and audited by the eval's invariant registry (a reserved, machine-validated margin, not an unconditional wall-clock guarantee; the write path that could stall left the handler entirely — see the CLI reference on spool commands). Escalation is entered only while both the profile's escalation window and the work deadline are open, and runs two phases:
 
-1. **Query expansion** — the LLM generates lexical and semantic variants of the prompt. These expanded queries run through BM25 to discover candidates that the original query terms missed. New candidates are merged into the result set (deduplicated).
+1. **Query expansion** — the LLM generates lexical and semantic variants of the *current* prompt (never a concatenated multi-turn query). Variants run as discounted recall lanes (lex → FTS, vec/hyde → vector) and are re-fused through the same membership stage under the expansion mass cap and protected current-class slots — expansion can add candidates but can never outvote the user's actual question. The expansion transport carries a real deadline abort: on expiry the call is cancelled, not abandoned to hold the process open.
 
-2. **Cross-encoder reranking** — the top 15 candidates are scored by the reranker with 2000 chars of document context per candidate. Results are blended (60% original score, 40% reranker score) to avoid over-relying on either signal.
+2. **Cross-encoder reranking** — the **complete** candidate pool is sent — a fixed top-N slice would make full *candidate* coverage structurally impossible. Per candidate the handler prepares a 2000-char projection, of which the store transmits the first 400 chars to the endpoint (sized to the reranker's 512-token query+document pair context); the cache key and the eval's transmitted-text manifest identify exactly that transmitted projection. An applied rerank requires two contracts: **full coverage** (a partially-covered pool is never partially reordered — the store throws on incomplete live coverage and the failure guard arbitrates instead) and **discrimination** (the per-request degeneracy gate discards collapsed or near-constant score sets — `CLAWMEM_RERANK_DEGENERACY_GATE`). A passing rerank joins the final order as one more rank-fused lane (`CLAWMEM_RERANK_LANE_WEIGHT`, default 1.5): it adds mass *within* the bands and never elevates a candidate's band — coverage proves the reranker answered, not that it outranks current-turn support.
 
-Both phases have a hard stop at 6 seconds (leaving 2 seconds of headroom within the hook timeout). If GPU services are unavailable or either phase times out, the hook falls back to the fast-path results. On a GPU system, expansion typically takes ~300ms and reranking ~200ms, so both phases fire on nearly every prompt. On CPU-only systems, the fast path alone usually consumes most of the 4-second budget, so escalation skips naturally.
+If GPU services are unavailable, either phase times out, or the rerank fails its contracts, the hook falls back to the fused fast-path order. The effect: `deep` results approach what the `query` MCP tool returns (which always runs expansion + reranking), while `speed` and `balanced` stay on the fast path.
 
-The effect: `deep` profile hooks produce results closer to what the `query` MCP tool returns (which always runs expansion + reranking), while `speed` and `balanced` continue using the fast path only.
+### Session focus topic (v0.9.0 §11.4; scoring boost removed in v0.38.0)
 
-### Session focus topic boost (v0.9.0 §11.4)
-
-The session focus topic is a per-session bias that steers context-surfacing toward a declared topic for the duration of a working session, without writing to SQLite or mutating any lifecycle column. Use it when the user asks to focus on one thing ("let's focus on the auth refactor for this session" / "only surface X-related docs right now") — the topic biases retrieval toward matching docs while leaving the underlying vault state untouched. Clearing the focus at the end of the subsession returns surfacing to baseline.
+The session focus topic is a per-session presentation bias for context-surfacing, declared for the duration of a working session without writing to SQLite or mutating any lifecycle column. Use it when the user asks to focus on one thing ("let's focus on the auth refactor for this session") — the topic threads through the pipeline as an `intent` hint while leaving the underlying vault state untouched. Clearing the focus at the end of the subsession returns surfacing to baseline.
 
 Set / show / clear with the CLI:
 
@@ -88,11 +85,8 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 
 When a focus topic is active:
 
-- **Intent-threaded retrieval** — the topic is passed as `intent` to `expandQuery`, `rerank`, and `extractSnippet`. Query expansion generates topic-aware variants, rerank prioritizes topic-aligned segments, and snippet extraction prefers sentences containing the topic tokens. Same `intent` lever that already exists on the query-time pipeline.
-- **Post-composite-score topic boost** — after `applyCompositeScoring` and before the adaptive threshold filter, docs that match all topic tokens (bag-of-word against title/path/body[:800], case-insensitive) get a 1.4× multiplier on `compositeScore`; non-matching docs get a 0.75× demote (clamped at a 0.5 floor). Boost fires per-result so it interacts cleanly with the adaptive threshold — matching docs surface higher, non-matching docs drop.
-- **Zero-match NO-OP** — if no docs in the scored result set match the topic, the boost stage is a no-op. The baseline ordering is returned unchanged, so the adaptive threshold sees byte-identical input and the result set never shrinks because of a non-matching focus. This fail-open contract is locked in by hook-level integration tests that assert byte-equality between a non-matching-topic run and a no-topic run.
-- **Session isolation** — the focus file is keyed by `sessionId`, never touches SQLite, and concurrent sessions on the same host cannot cross-contaminate each other's topic biasing. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping — do not rely on it for multi-session deployments.
-
+- **Snippet selection only** — the topic is passed as `intent` to `extractSnippet`, so snippet extraction prefers sentences containing the topic tokens. It is NOT passed to `expandQuery` or `rerank` (v0.38.0): expansion variants change candidate membership and rerank intent changes fused mass/order, so a session preference reaching either would cross into scoring/ordering.
+- **No scoring or ordering effect** — the post-composite-score topic boost (1.4× match / 0.75× demote) was DELETED in v0.38.0: the final order is the channel-aware fusion key and admission is judged on that same key, so a composite multiplier crossing into presentation was a metadata signal the ordering contract forbids. A matching topic changes snippet selection only; the surfaced set and its order are byte-identical with or without a focus.
 ### Hook blind spots
 
 Hooks filter aggressively — they enforce score thresholds, cap token budgets, and exclude system artifacts. If a memory exists but wasn't surfaced in `<vault-context>`, it doesn't mean it's missing from the vault. It means it didn't make the top-k cut for this prompt.

@@ -184,8 +184,26 @@ export function isHeartbeatPrompt(prompt: string): boolean {
   // Exact tiny pings.
   if (p === "ping" || p === "pong" || p === "heartbeat") return true;
 
+  // Word-boundary matching, not bare substring inclusion: a bare
+  // `includes("ping")` classified every real prompt containing "scoping" /
+  // "mapping" / "shipping" / "typing" as a heartbeat, silently dropping that
+  // turn's vault context AND its context_usage row (which also broke
+  // multi-turn lookback for the turns after it). Found by the BUILD-0 hook
+  // replay harness on its first run against a real prompt.
   const subs = getHeartbeatSubstrings();
-  return subs.some(s => p.includes(s));
+  return subs.some(s => hasWordBoundedOccurrence(p, s));
+}
+
+/** True when `needle` occurs in `haystack` with no letter/digit directly on either side. */
+function hasWordBoundedOccurrence(haystack: string, needle: string): boolean {
+  if (!needle) return false;
+  const isWordChar = (ch: string | undefined) => ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
+  let idx = haystack.indexOf(needle);
+  while (idx !== -1) {
+    if (!isWordChar(haystack[idx - 1]) && !isWordChar(haystack[idx + needle.length])) return true;
+    idx = haystack.indexOf(needle, idx + 1);
+  }
+  return false;
 }
 
 export function wasPromptSeenRecently(store: Store, hookName: string, prompt: string): boolean {
@@ -405,7 +423,9 @@ export function logInjection(
   injectedPaths: string[],
   estimatedTokens: number,
   turnIndex?: number,
-  queryText?: string
+  queryText?: string,
+  /** BUILD-5 (C5): injection-time co-activation is rich-get-richer trained on the hook's own injections — it left the surfacing path entirely (at t60 surfacing calls logInjection only for empty/alignment rows, whose paths never reach the >=2 branch); other callers keep the default. */
+  recordCoActivations: boolean = true
 ): number {
   try {
     const usageId = store.insertUsage({
@@ -419,8 +439,9 @@ export function logInjection(
       queryText,
     });
 
-    // Record co-activation for all injected paths (E3)
-    if (injectedPaths.length >= 2) {
+    // Record co-activation for all injected paths (E3) — unless the caller
+    // opted out (BUILD-5: the surfacing hook's injection-time writes).
+    if (recordCoActivations && injectedPaths.length >= 2) {
       store.recordCoActivation(injectedPaths);
     }
 

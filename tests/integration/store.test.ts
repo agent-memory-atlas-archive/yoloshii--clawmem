@@ -223,6 +223,26 @@ describe("co-activation", () => {
     expect(results[0]!.count).toBe(2);
   });
 
+  it("recordCoActivation is atomic — a later-pair failure rolls back the whole batch (BUILD-3d.4 transaction teeth)", () => {
+    // recordCoActivation(["a","b","c"]) inserts sorted pairs in order:
+    // (a,b), (a,c), (b,c). A trigger that aborts the LAST pair (b,c) proves the
+    // batching: under the single-transaction fix the whole call rolls back to 0
+    // rows; the pre-fix per-pair autocommit would have committed (a,b)+(a,c)
+    // before the abort. This is what the row/count tests above cannot see.
+    store.db.exec(`
+      CREATE TRIGGER coact_abort_bc BEFORE INSERT ON co_activations
+      WHEN NEW.doc_a = 'b.md' AND NEW.doc_b = 'c.md'
+      BEGIN SELECT RAISE(ABORT, 'test-injected co_activations failure'); END
+    `);
+    try {
+      expect(() => store.recordCoActivation(["a.md", "b.md", "c.md"])).toThrow();
+      const remaining = store.db.prepare("SELECT COUNT(*) AS n FROM co_activations").get() as { n: number };
+      expect(remaining.n).toBe(0); // whole transaction rolled back — no committed prefix
+    } finally {
+      store.db.exec("DROP TRIGGER IF EXISTS coact_abort_bc");
+    }
+  });
+
   it("handles multi-path co-activation (3 paths → 3 pairs)", () => {
     store.recordCoActivation(["a.md", "b.md", "c.md"]);
     const count = store.db.prepare("SELECT COUNT(*) as cnt FROM co_activations").get() as { cnt: number };

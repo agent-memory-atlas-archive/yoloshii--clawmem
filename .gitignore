@@ -23,6 +23,9 @@ node_modules/
 # Internal dev artifacts
 eval-queries*.json
 eval-bypass-cases*.json
+eval-hook-cases*.jsonl
+eval-hook-cases*.jsonl.bak-*
+eval-runs/
 eval-bundles/*
 # v0.29.0: the judge-recommendation evidence SHIPS (J8 reproducibility) — the
 # harness + raw model artifacts only; review transcripts stay local.

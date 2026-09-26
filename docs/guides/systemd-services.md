@@ -4,7 +4,7 @@ Keep ClawMem's AI agent memory services running automatically with systemd user 
 
 ## Watcher service
 
-Monitors collections for file changes and re-indexes automatically:
+Monitors collections for file changes and re-indexes automatically. Since v0.38.0 it also hosts the vault's vector daemon, which the context-surfacing hook's vector deadline depends on — run it wherever the hooks run:
 
 ```bash
 cat > ~/.config/systemd/user/clawmem-watcher.service << 'EOF'
@@ -67,6 +67,7 @@ loginctl enable-linger $(whoami)
 ```bash
 systemctl --user status clawmem-watcher.service
 systemctl --user status clawmem-embed.timer
+clawmem vec-daemon-health   # v0.38.0: the watcher's vector daemon answers for this vault (exit 0 = live)
 ```
 
 ## Background maintenance workers (v0.8.2)

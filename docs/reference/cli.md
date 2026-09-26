@@ -7,7 +7,8 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0)
+clawmem rerank-health           # Live cache-bypassed reranker probe: coverage + discrimination check, and provider-identity attestation (v0.38.0 — a passing probe enables remote rerank-score caching; a failed or unfingerprintable probe REVOKES it)
 ```
 
 ## Collection management
@@ -141,6 +142,13 @@ clawmem hook staleness-check
 clawmem hook curator-nudge
 ```
 
+Since v0.38.0 the context-surfacing hook applies injection bookkeeping (recall events, injected-paths/token fill-in, secondary-vault mirrors) off-process: after emitting its payload the hook parks a job and hands it over a pipe to a detached `spool-ingest` child, which persists it under `<db dir>/surfacing-spool/` and drains it. The turn-alignment `context_usage` row is written in-hook (fail-closed) and never depends on the spool.
+
+```bash
+clawmem spool-ingest            # INTERNAL: read one bookkeeping job from stdin, persist to the spool, drain
+clawmem spool-drain             # Apply pending spool jobs manually (safe any time; claim-by-rename makes concurrent drainers non-duplicating; jobs older than 24h are discarded)
+```
+
 ## IO6 surface commands (daemon integration)
 
 For non-hook integrations where a host process needs to inject context programmatically (e.g., daemon mode, custom orchestrators):
@@ -218,9 +226,18 @@ clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-exampl
 
 Replays gold-labeled queries through the real `query` tool handler and scores retrieved documents against hand-labeled evidence (doc-level Jaccard, precision/recall@k, hit@k, MRR). Writes `run.json` + `report.md`; touches no retrieval, lifecycle, or telemetry state (normal inference caches may populate, as in any live query). Exits `1` when the trust gate fails (too few scored examples, unresolved gold refs, or no `--audited` label-audit attestation). Gold schema, trust gates, and A/B workflow: [docs/guides/eval-harness.md](../guides/eval-harness.md).
 
+`clawmem vec-daemon-health [--db <path>] [--json] [--timeout-ms N]` — **v0.38.0.** Is the watcher's vector daemon Path-A AUTHORITATIVE for the vault? A real ping round trip (exact DB + owning pid), never a socket glob. Exit 0 ONLY for `live` (attested pid + DB **and** the `hydrated-v1` response protocol advertised) — the one state under which the context-surfacing hook's vector deadline is authoritative. Everything else exits 1: `absent` / `stale` / `unresponsive` / `foreign-db` (no usable listener), and the two liveness-without-authority tiers — `live-raw` (attested but not hydrated-capable: serves the raw-hit execution with client-side hydration timing) and `live-legacy` (a pre-v0.38 watcher: answers the daemon protocol, cannot attest). The JSON output carries `live` (any listener), `attested`, and `authoritative` separately. `clawmem doctor` runs the same check and warns (non-fatal issue) on the non-authoritative live tiers.
+
+```bash
+clawmem eval hook-run --gold <cases.jsonl> --db <snapshot> [--profile ...] [--budget-ms N] [--baseline <hook-run.json>] [--pair-with <run-dir> --pair-min-valid N] [--pair-min-exposed-stratum deep=6] [--pair-min-basis-stratum speed:bm25-rrf=3] [--pair-treatment <t>] [--capture-expansions <f> | --replay-expansions <f>] [--latency-reps N] [--skill-db <snapshot>] [--out <dir>] [--vector-exec daemon-required|in-process] [--vector-prewarm steady-state|cold] [--vector-daemon-ready-timeout-ms N]
+clawmem eval hook-aggregate --runs <dir1,dir2,...> --out <dir>
+```
+
+`hook-run` runs the **daemon-backed vector protocol** by default (`--vector-exec daemon-required`): a dedicated vector-daemon child is spawned on the working copy (steady-state prewarm before verified readiness), every vector leg is daemon-required, and the protocol is recorded in the run identity (`vector_exec`, strict on every comparison surface); `in-process` is the recorded opt-out whose latency evidence is not authoritative on balanced/deep — see [eval-harness](../guides/eval-harness.md). It replays labeled UserPromptSubmit cases through the **real** context-surfacing handler and scores the injected order (graded nDCG@k, must-include recall, must-not rate, abstention accuracy, prior-leg accuracy, latency, invariant audit), with run-identity fingerprints, acceptance gates against a baseline, paired counterfactuals, and registered treatments. `hook-aggregate` aggregates replicated paired draws into a distributional verdict. Full protocol: [eval-harness](../guides/eval-harness.md#hook-replay-clawmem-eval-hook-run).
+
 ## Session focus topic (v0.9.0)
 
-Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and applies a post-composite-score topic boost (1.4× match, 0.75× demote, NO-OP on zero matches). Session-scoped — never writes to SQLite or mutates any lifecycle column.
+Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` used ONLY as a snippet-selection `intent` hint (presentation: which sentences of a surfaced doc are shown). A focus never reaches query expansion, reranking, scoring, or ordering — the post-composite topic boost and the expansion/rerank intent threading were both removed in v0.38.0. Session-scoped — never writes to SQLite or mutates any lifecycle column.
 
 ```bash
 clawmem focus set "<topic>"                        # uses CLAUDE_SESSION_ID / CLAWMEM_SESSION_ID env
@@ -253,6 +270,12 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_RERANK_API_KEY` | — | Bearer token for an authenticated remote reranker endpoint |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block node-llama-cpp auto-downloads |
 | `CLAWMEM_PROFILE` | `balanced` | Performance profile: `speed` (BM25 only), `balanced` (BM25+vector), `deep` (BM25+vector+expansion+reranking) |
+| `CLAWMEM_HOOK_BUDGET_MS` | `6000` | **v0.38.0.** Context-surfacing hook's authoritative internal time budget; host hook timeout must be ≥ 1.5s startup + this ([configuration](configuration.md)) |
+| `CLAWMEM_ADMISSION_POLICY` | `relevance` | **v0.38.0.** Hook admission policy; `composite` = eval control arm only |
+| `CLAWMEM_RERANK_DEGENERACY_GATE` | `on` | **v0.38.0.** Discard non-discriminating deep-profile rerank score sets; `off` only for eval control arms |
+| `CLAWMEM_RERANK_LANE_WEIGHT` | `1.5` | **v0.38.0.** Rank-fusion weight of an applied rerank lane; `0` = RRF-only counterfactual |
+| `CLAWMEM_RERANK_PROVIDER_ID` | — | **v0.38.0.** Declared reranker identity refinement; remote rerank caching requires an attested identity (`clawmem rerank-health`) |
+| `CLAWMEM_SURFACING_TRACE` | — | **v0.38.0.** `=1`: persist per-stage surfacing traces to `surfacing_diagnostics` (diagnostic; adds post-payload latency) |
 | `CLAWMEM_VAULTS` | — | JSON map of vault name to SQLite path |
 | `CLAWMEM_API_TOKEN` | — | Bearer token for REST API auth |
 | `CLAWMEM_ENABLE_AMEM` | enabled | A-MEM note construction during indexing |

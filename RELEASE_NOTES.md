@@ -4,6 +4,123 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.38.0 — the context-surfacing hook ranks, admits, and bookkeeps on one honest key
+
+The hook's ranking pipeline had accumulated incomparable signals: raw cosine and BM25
+scores sorted against each other, composite-score admission that rejected on-topic
+documents while admitting junk, a topic boost and metadata reorders layered on top of
+the sort, and post-injection SQLite bookkeeping riding the prompt-latency path. This
+release rebuilds the pipeline around a single ordering authority, measured end to end
+by a judged evaluation (labeled gold cases replayed through the real handler) that
+ships as part of the release.
+
+### One channel-aware ordering key
+
+Every retrieval leg — BM25, vector, file-aware, the gated prior-turn leg, and deep
+expansion variants — contributes a ranked **lane**; weighted reciprocal-rank fusion
+produces one key per candidate: a **band** (0 = supported by the current turn's own
+lanes, 1 = discounted-lane-only survivor) and a scale-free fused **mass**. That key
+decides pool membership (under an expansion mass cap + protected current-class slots,
+so recall hints can never outvote the user's actual question), the final injected
+order, and — new in this release — admission. Discounted-only candidates order
+strictly below every current-supported one. No mixed raw-score sorts remain, and no
+metadata reorders: the spreading-activation and memory-type-diversification stages
+are deleted, and pins/recency/quality multipliers can no longer change hook membership or ordering — composite retains tier sizing, so they still influence snippet depth (HOT/WARM/COLD). Co-activation is absent from the hook entirely. (All of it still acts on the composite MCP surfaces.)
+
+### Relevance admission, with honest abstention
+
+Keep/drop is judged on the same key that orders: a relative floor (≥ 50% of the top
+candidate's fused mass) inside band 0, and query-level abstention when there is
+nothing defensible to inject — `no-current-support` (band 0 empty, unless the
+anaphora gate certified the prior turn as the only signal) and `degenerate-basis`
+(FTS agreed on nothing — the vector-only junk signature of gibberish prompts). The
+pre-existing composite gate survives solely as the eval control arm behind
+`CLAWMEM_ADMISSION_POLICY=composite`.
+
+### The deep rerank lane earns its influence
+
+An applied rerank needs full candidate coverage (a partially-covered pool is never
+partially reordered) AND a discriminating score set — the per-request **degeneracy
+gate** (`CLAWMEM_RERANK_DEGENERACY_GATE`, default on) discards collapsed or near-constant score sets instead of trusting their arbitrary order (the 0.05 spread floor is calibrated from the zerank baseline and validated by the judged eval; another provider may need its own calibration). A passing rerank
+joins the final order as one more rank-fused lane (`CLAWMEM_RERANK_LANE_WEIGHT`,
+default 1.5) — mass within the bands, never a band elevation. Remote rerank scores
+are now cached only under an **attested provider identity**: `clawmem rerank-health`
+fingerprints what the endpoint actually serves (7-day expiry, failed probes revoke),
+so cached scores are namespaced to the attested provider. A same-URL swap nobody re-probes is honored until the next `rerank-health` refresh or the 7-day expiry — which is exactly why attestations expire instead of being trusted indefinitely. The rerank
+request revision bumped (`RERANK_REQUEST_REV=2`), invalidating prior cache entries
+once.
+
+### Deadlines that hold
+
+`CLAWMEM_HOOK_BUDGET_MS` (default 6000) is the hook's authoritative internal budget;
+every in-handler deadline derives from it, with a 500ms finalization reserve — a measured, invariant-audited margin for payload assembly, not an unconditional guarantee (the write path that could stall left the handler entirely, below). Expansion carries a real transport abort (an abandoned
+promise no longer holds the process past its budget), and `clawmem setup hooks`
+derives the host timeout from the budget (≥ 1.5s startup + budget, never reducing a
+larger existing value) while `clawmem doctor` checks the inequality.
+
+**Scope of the vector deadline — daemon-backed deployments.** The one deadline the handler
+cannot enforce by itself is the vector leg's: the sqlite-vec MATCH is synchronous, and a
+`Promise.race` timer on the same event loop cannot fire while it runs. The profile's vector
+timeout (900ms balanced, 2000ms deep) is therefore authoritative **when the watcher's vector
+daemon serves the vault** (`clawmem watch` — the scan runs off the hook's loop and the timer
+can actually fire); without the watcher the hook still works, but a cold multi-GB scan blocks
+the handler for the scan's full duration and the budget is a target, not a bound. The
+release's latency evidence was gathered under exactly that daemon-backed topology: the hook
+replay-eval spawns a dedicated vector-daemon child on its working copy (the watcher's
+steady-state prewarm performed before readiness, every vector leg daemon-required, daemon
+loss refuses the run) and records the protocol in the run identity (`vector_exec`), where it
+is strict across baseline, pair and replicated comparisons; an in-process replay is recorded
+as such and its latency axes are unmeasured. Making the vector path structurally bounded
+without a watcher is future work, not a claim of this release. **Fixed alongside:** a stale
+daemon socket left by a crashed watcher silently prevented the next watcher from ever binding
+its daemon (the liveness probe threw on a missing socket handler and the bind was skipped) —
+the hook then ran in-process, unbounded, with no diagnostic; the probe is fixed and the
+stale-socket bind is regression-tested. Because the contract is scoped to daemon-backed
+deployments, the prerequisite is checkable: `clawmem doctor` now verifies the vault's
+daemon by a real round trip, and `clawmem vec-daemon-health` (exit 0 only for a live daemon on the vault's socket —
+attested `live`, or `live-legacy` for a pre-v0.38 watcher that answers the daemon protocol
+but cannot attest its DB/pid) is the scriptable gate the shipping preflight uses.
+In the replay-eval, daemon ownership is re-verified before and after every rep, a
+`steady-state` prewarm that had no vector payload to warm refuses vector-exercising runs,
+and an in-process replay's budget gate is reported as unmeasured (raw timing kept as a
+diagnostic) rather than as a pass or an overrun.
+
+### Bookkeeping left the hook
+
+After the payload is assembled the hook does zero SQLite/filesystem work in normal production mode (the one disclosed exception: the diagnostic `CLAWMEM_SURFACING_TRACE=1` trace persist). Turn
+alignment became a single early **fail-closed** `context_usage` row at retrieval
+commit — no row, no injection, so injected context is never untracked and prompt
+history survives deadline skips. Recall events, injected-paths fill-in, and
+secondary-vault mirrors are handed to a detached `clawmem spool-ingest` child over a
+bounded pipe (250ms flush race; losing the race costs only that turn's optional
+learning data) and applied by a claim-by-rename drainer with per-row idempotency
+keys — crash-and-retry can never double-count. `clawmem spool-drain` applies pending
+jobs manually.
+
+### Session focus narrowed to presentation
+
+A focus topic now steers snippet selection only. The 1.4×/0.75× post-composite topic
+boost and the expansion/rerank intent threading are removed: a session preference
+must not change what surfaces or in what order, only which sentences of a surfaced
+doc are shown.
+
+### The judged hook eval harness
+
+`clawmem eval hook-run` replays labeled UserPromptSubmit cases through the real
+handler against a corpus snapshot: graded nDCG over the injected order, must-include
+recall, must-not damage rate, abstention accuracy, prior-leg accuracy, latency, and a
+hermetic invariant audit — with run-identity fingerprints (corpus, code, inference
+topology, served-model probes), holdout-only acceptance gates, paired counterfactuals
+(frozen expansion draws + per-case pre-treatment audits), registered treatments, an
+experiment-pinned clock, and `eval hook-aggregate` for replicated-draw distributional
+verdicts. `CLAWMEM_SURFACING_TRACE=1` captures the same per-stage trace envelope
+live into `surfacing_diagnostics` for post-hoc diagnosis.
+
+Upgrade notes (schema auto-migrations, the one-time rerank-cache cold start, the
+recommended `setup hooks` re-run): [docs/guides/upgrading.md](docs/guides/upgrading.md#v0380-channel-aware-hook-ranking-relevance-admission-off-process-bookkeeping).
+
+---
+
 ## v0.37.0 — a reachable-but-wrong inference endpoint now degrades instead of silently dying
 
 Issue #24: when `CLAWMEM_LLM_URL` pointed at a port where an *unrelated* service answered

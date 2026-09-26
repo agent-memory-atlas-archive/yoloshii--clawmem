@@ -193,6 +193,7 @@ Two separate OpenClaw changes interact with how ClawMem is configured and discov
 
 - **v2026.4.10** fixed a config normalization bug (#64192) where `plugins.slots.contextEngine` was silently dropped during config processing. If you are on an older pre-v0.10.0 ClawMem that still uses the `context-engine` slot, v2026.4.10+ is needed for reliable slot activation.
 - **v2026.4.11** tightened the plugin discovery path (`readdirSync({ withFileTypes: true })` + `dirent.isDirectory()`) and the plugin ownership check (`uid == current user || uid == 0`). Both are load-bearing for ClawMem v0.10.0+, which ships with the new `package.json`-based discovery contract and defaults to a copied (not symlinked) extensions directory. See the Install section above for the multi-user ownership gotcha.
+- **OpenClaw main from September 2026 (#131779, package version 2026.9.2)** tightened memory-slot ownership. A `kind: memory` plugin that is not the selected slot owner still loads, still registers its hooks and tools, but OpenClaw strips its memory runtime and logs a warning containing `memory plugin not selected for the memory slot; skipping its indexing runtime and recall registration`. On earlier releases an unselected memory plugin was disabled outright and the ready line omitted it, which was easy to spot. Now it fails quietly: if `plugins.slots.memory` points at another plugin, or was cleared with `openclaw config unset plugins.slots.memory`, you get ClawMem hooks without a ClawMem memory runtime and one line in the journal. The Verify section below checks the slot explicitly.
 
 ClawMem v0.10.0 uses the `memory` slot (`plugins.slots.memory: "clawmem"`), not the older `contextEngine` slot. The slot is set automatically by the `openclaw plugins enable clawmem` step in the setup next-steps output — you do not need to set it by hand via `openclaw config set`. On v2026.4.11+, `openclaw plugins enable clawmem` also disables any competing `memory`-slot plugin (e.g. `memory-core`, `memory-lancedb`) in the same command.
 
@@ -283,12 +284,21 @@ After setup (and the chown step on multi-user installs), check all components:
 openclaw plugins list | grep clawmem
 openclaw plugins inspect clawmem   # should show Kind: memory, Status: enabled
 
+# Memory slot owner. Must print "clawmem". Nothing printed means the slot is unset and the
+# loader picked ClawMem only because it was the first memory plugin it found; pin it with
+#   openclaw config set plugins.slots.memory clawmem
+openclaw config get plugins.slots.memory
+
 # Gateway log should include clawmem in the ready line, for example:
 #   [gateway] ready (7 plugins: acpx, browser, clawmem, device-pair, phone-control, talk-voice, telegram; ...)
 # AND the per-plugin registration line:
 #   [plugins] clawmem: plugin registered (kind=memory, bin=..., profile=balanced, budget=800)
 #   [plugins] clawmem: registered 5 agent tools
 journalctl -u openclaw-gateway.service -n 50 --no-pager | grep -E "(ready|\bclawmem\b)"
+
+# Slot warning must be ABSENT (expect 0). If it prints 1, ClawMem loaded without its memory
+# runtime because another plugin owns plugins.slots.memory. See Troubleshooting.
+journalctl -u openclaw-gateway.service -n 200 --no-pager | grep -c "not selected for the memory slot"
 
 # REST API responding
 curl http://localhost:7438/health

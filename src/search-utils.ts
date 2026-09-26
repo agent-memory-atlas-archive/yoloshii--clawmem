@@ -79,14 +79,30 @@ export type RankedResult = {
 // =============================================================================
 
 /**
+ * Fusion-policy options (C1b, RANKING-DEFECT-HANDOFF Addendum 5).
+ *
+ * `weightBonuses` multiplies the +0.05/+0.02 top-rank bonuses by the list's
+ * lane weight, so a discounted lane's rank-0 hit cannot outscore a full-weight
+ * lane through the unweighted bonus. Default FALSE — every existing caller
+ * (hybrid retrieval, the `query` MCP pipeline, query_plan, CLI query,
+ * causal/graph fusion) keeps byte-identical behavior; only the
+ * context-surfacing hook's candidate fusion opts in.
+ */
+export interface FusionPolicy {
+  weightBonuses?: boolean;
+}
+
+/**
  * Merge multiple ranked result lists using Reciprocal Rank Fusion.
  * k=60 is the standard RRF constant. Top-rank bonuses reward results
- * that appear at rank 0 (+0.05) or rank 1-2 (+0.02).
+ * that appear at rank 0 (+0.05) or rank 1-2 (+0.02); under
+ * `policy.weightBonuses` the bonus is scaled by the list's weight.
  */
 export function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[],
-  k: number = 60
+  k: number = 60,
+  policy: FusionPolicy = {}
 ): RankedResult[] {
   // Validate weights match result lists when explicitly provided
   if (weights.length > 0 && weights.length !== resultLists.length) {
@@ -115,7 +131,8 @@ export function reciprocalRankFusion(
       const r = list[rank]!;
       const existing = scores.get(r.file);
       const rrfScore = weight / (k + rank + 1);
-      const bonus = rank === 0 ? 0.05 : rank <= 2 ? 0.02 : 0;
+      const rawBonus = rank === 0 ? 0.05 : rank <= 2 ? 0.02 : 0;
+      const bonus = policy.weightBonuses ? rawBonus * weight : rawBonus;
       const total = rrfScore + bonus;
 
       if (existing) {

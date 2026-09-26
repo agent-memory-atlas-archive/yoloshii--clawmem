@@ -95,14 +95,17 @@ describe("hook mixed-channel pool (S49.1 U5)", () => {
     expect(ctx.indexOf("v-doc.md")).toBeLessThan(ctx.indexOf("w-doc.md"));
   });
 
-  it("deep-escalation sort/blend consumes the transformed scale (flat-1.0 FTS would invert the order)", async () => {
+  it("deep escalation honors the reranker's ranking via rank fusion — raw channel scores never order (BUILD-2 supersedes the 0.6/0.4 blend contract)", async () => {
     seedHookFixture();
-    // Regression-sensitive arithmetic: the blend is 0.6·score + 0.4·rerank.
-    //   Post-fix:  W ≈ 0.6·0.55 + 0.4·0.6 = 0.57  <  V = 0.6·0.9 + 0.4·0.5 = 0.74 → V leads.
-    //   Pre-fix (W's FTS score flat 1.0): W = 0.6·1.0 + 0.4·0.6 = 0.84 > 0.74 → W would lead.
-    // So asserting V-before-W FAILS against the old constant-score defect, and the
-    // stub hit-counter proves the blend path actually executed (a silently skipped
-    // rerank would leave the ordering correct for the wrong reason).
+    // BUILD-2 deleted the 0.6·score + 0.4·rerank blend: raw cosine and the
+    // FTS transform never enter ordering at all (the flat-1.0 FTS defect
+    // class this test guarded is structurally unreachable now). V and W are
+    // each rank-1 in their OWN lane → equal fusion contributions — so the
+    // fully-covering reranker's preference decides: the stub scores W
+    // (vortalcrest) 0.6 over V (vortalhub) 0.5, and W must lead. Under the
+    // old blend V led on raw-cosine dominance (0.74 vs 0.57) — this
+    // assertion flips with the contract, and the stub hit-counter still
+    // proves the rerank path actually executed.
     let stubHits = 0;
     const stub = Bun.serve({
       port: 0,
@@ -125,7 +128,7 @@ describe("hook mixed-channel pool (S49.1 U5)", () => {
       expect(stubHits).toBeGreaterThan(0);
       expect(ctx).toContain("w-doc.md");
       expect(ctx).toContain("v-doc.md");
-      expect(ctx.indexOf("v-doc.md")).toBeLessThan(ctx.indexOf("w-doc.md"));
+      expect(ctx.indexOf("w-doc.md")).toBeLessThan(ctx.indexOf("v-doc.md"));
     } finally {
       stub.stop(true);
     }

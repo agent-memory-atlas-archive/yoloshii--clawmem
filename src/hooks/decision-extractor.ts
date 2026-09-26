@@ -49,6 +49,7 @@ import {
 import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
+import type { LegacyWallDeadline } from "../clock-legacy.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
 // original {decision, preference, milestone, problem} gate, which rejected 77% of
@@ -100,7 +101,7 @@ export async function checkMergePolicy(
    *  bounds the dedup embedding. Past it, dedup degrades to a plain insert —
    *  saveMemory's hash dedup still applies — rather than starting a model call
    *  outside the Stop budget. */
-  deadlineMs?: number,
+  deadlineMs?: LegacyWallDeadline,
 ): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
   const policy = getMergePolicy(contentType);
 
@@ -814,7 +815,7 @@ async function detectContradictions(
   /** s342 D2: the Stop handler's whole-handler deadline. When present, the
    *  judge call is skipped below the remaining-budget floor (audited as
    *  `skipped_budget`) and an in-flight call is bounded by the remainder. */
-  deadlineAt?: number,
+  deadlineAt?: LegacyWallDeadline,
 ): Promise<number> {
   const decisions = newObservations.filter(o => o.type === "decision");
   if (decisions.length === 0) return 0;
@@ -894,7 +895,7 @@ async function detectContradictions(
 
   // Vector search for existing decisions on overlapping topics — the embedding
   // is bounded by the whole-handler deadline minus the persistence reserve.
-  const searchDeadline = deadlineAt !== undefined ? deadlineAt - PERSIST_RESERVE_MS : undefined;
+  const searchDeadline = deadlineAt !== undefined ? deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0013 */ : undefined;
   const queryText = newFacts.join(". ");
   let existingDocs: SearchResult[];
   try {
@@ -1165,7 +1166,7 @@ export async function decisionExtractor(
   // kills mid-write. Operating requirement (docs/reference/configuration.md):
   // the installed host hook timeout must exceed this budget plus safety.
   const stopBudget = resolveStopBudgetMs();
-  const deadlineAt = Date.now() + stopBudget.budgetMs;
+  const deadlineAt = Date.now() + stopBudget.budgetMs as LegacyWallDeadline /* O1-DEBT-0012 */;
   if (stopBudget.invalid) {
     console.error(`[decision-extractor] ${stopBudget.invalid}`);
   }
@@ -1303,7 +1304,7 @@ export async function decisionExtractor(
 
   // Check existing merge policy first (vector-based dedup for decisions),
   // bounded by the whole-handler deadline minus the persistence reserve.
-  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
+  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0014 */);
 
   if (mergeResult.action === 'skip') {
     process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
@@ -1352,7 +1353,7 @@ export async function decisionExtractor(
 
       // Check existing merge policy first (merge_recent for antipatterns),
       // under the same whole-handler deadline bound.
-      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
+      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0015 */);
 
       if (antiMerge.action === 'skip') {
         // Near-duplicate — skip

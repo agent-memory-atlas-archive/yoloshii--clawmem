@@ -10,21 +10,26 @@
  *      (fail-open contract: "topic set + zero matching docs → proceed
  *      with the normal results")
  *
- *   2. A matching topic CHANGES the output compared to the no-topic
- *      baseline on the same seeded store, so we can prove the boost
- *      actually has an effect at the hook level and is not just a
- *      unit-test-only behavior (below-threshold rescue at minimum).
+ *   2. (Amended BUILD-5, 2026-08-25) The boost MACHINERY IS REMOVED: since
+ *      BUILD-2 the final order is the channel-aware fusion key and since
+ *      BUILD-4 admission is judged on that same key, so the stage's only
+ *      residual effect was tier depth via the composite multiplier — a
+ *      metadata signal crossing presentation, deleted by C5. A matching
+ *      topic now changes NOTHING: trace.topicBoost stays null and the
+ *      output is byte-identical; sessionTopic itself survives as the
+ *      snippet-selection intent (presentation, not ordering).
  *
  * METHODOLOGY — each comparison uses TWO separate, identically-seeded
  * stores (one per call), NOT one store reused across both calls. This is
- * load-bearing: `contextSurfacing` intentionally mutates persistent
- * recall/co-activation state on every invocation (`logInjection` +
- * `writeRecallEvents`), and that state feeds back into composite scoring
- * on the NEXT call (spreading activation, frequency/recency signals). So
- * two calls against the SAME store differ REGARDLESS of the topic — the
- * second call is scored against the state the first call created. Reusing
- * one store conflates the variable under test (the topic) with the
- * call-ordinal (which call ran first). Two fresh identically-seeded
+ * load-bearing: `contextSurfacing` still mutates persistent per-turn
+ * state on every invocation (the retrieval-commit context_usage alignment
+ * row, t60 F59-2; plus dedupe/seen-prompt records), and turn state feeds
+ * later calls (the prior-context leg reads earlier turns' query_text).
+ * (Injection-time co-activation and spreading activation were DELETED at
+ * BUILD-5, and recall-event bookkeeping now lands via the off-process
+ * drainer — but the alignment write alone still makes call-ordinal a
+ * confound.) So two calls against the SAME store are not guaranteed
+ * byte-comparable regardless of the topic. Two fresh identically-seeded
  * stores isolate the topic as the ONLY difference between the two runs,
  * so byte-equality (or inequality) is attributable to the topic alone.
  *
@@ -49,6 +54,7 @@ import {
   type Store,
 } from "../../src/store.ts";
 import { clearConfigCache } from "../../src/config.ts";
+import { newSurfacingTrace } from "../../src/eval/hook-trace.ts";
 
 // =============================================================================
 // Hermetic env setup
@@ -235,12 +241,15 @@ describe("§11.4 topic boost — hook-level integration", () => {
     expect(ctxB).toBe(ctxA);
   });
 
-  it("matching topic CHANGES the output compared to the no-topic baseline on the same seeded store", async () => {
-    // Seed multiple docs that all share the query tokens so they ALL
-    // surface via FTS. The topic "authentication" matches auth.md only
-    // (via its title + body); the other two do not. With a topic set,
-    // the boost re-weights auth.md higher and demotes the other two,
-    // shifting the serialized string relative to the no-topic baseline.
+  it("matching topic: the boost machinery is GONE (BUILD-5) — trace.topicBoost stays null, sessionTopic is still resolved, output is byte-identical", async () => {
+    // Pre-BUILD-4 this test asserted the boost CHANGES the output bytes;
+    // post-BUILD-4 it asserted the boost runs traced but order-inert. Both
+    // premises are now removed BY DESIGN: BUILD-5 (C5) deleted the stage
+    // outright — its last residual (tier depth via the composite
+    // multiplier) was a metadata signal crossing presentation. What must
+    // hold NOW: the topic is RESOLVED (trace.sessionTopic — it still feeds
+    // snippet-selection intent), no boost record exists, and the output is
+    // byte-identical to the no-topic run.
     //
     // Two fresh identically-seeded stores make the topic the ONLY
     // difference: a false positive from the recall-feedback
@@ -258,20 +267,27 @@ describe("§11.4 topic boost — hook-level integration", () => {
 
     const prompt = "pipeline design primary";
 
-    const outNoTopic = await contextSurfacing(storeNoTopic, { prompt, sessionId: "s-no" } as any);
+    const traceNo = newSurfacingTrace();
+    const outNoTopic = await contextSurfacing(storeNoTopic, { prompt, sessionId: "s-no" } as any, { trace: traceNo });
 
     // Set a topic that matches auth.md directly via title + body.
     process.env.CLAWMEM_SESSION_FOCUS = "authentication";
-    const outWithTopic = await contextSurfacing(storeWithTopic, { prompt, sessionId: "s-with" } as any);
+    const traceWith = newSurfacingTrace();
+    const outWithTopic = await contextSurfacing(storeWithTopic, { prompt, sessionId: "s-with" } as any, { trace: traceWith });
     delete process.env.CLAWMEM_SESSION_FOCUS;
 
     const ctxNoTopic = additionalContext(outNoTopic);
     const ctxWithTopic = additionalContext(outWithTopic);
-
-    // Both calls must produce context. They should NOT be byte-identical,
-    // proving the topic boost has an observable effect at the hook level.
     expect(ctxNoTopic.length).toBeGreaterThan(0);
     expect(ctxWithTopic.length).toBeGreaterThan(0);
-    expect(ctxWithTopic).not.toBe(ctxNoTopic);
+
+    // BUILD-5: the machinery is deleted — no boost record on EITHER run...
+    expect(traceNo.topicBoost).toBeNull();
+    expect(traceWith.topicBoost).toBeNull();
+    // ...while the topic itself was still resolved (presentation intent)...
+    expect(traceWith.sessionTopic).toBe("authentication");
+    // ...and the output is fully unchanged: identical set, order, and bytes.
+    expect(traceWith.finalPaths).toEqual(traceNo.finalPaths);
+    expect(ctxWithTopic).toBe(ctxNoTopic);
   });
 });
