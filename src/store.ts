@@ -5095,6 +5095,17 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 export const RERANK_REQUEST_REV = 2;
 
 /**
+ * What an in-process (node-llama-cpp) rerank score MEANS, versioned. It is part
+ * of the local cache namespace (`rerankIdentityState`), so a score computed under
+ * a different local scoring stack never serves under the current one (cold
+ * start, no migration; llm_cache self-prunes). 2: node-llama-cpp 3.20 returns
+ * the Qwen3 reranker's probability; 3.15.1 passed it through a second sigmoid,
+ * which squeezed every score into about 0.50-0.73 (issue #26). Bump it whenever
+ * the local scoring stack changes what a score means.
+ */
+export const LOCAL_RERANK_SCORE_REV = 2;
+
+/**
  * The EXACT text transmitted to the rerank endpoint for a candidate —
  * truncated to ~400 chars to fit the server's 512-token context (query +
  * document must share one pair; ~2 chars/token for mixed content). Single
@@ -5149,7 +5160,7 @@ export function rerankProviderNamespace(kind: "remote" | "local", model: string,
  */
 export function rerankIdentityState(kind: "remote" | "local", model: string, db?: Database): { namespace: string | null; token: string } {
   if (kind === "local") {
-    const ns = `local:${model}`;
+    const ns = `local:${model}#score-rev${LOCAL_RERANK_SCORE_REV}`;
     return { namespace: ns, token: ns };
   }
   const url = Bun.env.CLAWMEM_RERANK_URL?.trim() || "unset";
