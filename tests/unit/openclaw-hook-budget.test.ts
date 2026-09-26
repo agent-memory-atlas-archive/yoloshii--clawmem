@@ -24,6 +24,13 @@ import {
   type ClawMemConfig,
 } from "../../src/openclaw/shell.ts";
 import {
+  parseHookBudgetConfig,
+  DEFAULT_HOOK_BUDGET_MS as HOOK_DEFAULT_BUDGET_MS,
+  MIN_HOOK_BUDGET_MS as HOOK_MIN_BUDGET_MS,
+  MAX_HOOK_BUDGET_MS as HOOK_MAX_BUDGET_MS,
+} from "../../src/hooks/context-surfacing.ts";
+import { MAX_LEG_BUDGET_MS } from "../../src/vector-protocol.ts";
+import {
   handleBeforePromptBuild,
   setHookRunnerForTests,
   restoreHookRunnerForTests,
@@ -84,10 +91,34 @@ describe("resolveHookBudgetMs", () => {
   test("clamps into [MIN, MAX] and floors fractions; MAX keeps the host timeout under OpenClaw's policy ceiling", () => {
     expect(resolveHookBudgetMs(500)).toBe(MIN_HOOK_BUDGET_MS);
     expect(resolveHookBudgetMs(10_000_000)).toBe(MAX_HOOK_BUDGET_MS);
-    expect(MAX_HOOK_BUDGET_MS).toBe(60_000);
+    expect(MAX_HOOK_BUDGET_MS).toBe(MAX_LEG_BUDGET_MS);
     expect(hostHookTimeoutMs({ hookBudgetMs: MAX_HOOK_BUDGET_MS })).toBeLessThanOrEqual(OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS);
     expect(resolveHookBudgetMs(6500.9)).toBe(6500);
     expect(resolveHookBudgetMs("8000")).toBe(8000);
+  });
+});
+
+describe("the plugin's clamp and the hook's budget parser agree (v0.38+)", () => {
+  test("DEFAULT, MIN and MAX equal the hook's own; MAX is the wire ceiling", () => {
+    expect(DEFAULT_HOOK_BUDGET_MS).toBe(HOOK_DEFAULT_BUDGET_MS);
+    expect(MIN_HOOK_BUDGET_MS).toBe(HOOK_MIN_BUDGET_MS);
+    expect(MAX_HOOK_BUDGET_MS).toBe(HOOK_MAX_BUDGET_MS);
+    expect(MAX_HOOK_BUDGET_MS).toBe(MAX_LEG_BUDGET_MS);
+  });
+  test("every value the plugin can hand the hook is accepted unchanged; one past MAX is refused", () => {
+    for (const raw of [undefined, "abc", 0, -5, 500, 6500.9, "8000", DEFAULT_HOOK_BUDGET_MS, MAX_HOOK_BUDGET_MS, MAX_HOOK_BUDGET_MS + 1, 60_000, 10_000_000]) {
+      const passed = resolveHookBudgetMs(raw);
+      const parsed = parseHookBudgetConfig(String(passed));
+      expect(parsed.valid).toBe(true);
+      expect(parsed.effectiveMs).toBe(passed);
+    }
+    expect(parseHookBudgetConfig(String(MAX_HOOK_BUDGET_MS + 1)).valid).toBe(false);
+  });
+  test("the manifest's schema bounds and help text carry the same range", async () => {
+    const manifest = await Bun.file(MANIFEST_PATH).json();
+    expect(manifest.configSchema.properties.hookBudgetMs.minimum).toBe(MIN_HOOK_BUDGET_MS);
+    expect(manifest.configSchema.properties.hookBudgetMs.maximum).toBe(MAX_HOOK_BUDGET_MS);
+    expect(manifest.uiHints.hookBudgetMs.help).toContain(`${MIN_HOOK_BUDGET_MS}-${MAX_HOOK_BUDGET_MS}`);
   });
 });
 

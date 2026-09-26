@@ -79,7 +79,7 @@
     "hookBudgetMs": {
       "label": "Hook time budget (ms)",
       "placeholder": "6000",
-      "help": "Wall-clock budget the context-surfacing hook schedules its legs against (CLAWMEM_HOOK_BUDGET_MS, 1000-60000). The plugin kills the hook 2 s after it and registers the host hook 2 s after that; an operator hook-timeout policy (plugins.entries.clawmem.hooks.timeouts.before_prompt_build) lower than budget + 4 s wins and must be raised together with it.",
+      "help": "Wall-clock budget the context-surfacing hook schedules its legs against (CLAWMEM_HOOK_BUDGET_MS, 1000-25000; the hook refuses a larger value). The plugin kills the hook 2 s after it and registers the host hook 2 s after that; an operator hook-timeout policy (plugins.entries.clawmem.hooks.timeouts.before_prompt_build) lower than budget + 4 s wins and must be raised together with it.",
       "advanced": true
     }
   },
@@ -140,7 +140,7 @@
       "hookBudgetMs": {
         "type": "number",
         "minimum": 1000,
-        "maximum": 60000
+        "maximum": 25000
       }
     }
   }

@@ -53,12 +53,17 @@ export type ClawMemConfig = {
 export const DEFAULT_HOOK_BUDGET_MS = 6000;
 export const MIN_HOOK_BUDGET_MS = 1000;
 /**
- * Product cap for a per-prompt path: one minute. OpenClaw's own hook-timeout
- * policy tops out at OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS, and the outer host
- * timeout (budget + both margins) must stay below it so the manifest's advice
- * to set a matching policy is always satisfiable.
+ * The hook's own ceiling. From v0.38 the context-surfacing hook refuses to run
+ * when CLAWMEM_HOOK_BUDGET_MS is above MAX_LEG_BUDGET_MS (src/vector-protocol.ts,
+ * 25 s), so the plugin clamps to the same number and never hands it a value it
+ * refuses. Mirrored rather than imported to keep this directory self-contained
+ * (link mode loads it as source); tests/unit/openclaw-hook-budget.test.ts pins
+ * the two equal. OpenClaw's own hook-timeout policy tops out at
+ * OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS, and the outer host timeout (budget + both
+ * margins) must stay below it so the manifest's advice to set a matching policy
+ * is always satisfiable.
  */
-export const MAX_HOOK_BUDGET_MS = 60_000;
+export const MAX_HOOK_BUDGET_MS = 25_000;
 export const HOOK_KILL_MARGIN_MS = 2000;
 export const HOST_TIMEOUT_MARGIN_MS = 2000;
 export const OPENCLAW_HOOK_TIMEOUT_POLICY_MAX_MS = 600_000;

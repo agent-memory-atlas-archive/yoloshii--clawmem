@@ -107,7 +107,7 @@ Setup also pins the memory slot (`plugins.slots.memory: clawmem`; since the Sept
 
 #### Hook time budget
 
-The context-surfacing hook runs under one budget, `hookBudgetMs` (default 6000, configurable from 1000 to 60000). The plugin passes it to the hook as `CLAWMEM_HOOK_BUDGET_MS` (honoured from ClawMem v0.38; older hooks ignore it), kills the hook process two seconds after it, and registers `before_prompt_build` with OpenClaw two seconds after that. Every timeout message names the hook, the profile and the budget. An operator hook-timeout policy (`plugins.entries.clawmem.hooks.timeouts.before_prompt_build` or `plugins.entries.clawmem.hooks.timeoutMs`) overrides the plugin's registration value, so a policy below budget plus four seconds kills surfacing on every prompt; setup warns when it finds one.
+The context-surfacing hook runs under one budget, `hookBudgetMs` (default 6000, configurable from 1000 to 25000, the hook's own ceiling; the hook refuses a larger value). The plugin passes it to the hook as `CLAWMEM_HOOK_BUDGET_MS` (honoured from ClawMem v0.38; older hooks ignore it), kills the hook process two seconds after it, and registers `before_prompt_build` with OpenClaw two seconds after that. Every timeout message names the hook, the profile and the budget. An operator hook-timeout policy (`plugins.entries.clawmem.hooks.timeouts.before_prompt_build` or `plugins.entries.clawmem.hooks.timeoutMs`) overrides the plugin's registration value, so a policy below budget plus four seconds kills surfacing on every prompt; setup warns when it finds one.
 
 At `profile: deep` the hook expects an LLM endpoint for query expansion and a reranker endpoint. With either missing, the plugin logs one warning at registration and, from v0.38, the hook degrades that leg to fused order inside the budget instead of loading a model in-process on every prompt (issue #28).
 
@@ -175,7 +175,7 @@ The plugin manifest (`src/openclaw/openclaw.plugin.json`) supports:
 | `clawmemBin` | auto-detected | Path to `clawmem` binary |
 | `tokenBudget` | 800 | Context injection budget |
 | `profile` | `balanced` | Performance profile |
-| `hookBudgetMs` | 6000 | Time budget for the context-surfacing hook, in milliseconds, 1000 to 60000. See "Hook time budget" above |
+| `hookBudgetMs` | 6000 | Time budget for the context-surfacing hook, in milliseconds, 1000 to 25000. See "Hook time budget" above |
 | `enableTools` | true | Register agent tools |
 | `servePort` | 7438 | REST API port for agent tools |
 | `gpuEmbed` | `http://localhost:8088` | Embedding endpoint override |
