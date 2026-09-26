@@ -455,8 +455,11 @@ describe("§28.1 setup openclaw — integration", () => {
   });
 
   test("I13 — --gateway-user naming the current user verifies the installed files", async () => {
+    // A complete install: OpenClaw copies the manifest and package.json with the entry.
     mkdirSync(pathJoin(env.pluginPath, "dist"), { recursive: true });
     writeFileSync(pathJoin(env.pluginPath, "dist", "index.js"), "export default {};\n");
+    writeFileSync(pathJoin(env.pluginPath, "openclaw.plugin.json"), "{}\n");
+    writeFileSync(pathJoin(env.pluginPath, "package.json"), "{}\n");
     const me = (process.env.USER || process.env.LOGNAME || "").trim();
     if (!me) return;
     const result = await runClawmemSetupOpenClaw(["--gateway-user", me], {
@@ -467,6 +470,22 @@ describe("§28.1 setup openclaw — integration", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("not world-writable");
+  });
+
+  test("I13b — --gateway-user with the installed copy missing its manifest: unverified, non-zero (codex v0.39 turn 9)", async () => {
+    mkdirSync(pathJoin(env.pluginPath, "dist"), { recursive: true });
+    writeFileSync(pathJoin(env.pluginPath, "dist", "index.js"), "export default {};\n");
+    writeFileSync(pathJoin(env.pluginPath, "package.json"), "{}\n");
+    const me = (process.env.USER || process.env.LOGNAME || "").trim();
+    if (!me) return;
+    const result = await runClawmemSetupOpenClaw(["--gateway-user", me], {
+      PATH: `${env.stubDir}:${process.env.PATH ?? ""}`,
+      HOME: env.tmpDir,
+      STUB_LOG: env.stubLog,
+      USER: me,
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toContain(`Missing after install: ${pathJoin(env.pluginPath, "openclaw.plugin.json")}`);
   });
 
   test("I14 — partial modern help (no --accept-capabilities advertised) forwards no consent flag and still installs", async () => {

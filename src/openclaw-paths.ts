@@ -226,21 +226,90 @@ export function resolveExtensionsDirNoOpenClaw(
   return pathResolve(resolveHomeForOpenClaw(opts), `.openclaw${suffix}`, "extensions");
 }
 
+/** The stat fields the access checks read; lstat + readlink let them follow symlinks as the kernel does. */
+export type AccessFs = {
+  statSync: (p: string) => { uid: number; gid: number; mode: number };
+  lstatSync: (p: string) => { uid: number; gid: number; mode: number };
+  readlinkSync: (p: string) => string;
+};
+
+const REAL_ACCESS_FS: AccessFs = {
+  statSync: (p) => fs.statSync(p),
+  lstatSync: (p) => fs.lstatSync(p),
+  readlinkSync: (p) => fs.readlinkSync(p, "utf8"),
+};
+
+type StatBits = { uid: number; gid: number; mode: number };
+
 /**
- * Can `uid` (member of `gids`) traverse every ancestor of `path` and execute
- * `path` itself, judged from mode bits and ownership the way the kernel does
- * for a non-root user? Root (uid 0) skips the traversal checks but still
- * needs an execute bit on the file itself, as execve does. The final target
- * must be a regular file (statSync follows symlinks): a 0755 directory named
- * clawmem passes every mode test and still cannot be executed. Used to
- * verify the gateway's runtime user can run the configured clawmem binary
- * without switching users.
+ * Resolve `path` component by component the way the kernel does, expanding
+ * each symlink where it occurs, and return every directory searched on the way
+ * (each needs the caller's x bit) plus the final non-symlink target. A
+ * symlink's own mode never matters on Linux; the directories on the way to its
+ * target do, which is why walking the literal path, or only its realpath, is
+ * not enough (codex v0.39 turn 9). null when a component is missing, a
+ * non-directory has components after it, or more than 40 symlinks are
+ * followed (ELOOP).
+ */
+function kernelWalk(path: string, fsm: AccessFs): { searched: StatBits[]; target: StatBits } | null {
+  const pending = pathResolve(path).split("/").filter(Boolean);
+  let cur = "/";
+  let curSt: StatBits;
+  try { curSt = fsm.lstatSync("/"); } catch { return null; }
+  const searched: StatBits[] = [];
+  let hops = 0;
+  while (pending.length > 0) {
+    const name = pending.shift()!;
+    if (name === ".") continue;
+    searched.push(curSt); // looking `name` up in `cur` needs x on `cur`
+    if (name === "..") {
+      cur = dirname(cur);
+      try { curSt = fsm.lstatSync(cur); } catch { return null; }
+      continue;
+    }
+    const next = cur === "/" ? `/${name}` : `${cur}/${name}`;
+    let st: StatBits;
+    try { st = fsm.lstatSync(next); } catch { return null; }
+    if ((st.mode & 0o170000) === 0o120000) {
+      if (++hops > 40) return null;
+      let link: string;
+      try { link = fsm.readlinkSync(next); } catch { return null; }
+      if (link.startsWith("/")) {
+        cur = "/";
+        try { curSt = fsm.lstatSync("/"); } catch { return null; }
+      }
+      pending.unshift(...link.split("/").filter(Boolean));
+      continue;
+    }
+    if (pending.length === 0) return { searched, target: st };
+    if ((st.mode & 0o170000) !== 0o040000) return null; // ENOTDIR
+    cur = next;
+    curSt = st;
+  }
+  return { searched, target: curSt };
+}
+
+/** The permission triple that applies to `uid`: owner, else group, else other (the first class that matches decides). */
+function permBits(st: StatBits, uid: number, gidSet: ReadonlySet<number>): number {
+  const shift = st.uid === uid ? 6 : gidSet.has(st.gid) ? 3 : 0;
+  return (st.mode >> shift) & 0o7;
+}
+
+/**
+ * Can `uid` (member of `gids`) reach and execute `path`, judged from mode bits
+ * and ownership the way the kernel does for a non-root user? Every directory
+ * searched while resolving it, symlink targets included, needs the x bit for
+ * the caller's class, and the target must be a regular file with that x bit.
+ * Root (uid 0) skips the searches but still needs an execute bit on the file
+ * itself, as execve does. A 0755 directory named clawmem passes every mode
+ * test and still cannot be executed. Used to verify the gateway's runtime user
+ * can run the configured clawmem binary without switching users.
  */
 export function canExecuteAs(
   path: string,
   uid: number,
   gids: readonly number[],
-  fsModule: { statSync: (p: string) => { uid: number; gid: number; mode: number } } = fs,
+  fsModule: AccessFs = REAL_ACCESS_FS,
 ): boolean {
   const abs = pathResolve(path);
   if (uid === 0) {
@@ -251,56 +320,56 @@ export function canExecuteAs(
     try { st = fsModule.statSync(abs); } catch { return false; }
     return isRegularFileMode(st.mode) && (st.mode & 0o111) !== 0;
   }
-  const parts = abs.split("/").filter(Boolean);
-  const chain: string[] = ["/"];
-  for (let i = 0; i < parts.length; i++) chain.push("/" + parts.slice(0, i + 1).join("/"));
+  const walk = kernelWalk(abs, fsModule);
+  if (!walk) return false;
   const gidSet = new Set(gids);
-  for (let i = 0; i < chain.length; i++) {
-    const p = chain[i]!;
-    let st;
-    try { st = fsModule.statSync(p); } catch { return false; }
-    const cls = st.uid === uid ? 0o100 : gidSet.has(st.gid) ? 0o010 : 0o001; // x bit for owner/group/other
-    if ((st.mode & cls) === 0) return false; // traverse (dir) or execute (final file)
-    if (i === chain.length - 1 && !isRegularFileMode(st.mode)) return false; // execve needs a regular file
-  }
-  return true;
+  if (walk.searched.some((d) => (permBits(d, uid, gidSet) & 0o1) === 0)) return false;
+  return isRegularFileMode(walk.target.mode) && (permBits(walk.target, uid, gidSet) & 0o1) !== 0;
 }
 
 /**
- * Can `uid` (member of `gids`) traverse every ancestor of `path` and read
- * `path` itself (a directory must also be searchable), judged from mode bits
- * and ownership the way the kernel does for a non-root user? Root always can
- * once the path exists. The companion of canExecuteAs: OpenClaw reads the
- * plugin's root, manifest, package.json and entry as the gateway's runtime
- * user, and a 0750 home directory above the install is the usual miss.
+ * Can `uid` (member of `gids`) reach and read `path` (a directory must also be
+ * searchable), judged the same way as canExecuteAs: every directory searched
+ * while resolving it, symlink targets included, needs the caller's x bit.
+ * Root always can once the path exists. OpenClaw reads the plugin's root,
+ * manifest, package.json and entry as the gateway's runtime user, and a 0750
+ * home directory above the install, or above a symlink's target, is the usual
+ * miss.
  */
 export function canReadAs(
   path: string,
   uid: number,
   gids: readonly number[],
-  fsModule: { statSync: (p: string) => { uid: number; gid: number; mode: number } } = fs,
+  fsModule: AccessFs = REAL_ACCESS_FS,
 ): boolean {
   const abs = pathResolve(path);
   if (uid === 0) {
     try { fsModule.statSync(abs); return true; } catch { return false; }
   }
-  const parts = abs.split("/").filter(Boolean);
-  const chain: string[] = ["/"];
-  for (let i = 0; i < parts.length; i++) chain.push("/" + parts.slice(0, i + 1).join("/"));
+  const walk = kernelWalk(abs, fsModule);
+  if (!walk) return false;
   const gidSet = new Set(gids);
-  for (let i = 0; i < chain.length; i++) {
-    let st;
-    try { st = fsModule.statSync(chain[i]!); } catch { return false; }
-    const shift = st.uid === uid ? 6 : gidSet.has(st.gid) ? 3 : 0; // owner / group / other class
-    const bits = (st.mode >> shift) & 0o7;
-    if (i < chain.length - 1) {
-      if ((bits & 0o1) === 0) return false; // every ancestor must be traversable
-      continue;
-    }
-    if ((bits & 0o4) === 0) return false; // the target must be readable
-    if ((st.mode & 0o170000) === 0o040000 && (bits & 0o1) === 0) return false; // and a directory searchable
-  }
+  if (walk.searched.some((d) => (permBits(d, uid, gidSet) & 0o1) === 0)) return false;
+  const bits = permBits(walk.target, uid, gidSet);
+  if ((bits & 0o4) === 0) return false;
+  if ((walk.target.mode & 0o170000) === 0o040000 && (bits & 0o1) === 0) return false;
   return true;
+}
+
+/** The installed plugin files OpenClaw reads as the gateway's runtime user. */
+export function pluginFilesOpenClawReads(root: string, entry: string): string[] {
+  return [root, entry, pathResolve(root, "openclaw.plugin.json"), pathResolve(root, "package.json")];
+}
+
+/** Of those, the ones `uid` cannot reach and read. A missing file counts: canReadAs rejects it. */
+export function unreadablePluginFiles(
+  root: string,
+  entry: string,
+  uid: number,
+  gids: readonly number[],
+  fsModule: AccessFs = REAL_ACCESS_FS,
+): string[] {
+  return pluginFilesOpenClawReads(root, entry).filter((p) => !canReadAs(p, uid, gids, fsModule));
 }
 
 /**

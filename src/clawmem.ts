@@ -2802,7 +2802,7 @@ async function verifyOpenClawPluginOwnership(params: {
   binPath: string;
 }): Promise<{ verified: boolean }> {
   const { statSync } = await import("fs");
-  const { canExecuteAs, canReadAs } = await import("./openclaw-paths.ts");
+  const { canExecuteAs, unreadablePluginFiles } = await import("./openclaw-paths.ts");
   let identity: UnixIdentity;
   let label: string;
   if (params.gatewayUser) {
@@ -2840,10 +2840,13 @@ async function verifyOpenClawPluginOwnership(params: {
   // Read + traverse for the same identity: OpenClaw reads the root, the
   // manifest, package.json and the entry as that user, so owner-or-root and
   // not world-writable is not enough (a 0750 home above the install passes both).
-  const mustRead = [params.root, params.entry, pathResolve(params.root, "openclaw.plugin.json"), pathResolve(params.root, "package.json")];
-  const unreadable = mustRead.filter((p) => existsSync(p) && !canReadAs(p, identity.uid, identity.gids));
+  const unreadable = unreadablePluginFiles(params.root, params.entry, identity.uid, identity.gids);
   if (unreadable.length > 0) {
-    for (const p of unreadable) console.log(`${c.red}${label} cannot traverse to or read ${p} (check its r bits and the x bits on every parent directory).${c.reset}`);
+    for (const p of unreadable) {
+      console.log(existsSync(p)
+        ? `${c.red}${label} cannot traverse to or read ${p} (check its r bits and the x bits on every directory on the way, symlink targets included).${c.reset}`
+        : `${c.red}Missing after install: ${p}${c.reset}`);
+    }
     return { verified: false };
   }
   // Execute + traverse for the identity that will actually spawn the binary,

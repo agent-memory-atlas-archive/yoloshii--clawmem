@@ -1053,9 +1053,8 @@ describe("clawmemBin must be executable, and setup verifies read access (codex v
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../../src/clawmem.ts", import.meta.url), "utf8");
     const verify = src.slice(src.indexOf("async function verifyOpenClawPluginOwnership"), src.indexOf("async function cmdSetupOpenClaw"));
-    expect(verify).toContain("canReadAs(p, identity.uid, identity.gids)");
-    expect(verify).toContain('"openclaw.plugin.json"');
-    expect(verify).toContain('"package.json"');
+    expect(verify).toContain("unreadablePluginFiles(params.root, params.entry, identity.uid, identity.gids)");
+    expect(verify).not.toContain("existsSync(p) && !");
     const setup = src.slice(src.indexOf("async function cmdSetupOpenClaw"));
     expect(setup).toContain("resolveRecordableClawmemBin(findClawmemBinary()");
     const install = setup.indexOf("// Path 1: delegate to OpenClaw");

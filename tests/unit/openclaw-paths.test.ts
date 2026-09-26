@@ -23,7 +23,7 @@ import {
   resolveHomeForOpenClaw,
   trim,
 } from "../../src/openclaw-paths.ts";
-import { canExecuteAs, canReadAs, moveTargetAside, resolveOpenClawProfile, resolveRecordableClawmemBin, swapDirIntoPlace } from "../../src/openclaw-paths.ts";
+import { canExecuteAs, canReadAs, moveTargetAside, pluginFilesOpenClawReads, resolveOpenClawProfile, resolveRecordableClawmemBin, swapDirIntoPlace, unreadablePluginFiles } from "../../src/openclaw-paths.ts";
 
 const STATIC_HOME = "/home/test-user";
 const staticHomedir = () => STATIC_HOME;
@@ -258,7 +258,8 @@ describe("canExecuteAs — traverse + execute judged for another identity", () =
     "/home/u/bin": { uid: 1000, gid: 1000, mode: 0o40755 },
     "/home/u/bin/clawmem": { uid: 1000, gid: 1000, mode: 0o100755 },
   };
-  const fsx = { statSync: (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; } };
+  const look = (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; };
+  const fsx = { statSync: look, lstatSync: look, readlinkSync: (p: string): string => { throw new Error("EINVAL " + p); } };
   test("owner can, a stranger cannot traverse a 700 home, root always can", () => {
     expect(canExecuteAs("/home/u/bin/clawmem", 1000, [1000], fsx)).toBe(true);
     expect(canExecuteAs("/home/u/bin/clawmem", 65534, [65534], fsx)).toBe(false);
@@ -481,7 +482,8 @@ describe("canReadAs — the gateway identity can traverse to and read the instal
     "/home/inst/ext/clawmem/dist": { uid: 1000, gid: 1000, mode: 0o40755 },
     "/home/inst/ext/clawmem/dist/index.js": { uid: 1000, gid: 1000, mode: 0o100644 },
   };
-  const fsx = { statSync: (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; } };
+  const look = (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; };
+  const fsx = { statSync: look, lstatSync: look, readlinkSync: (p: string): string => { throw new Error("EINVAL " + p); } };
   const entry = "/home/inst/ext/clawmem/dist/index.js";
   test("the installer can read the entry; a gateway user outside the home's group cannot traverse to it", () => {
     expect(canReadAs(entry, 1000, [1000], fsx)).toBe(true);
@@ -548,5 +550,91 @@ describe("resolveRecordableClawmemBin — setup records only an absolute, regula
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("canReadAs / canExecuteAs follow symlinks the way the kernel does (codex v0.39 turn 9)", () => {
+  // /public (755 root) holds links into /private (700 uid 1000)
+  const tree: Record<string, { uid: number; gid: number; mode: number }> = {
+    "/": { uid: 0, gid: 0, mode: 0o40755 },
+    "/public": { uid: 0, gid: 0, mode: 0o40755 },
+    "/public/plugin": { uid: 0, gid: 0, mode: 0o120777 },
+    "/public/rel": { uid: 0, gid: 0, mode: 0o120777 },
+    "/public/clawmem": { uid: 0, gid: 0, mode: 0o120777 },
+    "/private": { uid: 1000, gid: 1000, mode: 0o40700 },
+    "/private/plugin": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/private/plugin/index.js": { uid: 1000, gid: 1000, mode: 0o100644 },
+    "/private/bin": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/private/bin/clawmem": { uid: 1000, gid: 1000, mode: 0o100755 },
+    "/loop": { uid: 0, gid: 0, mode: 0o40755 },
+    "/loop/a": { uid: 0, gid: 0, mode: 0o120777 },
+    "/loop/b": { uid: 0, gid: 0, mode: 0o120777 },
+  };
+  const links: Record<string, string> = {
+    "/public/plugin": "/private/plugin",
+    "/public/rel": "../private/plugin",
+    "/public/clawmem": "/private/bin/clawmem",
+    "/loop/a": "/loop/b",
+    "/loop/b": "/loop/a",
+  };
+  const look = (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; };
+  const fsx = {
+    lstatSync: look,
+    statSync: look, // the root branch only; the cases below use non-root identities
+    readlinkSync: (p: string): string => { const l = links[p]; if (l === undefined) throw new Error("EINVAL " + p); return l; },
+  };
+  test("a readable target behind an absolute link into a 0700 directory is unreadable for others", () => {
+    expect(canReadAs("/public/plugin/index.js", 2000, [2000], fsx)).toBe(false);
+    expect(canReadAs("/public/plugin/index.js", 1000, [1000], fsx)).toBe(true);
+  });
+  test("a relative link resolves against its own directory and is judged the same way", () => {
+    expect(canReadAs("/public/rel/index.js", 2000, [2000], fsx)).toBe(false);
+    tree["/private"] = { uid: 1000, gid: 1000, mode: 0o40755 };
+    expect(canReadAs("/public/rel/index.js", 2000, [2000], fsx)).toBe(true);
+    expect(canReadAs("/public/plugin/index.js", 2000, [2000], fsx)).toBe(true);
+    tree["/private"] = { uid: 1000, gid: 1000, mode: 0o40700 };
+  });
+  test("a binary reached through a link into a 0700 directory is not executable for others", () => {
+    expect(canExecuteAs("/public/clawmem", 2000, [2000], fsx)).toBe(false);
+    expect(canExecuteAs("/public/clawmem", 1000, [1000], fsx)).toBe(true);
+  });
+  test("a symlink loop is refused rather than walked forever", () => {
+    expect(canReadAs("/loop/a", 1000, [1000], fsx)).toBe(false);
+    expect(canExecuteAs("/loop/a", 1000, [1000], fsx)).toBe(false);
+  });
+});
+
+describe("unreadablePluginFiles — every file OpenClaw reads, a missing one included (codex v0.39 turn 9)", () => {
+  const tree: Record<string, { uid: number; gid: number; mode: number }> = {
+    "/": { uid: 0, gid: 0, mode: 0o40755 },
+    "/ext": { uid: 0, gid: 0, mode: 0o40755 },
+    "/ext/clawmem": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/ext/clawmem/dist": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/ext/clawmem/dist/index.js": { uid: 1000, gid: 1000, mode: 0o100644 },
+    "/ext/clawmem/openclaw.plugin.json": { uid: 1000, gid: 1000, mode: 0o100644 },
+    "/ext/clawmem/package.json": { uid: 1000, gid: 1000, mode: 0o100644 },
+  };
+  const look = (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; };
+  const fsx = { statSync: look, lstatSync: look, readlinkSync: (p: string): string => { throw new Error("EINVAL " + p); } };
+  const root = "/ext/clawmem";
+  const entry = "/ext/clawmem/dist/index.js";
+  test("the list is the root, the entry, the manifest and package.json", () => {
+    expect(pluginFilesOpenClawReads(root, entry)).toEqual([root, entry, "/ext/clawmem/openclaw.plugin.json", "/ext/clawmem/package.json"]);
+  });
+  test("all readable → none reported; each required metadata file absent → that file is reported", () => {
+    expect(unreadablePluginFiles(root, entry, 2000, [2000], fsx)).toEqual([]);
+    for (const f of ["openclaw.plugin.json", "package.json"]) {
+      const p = `/ext/clawmem/${f}`;
+      const saved = tree[p]!;
+      delete tree[p];
+      expect(unreadablePluginFiles(root, entry, 2000, [2000], fsx)).toEqual([p]);
+      tree[p] = saved;
+    }
+  });
+  test("a root the identity cannot search hides every file under it", () => {
+    tree[root] = { uid: 1000, gid: 1000, mode: 0o40700 };
+    expect(unreadablePluginFiles(root, entry, 2000, [2000], fsx)).toEqual(pluginFilesOpenClawReads(root, entry));
+    expect(unreadablePluginFiles(root, entry, 1000, [1000], fsx)).toEqual([]);
+    tree[root] = { uid: 1000, gid: 1000, mode: 0o40755 };
   });
 });
