@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.37.0**.
+Guide for upgrading between released versions. Current: **v0.39.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,7 +59,31 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
-## v0.39.0: `forgotten` counts only forget; inactive documents broken down by reason
+## v0.39.0: the OpenClaw plugin on current OpenClaw, and `forgotten` counts only forget
+
+**No vault migration; nothing auto-applies in the vault.** What to do depends on your setup:
+
+- **OpenClaw: re-run `clawmem setup openclaw` after upgrading.** It installs the compiled copy
+  OpenClaw 2026.5.3 and later require, ships the manifest's tool declarations (from 2026.5.2
+  undeclared agent tools are rejected), and sets `hooks.allowConversationAccess` (needed from
+  2026.4.23) and `plugins.slots.memory` — see
+  [OpenClaw 2026.5 and later](openclaw-plugin.md#openclaw-20265-and-later-what-changed-and-what-setup-does-about-it).
+  On OpenClaw 2026.5 and later it asks for capability consent: add `--accept-capabilities` (or
+  `--yes`) to a non-interactive run. A gateway that runs as a service user: add
+  `--gateway-user <name>`. A named profile: `OPENCLAW_PROFILE=<name>` now reaches OpenClaw as
+  `--profile <name>`. New plugin config: `hookBudgetMs` (default 6000, 1000 to 25000). Setup now
+  stops when it cannot record an executable `clawmemBin`, and, with `--gateway-user`, when that
+  user cannot read the installed files.
+- **Source checkouts: run `bun install`.** `node-llama-cpp` moved to ^3.20.0. Package installs
+  get it with the update.
+- **In-process models on CUDA: run `clawmem embed` once after upgrading.** The first in-process
+  embedding after the `node-llama-cpp` upgrade compiles its kernels once (about ten seconds);
+  `clawmem embed` pays that outside a prompt.
+- **Reranking re-scores cold once.** In-process scores cached under node-llama-cpp 3.15.1 had a
+  squeezed scale, and a v0.38 remote cache can hold such scores written while its endpoint was
+  down; neither is reused. Expected, not a defect.
+
+### `forgotten` counts only forget; inactive documents broken down by reason
 
 **Drop-in — no migration, no action required.** `clawmem lifecycle status`, the `lifecycle_status` MCP tool,
 `GET /lifecycle/status` and `clawmem curate` now report **`forgotten` as the number of documents deactivated

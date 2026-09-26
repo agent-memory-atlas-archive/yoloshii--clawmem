@@ -4,6 +4,133 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.39.0 — the OpenClaw plugin installs and runs on current OpenClaw, and `forgotten` counts only forget
+
+OpenClaw added three checks between April and May 2026 that each switched off part of the
+ClawMem plugin without an error at install time, and the plugin had no time budget of its own
+for the context-surfacing hook. This release answers the three GitHub reports that followed
+([#26](https://github.com/yoloshii/ClawMem/issues/26), [#27](https://github.com/yoloshii/ClawMem/pull/27), [#28](https://github.com/yoloshii/ClawMem/issues/28)) and carries one
+reporting-contract fix for the lifecycle counts.
+
+### OpenClaw plugin: installs, registers and keeps its hooks on OpenClaw 2026.5+ (#27)
+
+- The manifest declares the five agent tools under `contracts.tools`. From OpenClaw 2026.5.2 the
+  registry rejects `registerTool` for any undeclared name, and the plugin kept running hook-only.
+  Thanks @cleverark ([PR #27](https://github.com/yoloshii/ClawMem/pull/27)) for the manifest change and the docs section this
+  release builds on.
+- `clawmem setup openclaw` installs a compiled copy. From OpenClaw 2026.5.3,
+  `openclaw plugins install --force` refuses a package whose entry is `index.ts`, so setup
+  bundles a Node-target `dist/index.js`, points `openclaw.extensions` at it, and installs that
+  staged copy. Nothing generated is committed.
+- Capability consent. OpenClaw 2026.5 asks for consent to a plugin's declared capabilities on
+  every local install. Setup prints what ClawMem declares and passes `--accept-capabilities`
+  only after an interactive yes or with `clawmem setup openclaw --accept-capabilities` (alias
+  `--yes` / `-y`); a non-interactive run without it stops and says so.
+- Setup writes the config a working install needs and reads each value back: the absolute
+  `clawmemBin`; `plugins.entries.clawmem.hooks.allowConversationAccess=true` (from OpenClaw
+  2026.4.23 a plugin OpenClaw did not bundle may not register `before_prompt_build` or
+  `agent_end` without it); and `plugins.slots.memory=clawmem` (since the September 2026 main
+  branch an unselected memory plugin still loads but loses its memory runtime). A write that does
+  not read back fails setup with a non-zero exit. Setup also warns on `allowPromptInjection=false`
+  and on an operator hook-timeout policy below the plugin's own timeout.
+- `--gateway-user <name>` for system-service installs: setup checks that the installed files are
+  owned by that user or root and not world-writable, that the user can read them through every
+  directory on the way (symlink targets included), and that it can run the `clawmem` binary, all
+  judged from its uid and supplementary groups. A missing manifest or `package.json` fails the
+  check too. Setup exits non-zero when any check fails.
+- `OPENCLAW_PROFILE` reaches OpenClaw: setup passes it to every `openclaw` command as
+  `--profile <name>` (the variable alone selects nothing in OpenClaw) and checks it against
+  OpenClaw's profile-name grammar before deriving any path from it, `--remove` included.
+- The installed root is read from `openclaw plugins inspect clawmem --json`; an inferred root is
+  used for diagnostics only.
+- A replaced install is parked first and put back if the replacement fails, on the delegated,
+  CLI-absent and `--link` paths. A failed restore names the parked copy (`clawmem.old-<pid>`) and
+  the `mv` that brings it back.
+- Setup records `clawmemBin` only as an absolute path to a regular file the installing user can
+  execute (a bare `clawmem` is resolved through `PATH` first) and stops otherwise; the plugin
+  refuses a configured `clawmemBin` that is missing, not a regular file, or not executable.
+
+### OpenClaw plugin: one time budget for the context-surfacing hook (#28)
+
+The new plugin config `hookBudgetMs` (default 6000 ms, 1000 to 25000) is the hook's wall-clock
+budget. The plugin passes it to the hook as `CLAWMEM_HOOK_BUDGET_MS`, which the v0.38 hook
+schedules its legs against; kills the hook 2 s after it; and registers `before_prompt_build` with
+OpenClaw 2 s after that, so the three limits stay in that order. An operator hook-timeout policy
+below the registration value still fires first, and setup warns when it finds one. 25000 is the
+hook's own ceiling (`MAX_LEG_BUDGET_MS`): the hook refuses to run above it, so the plugin clamps
+to it rather than pass a value the hook would refuse. Timeout messages name the hook, the profile
+and the budget. At `profile: deep` without an LLM or reranker endpoint, the plugin logs one
+warning at registration that names the missing legs.
+
+### node-llama-cpp ^3.20.0 (#26)
+
+`node-llama-cpp` moved to ^3.20.0 (llama.cpp b10361) and `bun.lock` was regenerated. A source
+checkout on macOS 26.6 with an M5 Pro no longer fails with
+`ggml_metal_library_init_from_source: error compiling source`. In-process Qwen3 reranker scores
+are now the model's probability; 3.15.1 applied a second sigmoid that squeezed every score into
+about 0.50–0.73. The local rerank cache is namespaced by a new score revision, so scores cached
+under 3.15.1 are never reused. Remote rerank caches go cold once as well: until this release the
+in-process fallback wrote its scores under the remote endpoint's namespace whenever the endpoint
+failed, so a v0.38 remote cache can hold local, squeezed-scale scores labelled as the endpoint's.
+The fallback now caches only in local mode, and remote namespaces carry a revision that makes
+those entries unreachable. The first reranked queries after upgrading re-score cold. On CUDA the
+first in-process embedding after the upgrade compiles its kernels once (about ten seconds on a
+GTX 1080 Ti); run `clawmem embed` once after upgrading to pay that outside a prompt.
+
+### Changed — `forgotten` counts only forget (a reporting-contract change)
+
+- `clawmem lifecycle status`, the `lifecycle_status` MCP tool, `GET /lifecycle/status` and `clawmem curate` report
+  `forgotten` as the number of documents deactivated by forget (`deactivated_reason = 'forget'`). It used to count
+  every inactive document without `archived_at`, which also took in documents whose file disappeared and documents
+  deactivated before v0.31.0 recorded a reason — so on an existing vault the number usually drops. Nothing in the
+  vault changes; the old count was mislabelled.
+- New: every inactive document broken down by deactivation reason — `absent`, `forget`, `archive`, `unknown_legacy`
+  (no recognised reason and no `archived_at`; in practice deactivated before v0.31.0, cause unrecoverable, so not
+  guessed). Exhaustive and disjoint. CLI and MCP print `Deactivation reasons: absent N, forget N, archive N,
+  unknown-legacy N`; `GET /lifecycle/status` adds `deactivation_reasons`; the curator report adds
+  `health.deactivationReasons`. No migration.
+
+### Docs
+
+- Upgrading guide: a hook that starts while an upgrade is still replacing files can load a mix of old and new modules
+  and fail; the failure is non-blocking, so that one prompt runs without ClawMem context (or that turn-end extraction
+  is skipped), and the next invocation loads the new code.
+- The CLI reference documents the new `setup openclaw` flags and `OPENCLAW_PROFILE`;
+  troubleshooting adds the Apple Silicon Metal compile error, the hook timeout message and the
+  conversation grant.
+
+### Verification
+
+- Live, on the pre-rebase branch (2026-09-09): `clawmem setup openclaw --accept-capabilities
+  --gateway-user <user>` against a real OpenClaw 2026.9.2 in an isolated state directory. The
+  compiled stage was accepted, the memory slot moved from memory-core, all three config values
+  read back, `openclaw plugins inspect clawmem --json` reported the plugin loaded and activated,
+  and the gateway logged the registration (`kind=memory`, `hookBudgetMs=6000`), the five agent
+  tools and the REST service.
+- Full suite: 2868 pass / 0 fail · the five OpenClaw suites: 200/200 · `tsc --noEmit`: 85 errors, all
+  pre-existing (the same set as v0.38.1 with the two handed-over commits), none new.
+- New locks: the plugin's default, minimum and maximum budget equal the hook's, the hook's parser
+  accepts every value the plugin can pass unchanged, and the manifest carries the same range
+  (four of these fail against the former 60000 cap); the local rerank namespace carries the score
+  revision (fails against the v0.38 key); an attested endpoint that fails leaves nothing under its
+  key and the next healthy call scores live (fails against the v0.38 write rule); read and
+  traverse access for the gateway identity is judged from mode bits along the kernel's own walk,
+  symlinks included, and an installed copy missing its manifest fails `--gateway-user`; a
+  `clawmemBin` without an execute bit is refused at setup and at plugin start.
+- Cross-model adversarial review (codex): the OpenClaw work cleared after seven turns; this
+  release's rebase, budget ceiling and rerank-cache changes took four more turns on the same session
+  and seven findings, all fixed (local fallback scores cached under a remote namespace; the gateway
+  user's read access, including symlinked and slash-terminated paths; the recorded `clawmemBin`; two
+  overstated release-note sentences), and cleared at turn 11. The lifecycle change
+  cleared its own review in the first round, and its O1 clock and seam audits found nothing.
+
+### What didn't change
+
+No schema change and no migration. Hooks, MCP tools and the REST API behave as in v0.38.1 apart
+from the lifecycle counts and the one-time cold rerank caches above.
+
+---
+
 ## v0.38.1 — the watcher now logs the version skew it refuses
 
 v0.38.0's vector wire refuses mixed builds in both directions, but only one direction was

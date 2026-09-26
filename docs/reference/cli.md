@@ -98,7 +98,9 @@ clawmem watch                   # Start file watcher (indexes on .md changes)
 clawmem setup hooks             # Install Claude Code hooks
 clawmem setup hooks --remove    # Remove installed hooks
 clawmem setup mcp               # Register MCP server
-clawmem setup openclaw                   # Install OpenClaw memory plugin. v0.10.4+ delegates to `openclaw plugins install --force` when the CLI is on PATH (profile-aware via OPENCLAW_STATE_DIR; auto-enabled). Falls back to recursive copy honoring OPENCLAW_STATE_DIR when the CLI is absent.
+clawmem setup openclaw                   # Install the OpenClaw memory plugin. With the openclaw CLI on PATH: stages a compiled copy (dist/index.js), delegates to `openclaw plugins install --force`, then sets and reads back clawmemBin, hooks.allowConversationAccess=true and plugins.slots.memory=clawmem (v0.39.0+). Falls back to a direct copy honoring OPENCLAW_STATE_DIR when the CLI is absent.
+clawmem setup openclaw --accept-capabilities  # Consent to the plugin's declared capabilities in a non-interactive run; OpenClaw 2026.5+ asks on every local install. Alias --yes / -y (v0.39.0+).
+clawmem setup openclaw --gateway-user <name>  # System-service installs: verify the installed files are owned by that user or root, not world-writable and readable by it (every directory on the way traversable, symlink targets included), and that it can run the clawmem binary; exits non-zero when a check fails (v0.39.0+).
 clawmem setup openclaw --link            # Load-path mode: delegates `openclaw plugins install -l` when CLI is on PATH (records source in plugins.load.paths — NOT a filesystem symlink). In CLI-absent fallback, creates a real symlink (note: OpenClaw v2026.4.11+ discovery skips fallback symlinks).
 clawmem setup openclaw --remove          # Uninstall. Tries `openclaw plugins uninstall clawmem --force` first; falls back to manual cleanup at the resolved extensions path for legacy unmanaged installs.
 clawmem setup openclaw --help            # Print full flag + env-var reference (v0.10.4+).
@@ -113,6 +115,7 @@ Both the delegated and fallback paths honor:
 |---------|--------|
 | `OPENCLAW_STATE_DIR` | Override the OpenClaw config root. Plugin installs into `<OPENCLAW_STATE_DIR>/extensions/clawmem`. |
 | `OPENCLAW_CONFIG_PATH` | Override the OpenClaw config file path; config root becomes `dirname(OPENCLAW_CONFIG_PATH)`. |
+| `OPENCLAW_PROFILE` | Named OpenClaw profile (v0.39.0+). Passed to every `openclaw` command as `--profile <name>` (the variable alone selects nothing in OpenClaw); the CLI-absent fallback resolves `~/.openclaw-<name>`. Checked against OpenClaw's profile-name grammar before anything is touched, `--remove` included. |
 | `OPENCLAW_HOME` | Override the home directory used to resolve the default `~/.openclaw` root. |
 | `HOME` / `USERPROFILE` | Standard home-dir env vars; consulted in that order when `OPENCLAW_HOME` is unset. |
 
