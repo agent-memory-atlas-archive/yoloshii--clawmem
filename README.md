@@ -375,7 +375,7 @@ CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
 | GET | `/timeline/:docid` | Temporal neighborhood (before/after) |
 | GET | `/sessions` | Recent session history |
 | GET | `/collections` | List all collections |
-| GET | `/lifecycle/status` | Active/archived/pinned/snoozed counts |
+| GET | `/lifecycle/status` | Active/archived/forgotten/pinned/snoozed counts + `deactivation_reasons` (`absent`/`forget`/`archive`/`unknown_legacy`) |
 | POST | `/documents/:docid/pin` | Pin/unpin |
 | POST | `/documents/:docid/snooze` | Snooze until date |
 | POST | `/documents/:docid/forget` | Deactivate |
@@ -610,7 +610,7 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `memory_rank` | Ranking diagnostic (v0.36.0): real-pipeline composite breakdown per result — weights, recency, confidence blend, quality/length/frequency/canonical multipliers, signed pinΔ, co-activation — plus raw-vs-composite rank shifts; demoted raw winners stay visible. FTS-only candidates; read-only. |
 | `session_log` | USE THIS for "last time", "yesterday", "what happened", "what did we do". Returns session history with handoffs and file changes. DO NOT use `query()` for cross-session questions — this tool has session-specific data that search cannot find. |
 | `profile` | Current static + dynamic user profile |
-| `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |
+| `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts, the deactivation-reason breakdown, and policy summary |
 | `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold. Archives only — never deletes. Defaults to dry_run (preview only) |
 | `lifecycle_restore` | Restore documents that were auto-archived by lifecycle policies. Filter by query, collection, or restore all |
 

@@ -254,7 +254,7 @@ Permanently deactivate a memory.
 
 ### lifecycle_status
 
-Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts.
+Document lifecycle statistics: active, archived, forgotten (deactivated by forget), pinned, snoozed counts, plus every inactive document broken down by deactivation reason — `absent`, `forget`, `archive`, `unknown-legacy` (no recognised reason — in practice deactivated before v0.31.0).
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|

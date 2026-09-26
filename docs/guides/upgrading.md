@@ -59,6 +59,29 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.39.0: `forgotten` counts only forget; inactive documents broken down by reason
+
+**Drop-in — no migration, no action required.** `clawmem lifecycle status`, the `lifecycle_status` MCP tool,
+`GET /lifecycle/status` and `clawmem curate` now report **`forgotten` as the number of documents deactivated
+by forget** (`deactivated_reason = 'forget'`). It used to count every inactive document without
+`archived_at`, which also took in documents whose source file disappeared and documents deactivated before
+v0.31.0 recorded a reason — so **on an existing vault the number usually drops**. Nothing in the vault
+changed; the old count was mislabelled.
+
+A new breakdown partitions every inactive document, exhaustively and without overlap:
+
+| Reason | Meaning |
+|---|---|
+| `absent` | its file disappeared from the collection (the document comes back if the file does) |
+| `forget` | deactivated by forget (`memory_forget`, `POST /documents/:docid/forget`) — equals `forgotten` |
+| `archive` | archived by the lifecycle sweep, or an older row with no recognised reason but an `archived_at` |
+| `unknown_legacy` | no recognised reason and no `archived_at` — in practice a row deactivated before v0.31.0, by forget or by absence; that cause cannot be recovered, so it is not guessed |
+
+The CLI and the MCP tool print it as `Deactivation reasons: absent N, forget N, archive N, unknown-legacy N`;
+`GET /lifecycle/status` adds a `deactivation_reasons` object; the curator report
+(`~/.cache/clawmem/curator-report.json`) adds `health.deactivationReasons`. Anything that relied on the old
+meaning of `forgotten` should read `deactivation_reasons` instead.
+
 ## v0.38.0: channel-aware hook ranking, relevance admission, off-process bookkeeping
 
 **Drop-in.** Schema migrations are additive and auto-apply on first open: `dedupe_key` columns (with partial unique indexes) on `context_usage` and `recall_events` for idempotent off-process bookkeeping, and the `surfacing_diagnostics` table (created lazily the first time `CLAWMEM_SURFACING_TRACE=1` persists a trace). No reindex, no re-embed, no graph rebuild. MCP tools are unchanged — everything below is the context-surfacing hook.

@@ -4477,6 +4477,7 @@ async function cmdLifecycle(args: string[]) {
       console.log(`Active: ${stats.active}`);
       console.log(`Archived (auto): ${stats.archived}`);
       console.log(`Forgotten (manual): ${stats.forgotten}`);
+      console.log(`Deactivation reasons: absent ${stats.deactivation_reasons.absent}, forget ${stats.deactivation_reasons.forget}, archive ${stats.deactivation_reasons.archive}, unknown-legacy ${stats.deactivation_reasons.unknown_legacy}`);
       console.log(`Pinned: ${stats.pinned}`);
       console.log(`Snoozed: ${stats.snoozed}`);
       console.log(`Never accessed: ${stats.neverAccessed}`);
@@ -4779,6 +4780,7 @@ interface CuratorReport {
     active: number;
     archived: number;
     forgotten: number;
+    deactivationReasons: { absent: number; forget: number; archive: number; unknown_legacy: number };
     pinned: number;
     snoozed: number;
     neverAccessed: number;
@@ -4889,7 +4891,7 @@ async function cmdCurate(_args: string[]) {
   const s = getStore();
   const report: CuratorReport = {
     timestamp: isoNow(),
-    health: { active: 0, archived: 0, forgotten: 0, pinned: 0, snoozed: 0, neverAccessed: 0, embeddingBacklog: 0, infrastructure: "healthy" },
+    health: { active: 0, archived: 0, forgotten: 0, deactivationReasons: { absent: 0, forget: 0, archive: 0, unknown_legacy: 0 }, pinned: 0, snoozed: 0, neverAccessed: 0, embeddingBacklog: 0, infrastructure: "healthy" },
     sweep: { candidates: 0 },
     consolidation: { candidates: 0 },
     retrieval: { bm25Pass: false, topScore: 0 },
@@ -4907,6 +4909,7 @@ async function cmdCurate(_args: string[]) {
       active: stats.active,
       archived: stats.archived,
       forgotten: stats.forgotten,
+      deactivationReasons: stats.deactivation_reasons,
       pinned: stats.pinned,
       snoozed: stats.snoozed,
       neverAccessed: stats.neverAccessed,
@@ -4914,6 +4917,7 @@ async function cmdCurate(_args: string[]) {
       infrastructure: "healthy",
     };
     console.log(`  Documents: ${stats.active} active, ${stats.archived} archived, ${stats.forgotten} forgotten`);
+    console.log(`  Deactivation reasons: absent ${stats.deactivation_reasons.absent}, forget ${stats.deactivation_reasons.forget}, archive ${stats.deactivation_reasons.archive}, unknown-legacy ${stats.deactivation_reasons.unknown_legacy}`);
     console.log(`  Pinned: ${stats.pinned} | Snoozed: ${stats.snoozed} | Never accessed: ${stats.neverAccessed}`);
     console.log(`  Embedding backlog: ${status.needsEmbedding}`);
     if (status.needsEmbedding > 0) {

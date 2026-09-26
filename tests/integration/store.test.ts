@@ -270,6 +270,32 @@ describe("lifecycle management", () => {
     expect(stats).toBeDefined();
     expect(typeof stats.active).toBe("number");
   });
+
+  it("getLifecycleStats: forgotten counts only forget; deactivation_reasons partitions every inactive row", () => {
+    const at = "2026-03-01T00:00:00Z";
+    const seed = (path: string, active: number, reason: string | null, archivedAt: string | null) => {
+      insertContent(store.db, `h-${path}`, `body of ${path}`, at);
+      insertDocument(store.db, "test", path, path, `h-${path}`, at, at);
+      store.db.prepare(`UPDATE documents SET active = ?, deactivated_reason = ?, archived_at = ? WHERE collection = 'test' AND path = ?`)
+        .run(active, reason, archivedAt, path);
+    };
+    seed("active.md", 1, null, null);
+    seed("absent.md", 0, "absent", null);
+    seed("forgot.md", 0, "forget", null);
+    seed("arch.md", 0, "archive", at);
+    seed("arch-legacy.md", 0, null, at);                 // no recorded reason, archived_at set → archive
+    seed("legacy.md", 0, null, null);                    // no recorded reason, no archived_at → unknown_legacy
+    seed("custom.md", 0, "some-other-reason", null);     // unrecognised reason, no archived_at → unknown_legacy
+
+    const stats = store.getLifecycleStats();
+    expect(stats.active).toBe(1);
+    expect(stats.archived).toBe(2);
+    expect(stats.forgotten).toBe(1);                     // the old count (inactive without archived_at) was 4
+    expect(stats.deactivation_reasons).toEqual({ absent: 1, forget: 1, archive: 2, unknown_legacy: 2 });
+    const r = stats.deactivation_reasons;
+    const inactive = (store.db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE active = 0`).get() as { n: number }).n;
+    expect(r.absent + r.forget + r.archive + r.unknown_legacy).toBe(inactive);   // exhaustive and disjoint
+  });
 });
 
 // ─── Virtual paths ──────────────────────────────────────────────────

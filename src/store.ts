@@ -1814,7 +1814,7 @@ export type Store = {
   archiveDocuments: (ids: number[]) => number;
   getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
   restoreArchivedDocuments: (filter: { ids?: number[]; collection?: string; sinceDate?: string }) => number;
-  getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null };
+  getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null; deactivation_reasons: { absent: number; forget: number; archive: number; unknown_legacy: number } };
   searchArchived: (query: string, limit?: number) => { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[];
 };
 
@@ -7137,12 +7137,23 @@ function getLifecycleStatsFn(db: Database): {
   active: number; archived: number; forgotten: number;
   pinned: number; snoozed: number;
   neverAccessed: number; oldestAccess: string | null;
+  deactivation_reasons: { absent: number; forget: number; archive: number; unknown_legacy: number };
 } {
+  // Reason-aware contract: `forgotten` counts the rows deactivated by forget (deactivated_reason
+  // 'forget'). It used to count every inactive row without archived_at, which also swept in
+  // documents whose file disappeared ('absent') and rows deactivated before v0.31.0 recorded a
+  // cause. `deactivation_reasons` partitions the inactive rows exhaustively and disjointly:
+  // absent · forget · archive (reason 'archive', or no recognised reason with archived_at set) ·
+  // unknown_legacy (no recognised reason, no archived_at). A legacy row is reported as unknown
+  // rather than reclassified: that its file is absent now says nothing about why it was deactivated.
   const row = db.prepare(`
     SELECT
       SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
       SUM(CASE WHEN active = 0 AND archived_at IS NOT NULL THEN 1 ELSE 0 END) as archived,
-      SUM(CASE WHEN active = 0 AND archived_at IS NULL THEN 1 ELSE 0 END) as forgotten,
+      SUM(CASE WHEN active = 0 AND deactivated_reason = 'forget' THEN 1 ELSE 0 END) as forgotten,
+      SUM(CASE WHEN active = 0 AND deactivated_reason = 'absent' THEN 1 ELSE 0 END) as r_absent,
+      SUM(CASE WHEN active = 0 AND (deactivated_reason = 'archive' OR ((deactivated_reason IS NULL OR deactivated_reason NOT IN ('absent','forget')) AND archived_at IS NOT NULL)) THEN 1 ELSE 0 END) as r_archive,
+      SUM(CASE WHEN active = 0 AND archived_at IS NULL AND (deactivated_reason IS NULL OR deactivated_reason NOT IN ('absent','forget','archive')) THEN 1 ELSE 0 END) as r_unknown,
       SUM(CASE WHEN active = 1 AND pinned = 1 THEN 1 ELSE 0 END) as pinned,
       SUM(CASE WHEN active = 1 AND snoozed_until IS NOT NULL AND snoozed_until > datetime('now') THEN 1 ELSE 0 END) as snoozed,
       SUM(CASE WHEN active = 1 AND last_accessed_at IS NULL THEN 1 ELSE 0 END) as neverAccessed,
@@ -7158,6 +7169,12 @@ function getLifecycleStatsFn(db: Database): {
     snoozed: row?.snoozed ?? 0,
     neverAccessed: row?.neverAccessed ?? 0,
     oldestAccess: row?.oldestAccess ?? null,
+    deactivation_reasons: {
+      absent: row?.r_absent ?? 0,
+      forget: row?.forgotten ?? 0,
+      archive: row?.r_archive ?? 0,
+      unknown_legacy: row?.r_unknown ?? 0,
+    },
   };
 }
 

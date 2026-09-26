@@ -223,6 +223,18 @@ describe("memory_stats", () => {
   });
 });
 
+describe("lifecycle_status", () => {
+  it("forgotten counts only forget; the deactivation reasons partition every inactive row", async () => {
+    const res = await call("lifecycle_status", {});
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    // The fixture's inactive rows: alpha/a5 + gamma/g1 'absent', alpha/a6 with no recorded reason.
+    // The old count ("inactive without archived_at") reported all three as forgotten.
+    expect(text).toContain("Forgotten (manual): 0");
+    expect(text).toContain("Deactivation reasons: absent 2, forget 0, archive 0, unknown-legacy 1");
+  });
+});
+
 describe("memory_rank", () => {
   it("returns per-result breakdowns consistent with compositeScore, with a valid raw-rank permutation", async () => {
     const res = await call("memory_rank", { query: "flumaroon", limit: 10 });

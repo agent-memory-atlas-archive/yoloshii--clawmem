@@ -168,7 +168,7 @@ clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence docu
 ## Lifecycle & retention
 
 ```bash
-clawmem lifecycle status                    # Lifecycle stats + active policy
+clawmem lifecycle status                    # Lifecycle stats (+ deactivation reasons) + active policy
 clawmem lifecycle sweep [--dry-run]         # Archive stale docs per policy (reversible)
 clawmem lifecycle search <query>            # Search archived docs (FTS, no restore)
 clawmem lifecycle restore --query <term> | --collection <name> | --all

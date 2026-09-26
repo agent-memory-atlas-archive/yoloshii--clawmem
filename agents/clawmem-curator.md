@@ -23,7 +23,7 @@ Gather baseline data. All subsequent phases use these values.
 
 1. Call `mcp__clawmem__status()` — document counts, embedding coverage
 2. Call `mcp__clawmem__index_stats()` — content type distribution, stale count, avg access
-3. Call `mcp__clawmem__lifecycle_status()` — active/archived/forgotten/pinned/snoozed counts
+3. Call `mcp__clawmem__lifecycle_status()` — active/archived/forgotten/pinned/snoozed counts + deactivation reasons (absent/forget/archive/unknown-legacy)
 4. Call `mcp__clawmem__memory_stats()` (v0.36.0) — per-collection origin×active cross-tabs, deactivation reasons, accrual (7d/30d), and access/confidence/quality/effective-age distributions over active rows
 5. Bash (60s timeout): `clawmem doctor 2>&1`
 
@@ -301,6 +301,7 @@ Output this report after all phases complete:
 
 ### Health Snapshot
 - Documents: N active, N archived, N forgotten
+- Deactivation reasons: absent N, forget N, archive N, unknown-legacy N
 - Pinned: N | Snoozed: N | Never accessed: N
 - Embedding backlog: N documents
 - Infrastructure: [HEALTHY | N issues found]
