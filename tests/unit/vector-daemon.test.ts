@@ -207,10 +207,10 @@ describe("vector daemon server", () => {
     let scans = 0;
     handle = await startVectorDaemon(store, () => {}, async () => { scans++; return []; });
     const line = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ ping: true }) + "\n");
-    expect(JSON.parse(line)).toEqual({ pong: true, db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1"] }); // capability attestation (codex t84)
+    expect(JSON.parse(line)).toEqual({ pong: true, db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1"] }); // capability attestation (codex t84; O1 §4 activation)
     expect(scans).toBe(0);
     const pong = await daemonPing(store.dbPath, 1000);
-    expect(pong).toEqual({ status: "ok", db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1"] });
+    expect(pong).toEqual({ status: "ok", db: store.dbPath, pid: process.pid, protocols: ["hydrated-v1", "deadline-rel-v1"] });
     // A ping-shaped frame that is NOT a ping is a normal (malformed) request.
     const notPing = await rawRequest(vecDaemonSocketPath(store.dbPath), JSON.stringify({ ping: "yes" }) + "\n");
     expect(JSON.parse(notPing)).toEqual({ error: "malformed" });
@@ -886,14 +886,18 @@ describe("t89 remedies", () => {
     expect((await daemonPing(dbPath, 2000)).status).toBe("error");
   });
 
-  test("P1: an attested pong WITHOUT hydrated-v1 → live-raw (non-authoritative); WITH it → live", async () => {
+  test("P1 + O1 §4: an attested pong WITHOUT hydrated-v1 → live-raw; WITH hydrated-v1 but WITHOUT deadline-rel-v1 → still live-raw; WITH both → live", async () => {
     const dbPath = `/tmp/vd-health-${process.pid}.sqlite`;
     const sock = vecDaemonSocketPath(dbPath);
     const raw = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77 }) + "\n"); s.end(); });
     const hRaw = await vdHealth(dbPath, 2000);
     raw.stop();
     expect(hRaw.status).toBe("live-raw");
-    const full = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77, protocols: ["hydrated-v1"] }) + "\n"); s.end(); });
+    const hydratedOnly = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77, protocols: ["hydrated-v1"] }) + "\n"); s.end(); });
+    const hHydrated = await vdHealth(dbPath, 2000);
+    hydratedOnly.stop();
+    expect(hHydrated.status).toBe("live-raw"); // a daemon that ignores the relative budget is not the certified contract
+    const full = fakeServer(sock, (s) => { s.write(JSON.stringify({ pong: true, db: dbPath, pid: 77, protocols: ["hydrated-v1", "deadline-rel-v1"] }) + "\n"); s.end(); });
     cleanups2.push(() => full.stop());
     expect((await vdHealth(dbPath, 2000)).status).toBe("live");
   });

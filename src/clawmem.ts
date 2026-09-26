@@ -3159,7 +3159,8 @@ async function cmdReindex(args: string[]) {
  * `clawmem vec-daemon-health [--db <path>] [--json]` — the machine-decisive
  * form of the doctor's vector-daemon check (codex t77 F5 / t89 P1): exit 0
  * ONLY for the Path-A-AUTHORITATIVE state `live` — the pong names exactly
- * this DB + the owning pid AND advertises the hydrated-v1 response protocol.
+ * this DB + the owning pid AND advertises BOTH the hydrated-v1 response
+ * protocol and the O1 deadline-rel-v1 relative-budget protocol.
  * The liveness-without-authority tiers exit 1: `live-raw` (attested but not
  * hydrated-capable — serves the raw-hit execution) and `live-legacy` (a
  * pre-v0.38 watcher: an idle daemon-protocol listener that cannot attest).
@@ -3181,9 +3182,9 @@ async function cmdVecDaemonHealth(args: string[]) {
   if (values.json) {
     console.log(JSON.stringify({ ...h, checked_db: dbPath, live: listening, authoritative, attested: h.status === "live" || h.status === "live-raw" }));
   } else if (h.status === "live") {
-    console.log(`${c.green}✓${c.reset} vector daemon LIVE for ${dbPath} (pid ${h.pid}, ${h.socket}) — hydrated-v1 attested; the hook's vector deadline is authoritative`);
+    console.log(`${c.green}✓${c.reset} vector daemon LIVE for ${dbPath} (pid ${h.pid}, ${h.socket}) — hydrated-v1 + deadline-rel-v1 attested; the hook's vector deadline is authoritative`);
   } else if (h.status === "live-raw") {
-    console.log(`${c.yellow}⚠${c.reset} vector daemon LIVE but NOT hydrated-v1-capable for ${dbPath} (pid ${h.pid}, ${h.socket}) — it serves the raw-hit execution (client-side hydration); restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
+    console.log(`${c.yellow}⚠${c.reset} vector daemon LIVE but NOT fully capable for ${dbPath} (pid ${h.pid}, ${h.socket}; advertised: ${h.protocols.join(", ") || "none"}) — the deadline contract needs hydrated-v1 AND deadline-rel-v1; restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
   } else if (h.status === "live-legacy") {
     console.log(`${c.yellow}⚠${c.reset} vector daemon LIVE (legacy, unattested) for ${dbPath} (${h.socket}) — a pre-v0.38 watcher; restart it on v0.38 to attest DB/pid and serve hydrated-v1`);
   } else {
@@ -3235,11 +3236,11 @@ async function cmdDoctor() {
     const s = getStore();
     const h = await vectorDaemonHealth(s.dbPath);
     if (h.status === "live") {
-      console.log(`${c.green}✓${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} — hydrated-v1 attested; the context-surfacing hook's vector deadline is authoritative on this host`);
+      console.log(`${c.green}✓${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} — hydrated-v1 + deadline-rel-v1 attested; the context-surfacing hook's vector deadline is authoritative on this host`);
     } else if (h.status === "live-raw") {
-      // t89 P1: liveness without deadline authority — the daemon serves the raw-hit
-      // execution (client-side hydration timing), not the certified Path-A contract.
-      console.log(`${c.yellow}⚠${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} but NOT hydrated-v1-capable — it serves the raw-hit execution; restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
+      // t89 P1 + O1 §4: liveness without deadline authority — the daemon serves the raw-hit
+      // execution or ignores the relative budget, not the certified Path-A contract.
+      console.log(`${c.yellow}⚠${c.reset} Vector daemon: live (pid ${h.pid}) on ${h.socket} but NOT fully capable (advertised: ${h.protocols.join(", ") || "none"}) — the deadline contract needs hydrated-v1 AND deadline-rel-v1; restart 'clawmem watch' on v0.38+ for the deadline-authoritative path`);
       issues++;
     } else if (h.status === "live-legacy") {
       console.log(`${c.yellow}⚠${c.reset} Vector daemon: live on ${h.socket} (pre-v0.38 watcher — answers the daemon protocol but cannot attest its DB/pid, and serves the raw-hit execution; restart 'clawmem watch' on v0.38 for attested, deadline-authoritative health)`);

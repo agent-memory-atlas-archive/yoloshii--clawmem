@@ -43,6 +43,8 @@ function identity(over: Partial<RunIdentity["ranking_policy"] & Record<string, u
     // Codex t76: comparison surfaces fail closed on an ABSENT vector_exec —
     // the fixture records the in-process protocol explicitly.
     vector_exec: { protocol: "in-process", prewarm: "n/a", response_protocol: "n/a" },
+    // O1 §4: members fail closed on an ABSENT deadline_protocol — the fixture records the contract.
+    deadline_protocol: "monotonic-relative-v1",
     ranking_policy: { rerank_lane_weight: 1.5, fusion_policy_rev: 6, expansion_set: `draw:${drawFp}`, degeneracy_gate: "on", ...(over as object) },
   } as RunIdentity;
 }
@@ -725,6 +727,13 @@ describe("codex t68 F3: pre-registered admission-basis coverage", () => {
     const a = withBasis("r1", "aaaa", { declared: { "deep:rerank-fused-rrf": 11 } });
     const b = withBasis("r2", "bbbb", { declared: { "deep:rerank-fused-rrf": 11 } });
     expect(() => aggregateReplicatedRuns([a, b])).toThrow(/min_basis_by_stratum\.deep:rerank-fused-rrf=11 is not satisfied/);
+  });
+
+  it("O1 §4: a member without deadline_protocol is REFUSED — it measured wall-clock deadline semantics and cannot aggregate", () => {
+    const a = m("r1", "aaaa111111111111");
+    const b = m("r2", "bbbb222222222222");
+    delete b.report.identity!.deadline_protocol;
+    expect(() => aggregateReplicatedRuns([a, b])).toThrow(/records no deadline_protocol/);
   });
 
   it("declaring minima without recorded coverage refuses — not written by this code", () => {

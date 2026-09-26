@@ -365,6 +365,12 @@ export function compareIdentities(
     if ((id as Record<string, unknown>).eval_now === undefined) {
       mismatches.push(`identity on ${side} has no eval_now — the evaluation clock its composite policy inputs were computed on is unidentifiable (turn-55+ code records wall clock explicitly as null); re-run or re-stamp before pairing`);
     }
+    // O1 §4 / §6 step 5: the handler timing contract is identity — absence means the side
+    // measured wall-clock deadline semantics (pre-O1). Fail closed on either side; two absent
+    // sides would deep-compare as equal while both are unidentifiable relative to O1 semantics.
+    if ((id as Record<string, unknown>).deadline_protocol === undefined) {
+      mismatches.push(`identity on ${side} has no deadline_protocol — it measured the handler under wall-clock deadline semantics (pre-O1); re-run before pairing`);
+    }
   }
   if (mismatches.length > 0) return { comparable: false, weights, gates, mismatches };
   const diffs: string[] = [];

@@ -69,6 +69,8 @@ function identity(weight: number): Record<string, any> {
     // Codex t76: comparison surfaces fail closed on an ABSENT vector_exec —
     // the fixture records the in-process protocol explicitly.
     vector_exec: { protocol: "in-process", prewarm: "n/a", response_protocol: "n/a" },
+    // O1 §4: the audit fails closed on an ABSENT deadline_protocol — the fixture records the contract.
+    deadline_protocol: "monotonic-relative-v1",
     ranking_policy: { rerank_lane_weight: weight, fusion_policy_rev: 5, expansion_set: "draw:0123456789abcdef" },
   };
 }
@@ -268,6 +270,10 @@ describe("pair-audit: run-identity comparability (codex turn-20 F1)", () => {
     expect(v.mismatches.join("\n")).toContain("eval_now");
     // One-sided absence names the side; explicit wall clock (null/null) compares.
     expect(compareIdentities(legacy(), identity(1.5)).mismatches.join("\n")).toContain("identity on A has no eval_now");
+    // O1 §4: a side without deadline_protocol measured wall-clock deadline semantics — fails closed.
+    const noDp = identity(1.5); delete noDp.deadline_protocol;
+    expect(compareIdentities(noDp, identity(1.5)).mismatches.join("\n")).toContain("identity on A has no deadline_protocol");
+    expect(compareIdentities(identity(1.5), identity(1.5)).mismatches.join("\n")).not.toContain("deadline_protocol");
     expect(compareIdentities(identity(1.5), identity(1.5)).comparable).toBe(true);
   });
 

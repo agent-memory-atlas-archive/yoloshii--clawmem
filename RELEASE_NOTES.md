@@ -102,7 +102,11 @@ audit over branded `MonoDeadline` / `DurationMs` / `EpochMs` values, both at zer
 that way. The timing evidence changed with it: every rep's per-leg record is persisted
 (`vector_leg_records`: monotonic `over_ms`, the span on both clocks with `clock_skew_ms`
 exposing a realtime step, an orthogonal terminal kind × execution path, and a timing class
-against the **frozen** 150 ms tolerance — never re-fitted). `CLAWMEM_HOOK_BUDGET_MS` gained a **maximum of 25000**
+against the **frozen** 150 ms tolerance — never re-fitted). The contract is identity: the run
+records `deadline_protocol: "monotonic-relative-v1"`, the daemon advertises `deadline-rel-v1`
+beside `hydrated-v1`, `clawmem doctor` / `clawmem vec-daemon-health` require both for the
+authoritative `live` tier, and every comparison surface (baseline, pair, replicated members)
+fails closed on a report without it. `CLAWMEM_HOOK_BUDGET_MS` gained a **maximum of 25000**
 (the wire ceiling): larger values are refused by the hook, by `clawmem setup hooks` and are
 reported by `clawmem doctor`; the fallback and clamp behaviours below the maximum are unchanged.
 

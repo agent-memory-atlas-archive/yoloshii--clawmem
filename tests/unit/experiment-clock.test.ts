@@ -132,6 +132,7 @@ describe("scripts/experiment-clock.sh — one experiment, one clock (codex t56 F
       eval_now: evalNow,
       // Codex t76: member comparison fails closed on an ABSENT vector_exec.
       vector_exec: { protocol: "in-process", prewarm: "n/a", response_protocol: "n/a" },
+      deadline_protocol: "monotonic-relative-v1", // a CURRENT member: every run is stamped since O1 activation (an unstamped one is refused)
       ranking_policy: { rerank_lane_weight: 1.5, fusion_policy_rev: 6, expansion_set: `draw:${drawFp}`, degeneracy_gate: "on" },
     } as RunIdentity);
     expect(() => assertReplicatedMemberIdentity(member("aaaa111111111111", clock), member("bbbb222222222222", clockAgain), "ref-1")).not.toThrow();

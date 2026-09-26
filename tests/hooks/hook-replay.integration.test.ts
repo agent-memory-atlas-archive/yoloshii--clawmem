@@ -1366,9 +1366,9 @@ describe("BUILD-3d: registered treatments at the runHookEval boundary (codex tur
     expect(breached.report.vector_deadline.max_over_ms).toBe(2230);
     expect(breached.report.vector_deadline.worst).toEqual({ leg: "primary", case: "rt-tune", attempt: 0, rep: 0, budget_ms: 900 });
     // O1 §3: EVERY rep's record is persisted in full, keyed case + rep, with the harness-derived
-    // timing class and the run's deadline-protocol identity (null before O1 activation) — a late
+    // timing class and the run's deadline-protocol identity (stamped on EVERY run since O1 activation — never null) — a late
     // SUCCESS is distinguishable from a late abandonment in the artifact itself.
-    expect(breached.report.vector_leg_records).toEqual([{ leg: "primary", over_ms: 2230, budget_ms: 900, case: "rt-tune", attempt: 0, rep: 0, mono_elapsed_ms: 3130, wall_elapsed_ms: 3130, clock_skew_ms: 0, terminal_kind: "completion", status: "ok", timing: "late", deadline_protocol: null }]);
+    expect(breached.report.vector_leg_records).toEqual([{ leg: "primary", over_ms: 2230, budget_ms: 900, case: "rt-tune", attempt: 0, rep: 0, mono_elapsed_ms: 3130, wall_elapsed_ms: 3130, clock_skew_ms: 0, terminal_kind: "completion", status: "ok", timing: "late", deadline_protocol: "monotonic-relative-v1" }]);
     const persisted = JSON.parse(readFileSync(breached.artifacts!.runJsonPath, "utf8")) as { vector_leg_records: unknown[] };
     expect(persisted.vector_leg_records).toEqual(breached.report.vector_leg_records);
     // The breach is an INDEPENDENT trust failure (codex t82 P1) — never a

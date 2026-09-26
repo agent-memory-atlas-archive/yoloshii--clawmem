@@ -193,6 +193,8 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
     expect(d.exitCode).toBe(0);
     const rd = JSON.parse(readFileSync(join(outD, "hook-run.json"), "utf-8"));
     expect(rd.identity.vector_exec).toEqual({ protocol: "daemon-required", prewarm: "steady-state", response_protocol: "hydrated-v1" });
+    // O1 §4 ACTIVATION: the handler timing contract is stamped from the implementation constant.
+    expect(rd.identity.deadline_protocol).toBe("monotonic-relative-v1");
     expect(rd.vector_exec.protocol).toBe("daemon-required");
     expect(rd.vector_exec.response_protocol).toBe("hydrated-v1");
     expect(rd.vector_exec.latency_authoritative).toBe(true);
@@ -558,6 +560,24 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
         vectorExec: { protocol: "daemon-required", prewarm: "cold", readyTimeoutMs: 30_000 },
         baselinePath: join(legacy, "hook-run.json"),
       })).rejects.toThrow(/baseline predates vector_exec recording/);
+      // O1 §4 / §6 step 5: a partner or baseline WITHOUT deadline_protocol (pre-O1: wall-clock
+      // deadline semantics) fails closed on both surfaces — preflight for the pair, before scoring.
+      const preO1 = join(dir, "pre-o1");
+      mkdirSync(preO1);
+      const hrO1 = JSON.parse(readFileSync(join(cold, "hook-run.json"), "utf-8"));
+      delete hrO1.identity.deadline_protocol;
+      writeFileSync(join(preO1, "hook-run.json"), JSON.stringify(hrO1));
+      writeFileSync(join(preO1, "traces.jsonl"), readFileSync(join(cold, "traces.jsonl")));
+      await expect(runHookEval({
+        goldPath, store, minExamples: 1, audited: true, latencyReps: 1,
+        vectorExec: { protocol: "daemon-required", prewarm: "cold", readyTimeoutMs: 30_000 },
+        pairWith: preO1, pairMinValid: 1,
+      })).rejects.toThrow(/pair gate \(preflight\): partner run .* carries no deadline_protocol identity/);
+      await expect(runHookEval({
+        goldPath, store, minExamples: 1, audited: true, latencyReps: 1,
+        vectorExec: { protocol: "daemon-required", prewarm: "cold", readyTimeoutMs: 30_000 },
+        baselinePath: join(preO1, "hook-run.json"),
+      })).rejects.toThrow(/baseline records no deadline_protocol/);
     } finally {
       store.close();
     }
@@ -573,6 +593,7 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
         served_embed: "se", served_llm: "sl", served_rerank: "sr",
       },
       latency_protocol: { reps: 3, aggregation: "lower-median" },
+      deadline_protocol: "monotonic-relative-v1",
       eval_now: null,
       vector_exec: { protocol: "daemon-required", prewarm: "steady-state", response_protocol: "hydrated-v1" },
       ranking_policy: { rerank_lane_weight: 1.5, fusion_policy_rev: 6, expansion_set: "draw:aaaa111111111111", degeneracy_gate: "on" },

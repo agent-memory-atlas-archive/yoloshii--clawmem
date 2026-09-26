@@ -67,7 +67,7 @@ loginctl enable-linger $(whoami)
 ```bash
 systemctl --user status clawmem-watcher.service
 systemctl --user status clawmem-embed.timer
-clawmem vec-daemon-health   # v0.38.0: the watcher's vector daemon answers for this vault (exit 0 = live)
+clawmem vec-daemon-health   # v0.38.0: the watcher's vector daemon answers for this vault (exit 0 = live: attested + hydrated-v1 + deadline-rel-v1)
 ```
 
 ## Background maintenance workers (v0.8.2)

@@ -414,9 +414,11 @@ export async function startVectorDaemon(
       const parsed = JSON.parse(line) as Record<string, unknown> | null;
       // Ping: answered WITHOUT scanning and outside single-flight — a readiness/identity probe must
       // not be starved by an in-flight cold scan, and it must name the process + DB behind the socket.
-      // `protocols` is the capability attestation (t84): this daemon serves hydrated-v1.
+      // `protocols` is the capability attestation (t84): this daemon serves hydrated-v1 AND, since
+      // O1 activation, the relative-budget deadline protocol (§4: NEVER advertised while any
+      // deadline path read wall time — both O1 ratchets are at zero in this build).
       if (parsed && typeof parsed === "object" && parsed.ping === true) {
-        respond(socket, { pong: true, db: store.dbPath, pid: process.pid, protocols: [HYDRATED_PROTOCOL] });
+        respond(socket, { pong: true, db: store.dbPath, pid: process.pid, protocols: [HYDRATED_PROTOCOL, DEADLINE_PROTOCOL] });
         return;
       }
       // O1 §4 version skew, detected by FIELD PRESENCE before anything is decoded: a pre-O1
@@ -861,7 +863,7 @@ export async function daemonPing(dbPath: string, timeoutMs: number): Promise<Dae
 /** Operational liveness/ownership state of a vault's vector daemon (codex t77 F5). */
 export type VectorDaemonHealth =
   | { status: "live"; socket: string; db: string; pid: number; protocols: string[] }
-  /** Attested (exact DB + pid) but WITHOUT hydrated-v1 (t84/t89 P1): live, NOT Path-A authoritative — the v0.38 hook classifies its answers `skew` and falls back to FTS. */
+  /** Attested (exact DB + pid) but WITHOUT hydrated-v1 or deadline-rel-v1 (t84/t89 P1, O1 §4): live, NOT Path-A authoritative — the v0.38 hook classifies its answers `skew` and falls back to FTS. */
   | { status: "live-raw"; socket: string; db: string; pid: number; protocols: string[] }
   /** A live clawmem daemon predating the ping protocol (pre-v0.38 watcher): serves this vault's path-keyed socket, cannot attest DB/pid — liveness is established, attestation is not. */
   | { status: "live-legacy"; socket: string }
@@ -874,16 +876,16 @@ export type VectorDaemonHealth =
  * no socket file; "stale" = a file nobody listens on (a crashed watcher);
  * "unresponsive" = a listener that did not answer within `timeoutMs`;
  * "foreign-db" = a listener serving a different DB path; "live" = the
- * watcher's daemon serving exactly `dbPath` AND attesting the hydrated-v1
- * capability; "live-raw" = attested DB/pid but WITHOUT hydrated-v1 (no
- * daemon-side projection); "live-legacy" = a pre-v0.38 daemon (answers the
- * frame protocol, has no ping) on this vault's path-keyed socket — live,
- * unattested. ONLY "live" makes the context-surfacing hook's vector deadline
- * authoritative on this host (t89 P1): against a live-raw or live-legacy
- * daemon the v0.38 hook classifies every vector answer `skew` and falls back
- * to FTS — it never hydrates raw hits client-side (codex migration r2 #1).
- * The O1 relative budget is attested per ANSWER (an unattested answer is
- * `skew`); the pong does not advertise deadline-rel-v1 until O1 activation.
+ * watcher's daemon serving exactly `dbPath` AND attesting BOTH capabilities
+ * the deadline contract certifies — hydrated-v1 projection and the O1
+ * deadline-rel-v1 relative budget; "live-raw" = attested DB/pid but lacking
+ * at least one of them (no daemon-side projection, or no relative budget);
+ * "live-legacy" = a pre-v0.38 daemon (answers the frame protocol, has no
+ * ping) on this vault's path-keyed socket — live, unattested. ONLY "live"
+ * makes the context-surfacing hook's vector deadline authoritative on this
+ * host (t89 P1): against a live-raw or live-legacy daemon the v0.38 hook
+ * classifies every vector answer `skew` and falls back to FTS — it never
+ * hydrates raw hits client-side (codex migration r2 #1).
  */
 export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Promise<VectorDaemonHealth> {
   const socket = vecDaemonSocketPath(dbPath);
@@ -892,10 +894,12 @@ export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Prom
   if (pong.status === "legacy") return { status: "live-legacy", socket };
   if (pong.status !== "ok") return pong.status === "absent" ? { status: "stale", socket } : { status: "unresponsive", socket };
   if (pong.db !== dbPath) return { status: "foreign-db", socket, db: pong.db, pid: pong.pid };
-  // t89 P1: `live` is reserved for the Path-A-authoritative daemon — exact DB/pid AND the
-  // hydrated-v1 capability. An attested daemon without it cannot answer the hook's hydrated
-  // requests (its raw hits are `skew` → FTS): live, but NOT what the deadline contract certifies.
-  return pong.protocols.includes(HYDRATED_PROTOCOL)
+  // t89 P1 + O1 §4: `live` is reserved for the Path-A-authoritative daemon — exact DB/pid AND
+  // BOTH capabilities. An attested daemon without hydrated-v1 cannot answer the hook's hydrated
+  // requests (its raw hits are `skew` → FTS); one without deadline-rel-v1 ignores the relative
+  // budget and runs under no deadline of its own: live, but NOT what the deadline contract
+  // certifies.
+  return pong.protocols.includes(HYDRATED_PROTOCOL) && pong.protocols.includes(DEADLINE_PROTOCOL)
     ? { status: "live", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols }
     : { status: "live-raw", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols };
 }

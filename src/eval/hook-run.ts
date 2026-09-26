@@ -32,6 +32,7 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
+import { DEADLINE_PROTOCOL, DEADLINE_PROTOCOL_IDENTITY } from "../vector-protocol.ts";
 import { join } from "path";
 import { createHash } from "crypto";
 import type { Store } from "../store.ts";
@@ -825,6 +826,17 @@ function assertComparableIdentity(
       // and can never compare with a hydrated-v1 run; absence fails closed.
       mismatches.push(`${who} records no vector_exec.response_protocol — a pre-t84 report measured the raw-hit execution (client-side hydration), a DIFFERENT contract from a hydrated-v1 run; re-run it under t84+ code`);
     }
+  }
+  // O1 §4 / §6 step 5: the handler timing contract is identity on EVERY comparison surface —
+  // a report without it measured wall-clock deadline semantics (steppable deadlines and
+  // wall-sampled over_ms); FAIL CLOSED on absence, and never compare across a mismatch.
+  for (const [who, side] of [["baseline", baseline], ["candidate", candidate]] as const) {
+    if (side.deadline_protocol === undefined) {
+      mismatches.push(`${who} records no deadline_protocol — it measured the handler under wall-clock deadline semantics (pre-O1), a DIFFERENT timing contract from a "${DEADLINE_PROTOCOL_IDENTITY}" run; re-run it under O1 code`);
+    }
+  }
+  if (baseline.deadline_protocol !== undefined && candidate.deadline_protocol !== undefined && baseline.deadline_protocol !== candidate.deadline_protocol) {
+    mismatches.push(`deadline_protocol (${baseline.deadline_protocol} vs ${candidate.deadline_protocol}) — the runs measured the handler under different timing contracts; re-run both under the same build`);
   }
   if (baseline.vector_exec !== undefined && candidate.vector_exec !== undefined
     && (baseline.vector_exec.protocol !== candidate.vector_exec.protocol
@@ -1684,6 +1696,16 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
         throw new HookEvalIntegrityError(`pair gate (preflight): vector execution protocol differs from the partner (partner ${describeVectorExec(partnerVe)} vs this run ${describeVectorExec(vectorExecId)}) — the protocol (response_protocol included, codex t84 CR-5: a pre-t84 partner records none and fails closed here) is identity, not a registrable treatment; run both arms under the same build + --vector-exec/--vector-prewarm`);
       }
     }
+    // O1 §4: the handler timing contract is identity too — refused in PREFLIGHT on absence or mismatch.
+    {
+      const partnerDp = (readRunHeader(opts.pairWith!).identity as { deadline_protocol?: string } | null)?.deadline_protocol;
+      if (partnerDp === undefined) {
+        throw new HookEvalIntegrityError(`pair gate (preflight): partner run at ${opts.pairWith} carries no deadline_protocol identity — it measured the handler under wall-clock deadline semantics (pre-O1); re-run the partner under O1 code`);
+      }
+      if (partnerDp !== DEADLINE_PROTOCOL_IDENTITY) {
+        throw new HookEvalIntegrityError(`pair gate (preflight): deadline_protocol differs from the partner (partner ${partnerDp} vs this run ${DEADLINE_PROTOCOL_IDENTITY}) — the handler timing contract is identity, not a registrable treatment; run both arms under the same build`);
+      }
+    }
     if (opts.baselinePath) {
       // Acceptance under the pair gate recomputes BOTH sides over the valid
       // ids, which is only meaningful when the baseline IS the partner: a
@@ -1883,6 +1905,14 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
     if (!pong.protocols.includes("hydrated-v1")) {
       throw new HookEvalIntegrityError(
         `vector daemon ownership check failed ${when}: child pid ${pong.pid} does not attest the hydrated-v1 response protocol (advertised: ${pong.protocols.join(", ") || "none"}) — the daemon-required run's identity is response_protocol "hydrated-v1"; the run is REFUSED`
+      );
+    }
+    // O1 §4: the run's identity is deadline_protocol "monotonic-relative-v1" — every daemon leg
+    // must run under the relative-budget wire (deadline-rel-v1). A daemon that cannot attest it
+    // would run its scans under NO deadline (caught per-leg as `skew` too, but refuse at the ping).
+    if (!pong.protocols.includes(DEADLINE_PROTOCOL)) {
+      throw new HookEvalIntegrityError(
+        `vector daemon ownership check failed ${when}: child pid ${pong.pid} does not attest the ${DEADLINE_PROTOCOL} deadline protocol (advertised: ${pong.protocols.join(", ") || "none"}) — the run's identity is deadline_protocol "${DEADLINE_PROTOCOL_IDENTITY}"; the run is REFUSED`
       );
     }
   };
@@ -2303,6 +2333,10 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
     // Codex t76: the vector execution protocol the legs ran under — STRICT
     // on every comparison surface, not a treatment.
     vector_exec: vectorExecId,
+    // O1 §4 ACTIVATION: the handler / evaluator timing contract, stamped from the exported
+    // implementation constant for EVERY run (speed-only and in-process included). Strict on
+    // every comparison surface; a report without it measured wall-clock deadline semantics.
+    deadline_protocol: DEADLINE_PROTOCOL_IDENTITY,
   };
   // Two independent contracts, both measured (codex t77 F4 + t81 P1/P2 + t82 P1):
   if (opts._testTimingSamples?.vectorLegs) allVectorLegs.push(...opts._testTimingSamples.vectorLegs);

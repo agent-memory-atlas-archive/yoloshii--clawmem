@@ -171,6 +171,7 @@ describe("eval hook-aggregate CLI — BUILD-3d replicated aggregation boundary",
         eval_now: null,
         // Codex t76: member comparison fails closed on an ABSENT vector_exec.
         vector_exec: { protocol: "in-process", prewarm: "n/a", response_protocol: "n/a" },
+        deadline_protocol: "monotonic-relative-v1", // a CURRENT member: every run is stamped since O1 activation (an unstamped one is refused)
         ranking_policy: { rerank_lane_weight: 1.5, fusion_policy_rev: 6, expansion_set: `draw:${drawFp}`, degeneracy_gate: "on" },
       },
       gates: { trust_pass: true, acceptance_pass: null, acceptance_waived: [], finalization_reserve_ok: null, budget_elapsed_ok: null, pass: false, reasons: [] },

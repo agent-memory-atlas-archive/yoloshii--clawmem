@@ -21,6 +21,7 @@
  * contract.
  */
 import { writeFileSync, mkdirSync } from "fs";
+import { DEADLINE_PROTOCOL_IDENTITY } from "../vector-protocol.ts";
 import { isoNow } from "../clock.ts";
 import { join } from "path";
 import { parseBaselineReport, HookEvalIntegrityError, assertReplicatedMemberIdentity, ACCEPTANCE_AXIS_METRICS, type HookRunReport, type AcceptanceAxis, deriveValidBasisByStratum } from "./hook-run.ts";
@@ -432,6 +433,12 @@ export function aggregateReplicatedRuns(members: { dir: string; report: HookRunR
     // a member without response_protocol measured a pre-t84 execution.
     if (ve && ve.response_protocol === undefined) {
       refuse(`member ${report.run_id} (${dir}) records no vector_exec.response_protocol (protocol ${ve.protocol}) — a pre-t84 member measured the raw-hit/client-hydration execution and cannot aggregate with t84+ members (codex t84 CR-5 / t89 P2); re-run this draw`);
+    }
+    // O1 §4 / §6 step 5: a member without the handler timing contract measured wall-clock
+    // deadline semantics — it can never aggregate with monotonic-relative-v1 members. The
+    // pairwise identity comparison below then holds every member to the reference's value.
+    if (id.deadline_protocol === undefined) {
+      refuse(`member ${report.run_id} (${dir}) records no deadline_protocol — it measured the handler under wall-clock deadline semantics (pre-O1) and cannot aggregate with "${DEADLINE_PROTOCOL_IDENTITY}" members; re-run this draw`);
     }
     const m = /^draw:(.+)$/.exec(rp.expansion_set);
     if (!m) refuse(`member ${report.run_id} (${dir}) has expansion_set "${rp.expansion_set}" — a replicated aggregate is built from frozen-draw member runs only ("draw:<fp>"); capture each draw with --capture-expansions`);
