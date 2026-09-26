@@ -5106,6 +5106,16 @@ export const RERANK_REQUEST_REV = 2;
 export const LOCAL_RERANK_SCORE_REV = 2;
 
 /**
+ * Revision of what a REMOTE rerank cache namespace admits. 2: only scores the
+ * configured endpoint itself returned. Before v0.39 the in-process fallback also
+ * wrote under the endpoint's namespace whenever the endpoint failed, so a v0.38
+ * cache can hold local (under node-llama-cpp 3.15.1, squeezed-scale) scores
+ * labelled as the endpoint's. The revision makes those entries unreachable
+ * (cold start, no migration; llm_cache self-prunes).
+ */
+export const REMOTE_RERANK_NAMESPACE_REV = 2;
+
+/**
  * The EXACT text transmitted to the rerank endpoint for a candidate —
  * truncated to ~400 chars to fit the server's 512-token context (query +
  * document must share one pair; ~2 chars/token for mixed content). Single
@@ -5193,7 +5203,8 @@ export function rerankIdentityState(kind: "remote" | "local", model: string, db?
   const observed = raw.value?.trim();
   if (!fresh || !observed) return { namespace: null, token: stamp(`expired:${url}#${raw.value}`) };
   const declared = Bun.env.CLAWMEM_RERANK_PROVIDER_ID?.trim();
-  const ns = declared ? `remote:${url}#${declared}@${observed}` : `remote:${url}#${observed}`;
+  const base = declared ? `remote:${url}#${declared}@${observed}` : `remote:${url}#${observed}`;
+  const ns = `${base}#ns-rev${REMOTE_RERANK_NAMESPACE_REV}`;
   return { namespace: ns, token: stamp(ns) };
 }
 
@@ -5625,8 +5636,11 @@ export async function rerank(query: string, documents: { file: string; text: str
           // file matches no input doc cannot be content-addressed, so it is
           // applied for this call but never cached.
           // Same rule for the local fallback: the namespace captured at
-          // request start, or no write at all.
-          if (doc && lookupProvider !== null && identityUnchanged()) {
+          // request start, or no write at all. And only in LOCAL mode: when
+          // this call started against a configured endpoint, the captured
+          // namespace names that endpoint, and a local score written there
+          // would later serve as the endpoint's (codex v0.39 turn 8).
+          if (doc && lookupProvider !== null && identityKind === "local" && identityUnchanged()) {
             setCachedResult(db, rerankCacheKey(rerankQuery, doc.file, model, doc.text, lookupProvider), result.score.toString());
           }
           // Apply score to all files sharing this text
