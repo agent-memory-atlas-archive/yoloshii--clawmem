@@ -8,9 +8,9 @@
  * Modes (CLAWMEM_TEST_RERANK_MODE):
  *  - "stub" (default): store.rerank replaced by a scoring stub that CAPTURES
  *    the options it receives — the spawning test asserts the production call
- *    supplies deadlineAt ≈ budget − FINALIZATION_RESERVE (codex turn-23
- *    finding 1: an options-blind stub let the deadline wiring regress
- *    silently).
+ *    supplies a MONOTONIC `deadline` ≈ budget − FINALIZATION_RESERVE from the
+ *    driver's own monotonic start (O1; codex turn-23 finding 1: an
+ *    options-blind stub let the deadline wiring regress silently).
  *  - "real-http-delay": store.rerank stays REAL; globalThis.fetch is mocked
  *    with an abort-honoring handler that sleeps CLAWMEM_TEST_RERANK_HTTP_
  *    DELAY_MS. The handler's deadline must abort the batch at the window
@@ -91,14 +91,15 @@ let expandCalls = 0;
 // t61 F60-1 capture: null = called WITHOUT intent; undefined-never-called stays "unseen".
 let expandIntentSeen: string | null | "unseen" = "unseen";
 let rerankIntentSeen: string | null | "unseen" = "unseen";
-type RerankOptsSeen = { requireLiveCoverage?: boolean; deadlineAt?: number };
+type RerankOptsSeen = { requireLiveCoverage?: boolean; deadline?: number };
 let rerankOpts: RerankOptsSeen | null = null;
 // Function-boundary read: rerankOpts is assigned only inside the store.rerank
 // closure, so a direct module-tail read is control-flow-narrowed to its
 // `null` initializer (chained property access becomes `never`); a call
 // boundary makes TS consult the declared type instead.
 const seenRerankOpts = (): RerankOptsSeen | null => rerankOpts;
-const t0 = Date.now();
+// O1: the handler's deadlines are performance.now()-based, so the driver anchors on the same clock.
+const t0 = performance.now();
 if (RERANK_MODE === "real-http-delay") {
   // REAL store.rerank against an abort-honoring delayed HTTP mock.
   process.env.CLAWMEM_RERANK_URL = "http://rerank.test:1";
@@ -221,6 +222,6 @@ console.log("BUDGETDRIVER::" + JSON.stringify({
   postOutputSkipped: trace.timings.postOutputSkipped,
   outcome: trace.outcome,
   requireLiveCoverage: seenRerankOpts()?.requireLiveCoverage ?? null,
-  deadlineDeltaMs: typeof seenRerankOpts()?.deadlineAt === "number" ? seenRerankOpts()!.deadlineAt! - t0 : null,
-  elapsedMs: Date.now() - t0,
+  deadlineDeltaMs: typeof seenRerankOpts()?.deadline === "number" ? seenRerankOpts()!.deadline! - t0 : null,
+  elapsedMs: performance.now() - t0,
 }));

@@ -82,7 +82,8 @@ import {
 } from "./maintenance.ts";
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
 import { consumePendingSurfacingBookkeeping, writeSurfacingBookkeepingSpoolJob, drainSurfacingBookkeepingSpool, validateSurfacingBookkeepingJob, serializeSurfacingBookkeepingJob, SPOOL_JOB_MAX_BYTES } from "./hooks/surfacing-bookkeeping.ts";
-import { contextSurfacing } from "./hooks/context-surfacing.ts";
+import { contextSurfacing, assertHookBudgetConfig } from "./hooks/context-surfacing.ts";
+import { monoNow, elapsed, evidenceMs, deadlineAfter, remainingForTimeout, duration, sleep, scaled, type MonoInstant, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
 import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
 import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } from "./judge.ts";
@@ -468,7 +469,7 @@ async function cmdMine(args: string[]) {
 
   // Write chunks as markdown to a staging directory (outside source tree), then index
   const { tmpdir } = await import("os");
-  const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`);
+  const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${epochMs(epochNow())}`);
   mkdirSync(stagingDir, { recursive: true });
 
   const { rmSync } = await import("fs");
@@ -721,7 +722,7 @@ async function cmdEmbed(args: string[]) {
         markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
       if (!canaryState) {
         console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
-        await setTaint(`no preflight validation at ${new Date().toISOString()}`);
+        await setTaint(`no preflight validation at ${isoNow()}`);
         process.exitCode = 1;
         return;
       }
@@ -735,11 +736,11 @@ async function cmdEmbed(args: string[]) {
       } catch { /* endpoint gone at the very end — endDrift stays null → unverified */ }
       if (endDrift === null) {
         console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
-        await setTaint(`unverified end-of-run at ${new Date().toISOString()}`);
+        await setTaint(`unverified end-of-run at ${isoNow()}`);
         process.exitCode = 1;
       } else if (endDrift < CANARY_DRIFT_FLOOR) {
         console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
-        await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${new Date().toISOString()}`);
+        await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${isoNow()}`);
         process.exitCode = 1;
       } else {
         // Verified end. A FULL verified rebuild (--force) clears any standing taint —
@@ -859,7 +860,7 @@ async function cmdEmbed(args: string[]) {
     let embedded = 0;
     let totalFragments = 0;
     let failedFragments = 0;
-    const batchStart = Date.now();
+    const batchStart = monoNow();
 
     // Cloud API: global batch pacing state (persists across documents)
     // TPM is the binding constraint, not RPM. 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
@@ -868,7 +869,7 @@ async function cmdEmbed(args: string[]) {
     const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
     const CLOUD_TPM_SAFETY = 0.85; // use 85% of limit to leave headroom for retries
     const CHARS_PER_TOKEN = 4;
-    let lastBatchSentAt = 0; // global timestamp of last batch send
+    let lastBatchSentAt: MonoInstant | null = null; // global timestamp of last batch send
 
     // Bind the run to one (dim, model) and validate every embedding before it is stored.
     // The first successful fragment sets the binding on a fresh vault; any later drift —
@@ -906,7 +907,7 @@ async function cmdEmbed(args: string[]) {
       }
 
       const fragments = splitDocument(body, frontmatter);
-      const docStart = Date.now();
+      const docStart = monoNow();
       const prevFailedFragments = failedFragments;
       let seq0Succeeded = false;
 
@@ -933,7 +934,7 @@ async function cmdEmbed(args: string[]) {
           // Global TPM-aware delay: compute required wait based on last batch's token count,
           // then wait only the remaining time since lastBatchSentAt. Applies to ALL batches
           // including first batch of each document (inter-document pacing).
-          if (lastBatchSentAt > 0) {
+          if (lastBatchSentAt !== null) {
             // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
             //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
             const batchEnd0 = Math.min(batchStartIdx + CLOUD_BATCH_SIZE, allTexts.length);
@@ -943,22 +944,19 @@ async function cmdEmbed(args: string[]) {
             const batchTokens = estimatedTokens;
             const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
             const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
-            const elapsed = Date.now() - lastBatchSentAt;
-            const remainingMs = requiredGapMs - elapsed;
-            if (remainingMs > 0) {
-              const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
-              await new Promise(r => setTimeout(r, jittered));
-            }
+            // O1: the pacing window is a monotonic deadline from the last send.
+            const wait = remainingForTimeout(deadlineAfter(lastBatchSentAt, duration(requiredGapMs)));
+            if (wait !== null) await sleep(scaled(wait, 0.85 + Math.random() * 0.3));
           }
 
           const batchEnd = Math.min(batchStartIdx + CLOUD_BATCH_SIZE, allTexts.length);
           const batchTexts = allTexts.slice(batchStartIdx, batchEnd);
-          lastBatchSentAt = Date.now();
-          const reqStart = Date.now();
+          lastBatchSentAt = monoNow();
+          const reqStart = monoNow();
 
           try {
             const results = await llm.embedBatch(batchTexts);
-            const reqMs = Date.now() - reqStart;
+            const reqMs = evidenceMs(elapsed(reqStart));
             const tokensUsed = llm.lastBatchTokens;
 
             for (let i = 0; i < results.length; i++) {
@@ -976,7 +974,7 @@ async function cmdEmbed(args: string[]) {
                   s.ensureVecTable(result.embedding.length, leaseGuard);
                   s.insertEmbedding(
                     hash, seq, frag.startLine, new Float32Array(result.embedding),
-                    result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                    result.model, isoNow(), frag.type, frag.label ?? undefined, canId,
                     leaseGuard, embedInputFp
                   );
                 }, "insertEmbedding", () => leaseLost);
@@ -1004,9 +1002,9 @@ async function cmdEmbed(args: string[]) {
           const text = formatDocForEmbedding(frag.content, label);
 
           try {
-            const fragStart = Date.now();
+            const fragStart = monoNow();
             const result = await llm.embed(text);
-            const fragMs = Date.now() - fragStart;
+            const fragMs = evidenceMs(elapsed(fragStart));
             if (result) {
               bindAndValidate(result);
               // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
@@ -1018,7 +1016,7 @@ async function cmdEmbed(args: string[]) {
                 s.ensureVecTable(result.embedding.length, leaseGuard);
                 s.insertEmbedding(
                   hash, seq, frag.startLine, new Float32Array(result.embedding),
-                  result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                  result.model, isoNow(), frag.type, frag.label ?? undefined, canId,
                   leaseGuard, embedInputFp
                 );
               }, "insertEmbedding", () => leaseLost);
@@ -1056,12 +1054,12 @@ async function cmdEmbed(args: string[]) {
       }
 
       embedded++;
-      const docMs = Date.now() - docStart;
-      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(0);
-      console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${hashes.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsed}s elapsed]`);
+      const docMs = evidenceMs(elapsed(docStart));
+      const elapsedSec = (evidenceMs(elapsed(batchStart)) / 1000).toFixed(0);
+      console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${hashes.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsedSec}s elapsed]`);
     }
 
-    const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
+    const totalSec = (evidenceMs(elapsed(batchStart)) / 1000).toFixed(1);
     console.log();
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
 
@@ -1491,7 +1489,7 @@ async function cmdEval(args: string[]) {
       limit,
       minExamples,
       audited: values.audited,
-      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-${profile}`),
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${isoNow().replace(/[:.]/g, "-")}-${profile}`),
       store: s,
     });
   } catch (e) {
@@ -1882,7 +1880,7 @@ async function cmdEvalHookRun(args: string[], usage: string) {
       pairMinBasisByStratum,
       pairTreatments,
       vectorExec,
-      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-hook`),
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${isoNow().replace(/[:.]/g, "-")}-hook`),
     });
   } catch (e) {
     if (e instanceof HookGoldFileError || e instanceof HookEvalIntegrityError) deferredDie = e.message;
@@ -1991,6 +1989,21 @@ async function cmdHook(args: string[]) {
     return;
   }
 
+  // O1 §2 (codex rev-8 F4) + codex migration r1 P1: refuse the context-surfacing RUN under an
+  // unsupported budget BEFORE stdin is read or the store is opened — one clear stderr line and an
+  // empty (fail-open) output, and no observable work under an unsupported budget. The tooling that
+  // explains the value (`doctor`, `setup hooks`) never throws. The handler asserts the same
+  // contract itself at its own entry, so there is no path to a budget that skips this check.
+  if (hookName === "context-surfacing") {
+    try {
+      assertHookBudgetConfig();
+    } catch (e) {
+      console.error(`[clawmem] context-surfacing refused: ${(e as Error).message}`);
+      writeHookOutput(makeEmptyOutput(hookName));
+      return;
+    }
+  }
+
   const input = await readHookInput();
   // Open the store capped from the START for the context-surfacing hook (not just after open via the
   // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
@@ -2000,7 +2013,8 @@ async function cmdHook(args: string[]) {
 
   try {
     switch (hookName) {
-      case "context-surfacing":
+      case "context-surfacing": {
+        // (Budget refused above, before stdin and the store — codex migration r1 P1.)
         // Scope the small busy_timeout to THIS process only. Each `clawmem
         // hook` invocation runs exactly one hook, so the Stop hooks
         // (decision-extractor / handoff-generator / feedback-loop, 30s budget)
@@ -2008,6 +2022,7 @@ async function cmdHook(args: string[]) {
         try { s.db.exec(`PRAGMA busy_timeout = ${CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS}`); } catch { /* non-fatal */ }
         output = await contextSurfacing(s, input);
         break;
+      }
       case "session-bootstrap":
         output = await sessionBootstrap(s, input);
         break;
@@ -2194,7 +2209,7 @@ async function cmdSurface(args: string[]) {
   try {
     if (isBootstrap) {
       // IO6b: session-bootstrap + staleness-check
-      const sessionId = input.trim() || `io6-${Date.now()}`;
+      const sessionId = input.trim() || `io6-${epochMs(epochNow())}`;
 
       const bootstrapResult = await sessionBootstrap(s, {
         prompt: "",
@@ -2397,13 +2412,18 @@ async function cmdSetupHooks(args: string[]) {
     // The two are set TOGETHER here; `clawmem doctor` enforces the same
     // inequality against whatever is installed. A larger already-installed
     // timeout is preserved (never reduced).
-    const { resolveHookBudgetMs, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
+    const { parseHookBudgetConfig, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
     // The budget the timeout is derived FROM is also PERSISTED into the
     // installed command (env prefix below) — otherwise the installer's
     // transient environment sizes the timeout while the installed hook runs
     // under whatever ambient budget it happens to get (codex turn-23
     // finding 4: silent drift in both directions).
-    const installBudgetMs = resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
+    // O1 §2: an UNSUPPORTED budget (above MAX_HOOK_BUDGET_MS) is refused at
+    // install — a pinned unsupported value would refuse every hook run.
+    const budgetConfig = parseHookBudgetConfig(process.env.CLAWMEM_HOOK_BUDGET_MS);
+    if (!budgetConfig.valid) die(`Refusing to install hooks: ${budgetConfig.reason}`);
+    if (budgetConfig.note) console.log(`${c.yellow}!${c.reset} ${budgetConfig.note}`);
+    const installBudgetMs = budgetConfig.effectiveMs;
     const requiredUserPromptTimeoutSec = Math.ceil((STARTUP_ALLOWANCE_MS + installBudgetMs) / 1000);
     const priorUserPromptTimeoutSec = (() => {
       let max = 0;
@@ -3302,33 +3322,58 @@ async function cmdDoctor() {
         // the handler before its own deadlines can act (the internal budget is
         // authoritative; the host timeout is only the outer kill switch).
         try {
-          const { resolveHookBudgetMs, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
-          let installedSec: number | null = null;
-          let installedBudgetMs: number | null = null;
+          const { parseHookBudgetConfig, readInstalledHookBudget, MAX_HOOK_BUDGET_MS, STARTUP_ALLOWANCE_MS } = await import("./hooks/context-surfacing.ts");
+          // Codex migration r1 P5: EVERY installed context-surfacing entry is validated — each runs on
+          // every prompt, so the last one is not the one that matters — and each entry's budget is
+          // read STRUCTURALLY (`readInstalledHookBudget`): the INSTALLED budget is authoritative,
+          // parsed from the command's own prefix assignment, never from this process's ambient
+          // environment (codex turn-23 finding 4) and never through a token regex that keeps quotes.
+          const entries: { command: string; timeoutSec: number | null }[] = [];
           for (const entry of settings.hooks?.["UserPromptSubmit"] ?? []) {
             for (const h of entry.hooks ?? []) {
-              if (h.command?.includes("clawmem") && h.command?.includes("context-surfacing")) {
-                installedSec = typeof h.timeout === "number" ? h.timeout : null;
-                // The INSTALLED budget is authoritative — parsed from the
-                // command's env prefix, never from this process's ambient
-                // environment (codex turn-23 finding 4).
-                const m = /CLAWMEM_HOOK_BUDGET_MS=(\d+)/.exec(h.command ?? "");
-                installedBudgetMs = m ? resolveHookBudgetMs(m[1]) : null;
+              if (typeof h.command === "string" && h.command.includes("clawmem") && h.command.includes("context-surfacing")) {
+                entries.push({ command: h.command, timeoutSec: typeof h.timeout === "number" ? h.timeout : null });
               }
             }
           }
-          const budgetMs = installedBudgetMs ?? resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
-          const budgetSource = installedBudgetMs !== null ? "installed" : "ambient — pre-BUILD-3a install carries no budget; run 'clawmem setup hooks' to pin it";
-          const requiredSec = Math.ceil((STARTUP_ALLOWANCE_MS + budgetMs) / 1000);
-          if (installedSec === null) {
-            console.log(`${c.yellow}!${c.reset} Hook timeout budget: context-surfacing entry has no timeout — run 'clawmem setup hooks' to set host timeout ≥ ${requiredSec}s (startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms)`);
-          } else if (installedSec * 1000 < STARTUP_ALLOWANCE_MS + budgetMs) {
-            console.log(`${c.red}✗${c.reset} Hook timeout budget: host timeout ${installedSec}s < startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource}) — the host kills the hook before its internal deadlines can act. Fix: run 'clawmem setup hooks' (writes ≥ ${requiredSec}s and pins the budget), or lower CLAWMEM_HOOK_BUDGET_MS and re-run setup`);
-            issues++; // a red line must contribute to doctor's failure state (codex turn-23 finding 2)
-          } else {
-            console.log(`${c.green}✓${c.reset} Hook timeout budget: host ${installedSec}s ≥ startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource})`);
+          const multi = entries.length > 1;
+          const effectiveBudgets = new Set<number>();
+          entries.forEach((e, i) => {
+            const tag = multi ? ` [entry ${i + 1}/${entries.length}]` : "";
+            const installed = readInstalledHookBudget(e.command);
+            if (installed.kind === "noncanonical") {
+              console.log(`${c.red}✗${c.reset} Hook budget${tag}: ${installed.detail} — the value the shell passes cannot be verified, so this entry's budget is UNVERIFIED. Fix: re-run 'clawmem setup hooks' (it writes the canonical CLAWMEM_HOOK_BUDGET_MS=<integer> prefix)`);
+              issues++;
+              return;
+            }
+            const budgetConfig = installed.kind === "assigned" ? installed.config : parseHookBudgetConfig(process.env.CLAWMEM_HOOK_BUDGET_MS);
+            const budgetSource = installed.kind === "assigned" ? "installed" : "ambient — pre-BUILD-3a install carries no budget; run 'clawmem setup hooks' to pin it";
+            if (!budgetConfig.valid) {
+              // O1 §2: an unsupported budget is a red line — every context-surfacing
+              // run refuses under it — but the doctor itself never throws.
+              console.log(`${c.red}✗${c.reset} Hook budget${tag}: ${budgetConfig.reason} (${budgetSource}) — the context-surfacing hook REFUSES to run under this value. Fix: set CLAWMEM_HOOK_BUDGET_MS ≤ ${MAX_HOOK_BUDGET_MS} and re-run 'clawmem setup hooks'`);
+              issues++;
+              return;
+            }
+            const budgetMs = budgetConfig.effectiveMs;
+            effectiveBudgets.add(budgetMs);
+            const requiredSec = Math.ceil((STARTUP_ALLOWANCE_MS + budgetMs) / 1000);
+            if (e.timeoutSec === null) {
+              console.log(`${c.yellow}!${c.reset} Hook timeout budget${tag}: context-surfacing entry has no timeout — run 'clawmem setup hooks' to set host timeout ≥ ${requiredSec}s (startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms)`);
+            } else if (e.timeoutSec * 1000 < STARTUP_ALLOWANCE_MS + budgetMs) {
+              console.log(`${c.red}✗${c.reset} Hook timeout budget${tag}: host timeout ${e.timeoutSec}s < startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource}) — the host kills the hook before its internal deadlines can act. Fix: run 'clawmem setup hooks' (writes ≥ ${requiredSec}s and pins the budget), or lower CLAWMEM_HOOK_BUDGET_MS and re-run setup`);
+              issues++; // a red line must contribute to doctor's failure state (codex turn-23 finding 2)
+            } else {
+              console.log(`${c.green}✓${c.reset} Hook timeout budget${tag}: host ${e.timeoutSec}s ≥ startup ${STARTUP_ALLOWANCE_MS}ms + internal budget ${budgetMs}ms (${budgetSource})`);
+            }
+          });
+          if (effectiveBudgets.size > 1) {
+            console.log(`${c.red}✗${c.reset} Hook budget: ${entries.length} installed context-surfacing entries CONFLICT (${[...effectiveBudgets].sort((a, b) => a - b).map(b => `${b}ms`).join(" vs ")}) — every entry runs on every prompt, so the hook executes under more than one budget. Fix: keep ONE entry (re-run 'clawmem setup hooks')`);
+            issues++;
+          } else if (multi) {
+            console.log(`${c.yellow}!${c.reset} Claude Code hooks: ${entries.length} context-surfacing entries are installed — each runs on every prompt (the vault is surfaced once per entry); keep one`);
           }
-        } catch { /* budget check is advisory — never blocks the doctor */ }
+        } catch { /* budget check is advisory — never blocks the doctor (every red line above already counted its issue) */ }
       } else {
         console.log(`${c.yellow}!${c.reset} Claude Code hooks: not installed (run 'clawmem setup hooks')`);
       }
@@ -4208,7 +4253,7 @@ async function cmdMigrate(args: string[]) {
         `${archived.operator_note ? `, note: ${archived.operator_note}` : ""}). Re-run with --apply.`);
       return;
     }
-    const startedAtMs = Date.now();
+    const startedAt = monoNow();
     const runKey = randomUUID();
     // Pessimistic terminal outcome: the row is BORN cli_error and only a
     // successful finalization flips it to cli_ok — a writer lock that kills
@@ -4219,10 +4264,10 @@ async function cmdMigrate(args: string[]) {
     try {
       outcome = restoreRetiredEdge(s.db, edge, { runKey, runId });
     } catch (err) {
-      finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+      finalizeCliCausalRun(s.db, runId, "cli_error", startedAt);
       throw err;
     }
-    finalizeCliCausalRun(s.db, runId, outcome.status === "restored" ? "cli_ok" : "cli_error", startedAtMs);
+    finalizeCliCausalRun(s.db, runId, outcome.status === "restored" ? "cli_ok" : "cli_error", startedAt);
     if (outcome.status === "restored") {
       console.log(`${c.green}Restored${c.reset} causal edge ${edge.sourceId}→${edge.targetId} from the archive.`);
     } else if (outcome.status === "not_archived") {
@@ -4305,7 +4350,7 @@ async function cmdMigrate(args: string[]) {
     return;
   }
 
-  const startedAtMs = Date.now();
+  const startedAt = monoNow();
   const runKey = randomUUID();
   // Pessimistic terminal outcome (same discipline as restore): born cli_error,
   // flipped to cli_ok only by successful finalization — failure representation
@@ -4344,10 +4389,10 @@ async function cmdMigrate(args: string[]) {
       }
     }
   } catch (err) {
-    finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+    finalizeCliCausalRun(s.db, runId, "cli_error", startedAt);
     throw err;
   }
-  finalizeCliCausalRun(s.db, runId, failures > 0 ? "cli_error" : "cli_ok", startedAtMs);
+  finalizeCliCausalRun(s.db, runId, failures > 0 ? "cli_error" : "cli_ok", startedAt);
   if (failures > 0) {
     process.exitCode = 1;
   }
@@ -4567,7 +4612,7 @@ async function cmdLifecycle(args: string[]) {
 async function cmdReflect(args: string[]) {
   const store = getStore();
   const days = parseInt(args[0] || "14");
-  const cutoff = new Date();
+  const cutoff = toDate(epochNow());
   cutoff.setDate(cutoff.getDate() - days);
 
   // §51.1 D13: reflection is about when content was authored, not when it was filed
@@ -4765,7 +4810,7 @@ async function cmdDiary(args: string[]) {
       if (!entry) die("Usage: clawmem diary write <entry text> [-t topic] [-a agent-name]");
 
       const s = getStore();
-      const now = new Date();
+      const now = toDate(epochNow());
       const dateStr = now.toISOString().slice(0, 10);
       const timeStr = now.toISOString().slice(11, 19).replace(/:/g, "");
       const ms = String(now.getMilliseconds()).padStart(3, "0");
@@ -4842,7 +4887,7 @@ async function cmdDiary(args: string[]) {
 async function cmdCurate(_args: string[]) {
   const s = getStore();
   const report: CuratorReport = {
-    timestamp: new Date().toISOString(),
+    timestamp: isoNow(),
     health: { active: 0, archived: 0, forgotten: 0, pinned: 0, snoozed: 0, neverAccessed: 0, embeddingBacklog: 0, infrastructure: "healthy" },
     sweep: { candidates: 0 },
     consolidation: { candidates: 0 },
@@ -4851,7 +4896,7 @@ async function cmdCurate(_args: string[]) {
     actions: [],
   };
 
-  console.log(`${c.bold}ClawMem Curator${c.reset} — ${new Date().toISOString().slice(0, 10)}\n`);
+  console.log(`${c.bold}ClawMem Curator${c.reset} — ${isoNow().slice(0, 10)}\n`);
 
   // Phase 0: Health snapshot
   try {

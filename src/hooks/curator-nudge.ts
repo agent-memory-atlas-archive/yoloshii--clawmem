@@ -7,6 +7,7 @@
  */
 
 import { resolve as pathResolve } from "path";
+import { epochNow, epochMs } from "../clock.ts";
 import { existsSync, readFileSync } from "fs";
 import type { Store } from "../store.ts";
 import { getIndexHealth } from "../store.ts";
@@ -49,7 +50,7 @@ export async function curatorNudge(
     return makeEmptyOutput("curator-nudge");
   }
 
-  const reportAge = Date.now() - new Date(report.timestamp).getTime();
+  const reportAge = epochMs(epochNow()) - new Date(report.timestamp).getTime();
   const reportDays = Math.floor(reportAge / (86400 * 1000));
 
   // If report is stale, just nudge

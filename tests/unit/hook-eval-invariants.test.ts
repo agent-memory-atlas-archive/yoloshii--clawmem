@@ -475,6 +475,18 @@ describe("summarizeFinalization — the machine-decisive reserve criterion (BUIL
   });
 });
 
+describe("vectorLegTiming — the harness-derived timing class against the FROZEN tolerance (O1 §3)", () => {
+  const { vectorLegTiming, VECTOR_DEADLINE_TOLERANCE_MS } = require("../../src/eval/hook-run.ts");
+  it("early below/at 0, on_time up to the tolerance inclusive, late beyond it", () => {
+    expect(vectorLegTiming(-400)).toBe("early");
+    expect(vectorLegTiming(0)).toBe("early");
+    expect(vectorLegTiming(1)).toBe("on_time");
+    expect(vectorLegTiming(VECTOR_DEADLINE_TOLERANCE_MS)).toBe("on_time");
+    expect(vectorLegTiming(VECTOR_DEADLINE_TOLERANCE_MS + 1)).toBe("late");
+    expect(VECTOR_DEADLINE_TOLERANCE_MS).toBe(150); // frozen — never re-fitted (codex rev-6 ruling)
+  });
+});
+
 describe("summarizeVectorDeadline — MAX overshoot per vector invocation vs its OWN deadline (codex t81 P1+P2)", () => {
   const { summarizeVectorDeadline, VECTOR_DEADLINE_TOLERANCE_MS } = require("../../src/eval/hook-run.ts");
 
@@ -484,39 +496,48 @@ describe("summarizeVectorDeadline — MAX overshoot per vector invocation vs its
 
   it("every invocation within its deadline+tol ⇒ adhered true; worst overshoot is the MAX (a negative = finished early)", () => {
     const s = summarizeVectorDeadline([
-      { leg: "primary", over_ms: -400, budget_ms: 900, case: "a", rep: 0 },
-      { leg: "deep", over_ms: 120, budget_ms: 2000, case: "a", rep: 0 },
-      { leg: "prior", over_ms: -50, budget_ms: 400, case: "b", rep: 1 },
+      { leg: "primary", over_ms: -400, budget_ms: 900, case: "a", attempt: 0, rep: 0 },
+      { leg: "deep", over_ms: 120, budget_ms: 2000, case: "a", attempt: 0, rep: 0 },
+      { leg: "prior", over_ms: -50, budget_ms: 400, case: "b", attempt: 0, rep: 1 },
     ]);
     expect(s.adhered).toBe(true);
     expect(s.max_over_ms).toBe(120);
-    expect(s.worst).toEqual({ leg: "deep", case: "a", rep: 0, budget_ms: 2000 });
+    expect(s.worst).toEqual({ leg: "deep", case: "a", attempt: 0, rep: 0, budget_ms: 2000 });
   });
 
   it("a SINGLE late invocation anywhere ⇒ adhered false, and worst names its leg/case/rep/budget (a lower median would have drowned it — the t81 pooling bug)", () => {
     const s = summarizeVectorDeadline([
       // many fast primary reps of other cases...
-      { leg: "primary", over_ms: -300, budget_ms: 900, case: "a", rep: 0 },
-      { leg: "primary", over_ms: -320, budget_ms: 900, case: "b", rep: 0 },
-      { leg: "primary", over_ms: -310, budget_ms: 900, case: "c", rep: 0 },
+      { leg: "primary", over_ms: -300, budget_ms: 900, case: "a", attempt: 0, rep: 0 },
+      { leg: "primary", over_ms: -320, budget_ms: 900, case: "b", attempt: 0, rep: 0 },
+      { leg: "primary", over_ms: -310, budget_ms: 900, case: "c", attempt: 0, rep: 0 },
       // ...and ONE persistently late deep leg on case d.
-      { leg: "deep", over_ms: 2100, budget_ms: 2000, case: "d", rep: 2 },
+      { leg: "deep", over_ms: 2100, budget_ms: 2000, case: "d", attempt: 0, rep: 2 },
     ]);
     expect(s.adhered).toBe(false);                 // MAX = 2100 > tol; a global lower median would be negative and PASS
     expect(s.max_over_ms).toBe(2100);
-    expect(s.worst).toEqual({ leg: "deep", case: "d", rep: 2, budget_ms: 2000 });
+    expect(s.worst).toEqual({ leg: "deep", case: "d", attempt: 0, rep: 2, budget_ms: 2000 });
   });
 
   it("exactly at tolerance adheres; one ms over does not — a per-invocation safety bound", () => {
-    expect(summarizeVectorDeadline([{ leg: "primary", over_ms: VECTOR_DEADLINE_TOLERANCE_MS, budget_ms: 900, case: "a", rep: 0 }]).adhered).toBe(true);
-    expect(summarizeVectorDeadline([{ leg: "primary", over_ms: VECTOR_DEADLINE_TOLERANCE_MS + 1, budget_ms: 900, case: "a", rep: 0 }]).adhered).toBe(false);
+    expect(summarizeVectorDeadline([{ leg: "primary", over_ms: VECTOR_DEADLINE_TOLERANCE_MS, budget_ms: 900, case: "a", attempt: 0, rep: 0 }]).adhered).toBe(true);
+    expect(summarizeVectorDeadline([{ leg: "primary", over_ms: VECTOR_DEADLINE_TOLERANCE_MS + 1, budget_ms: 900, case: "a", attempt: 0, rep: 0 }]).adhered).toBe(false);
+  });
+
+  it("codex migration r2 #6: two ATTEMPTS of the same case + rep are distinct evidence — the worst names its attempt", () => {
+    const s = summarizeVectorDeadline([
+      { leg: "primary", over_ms: 40, budget_ms: 900, case: "a", attempt: 0, rep: 0 },
+      { leg: "primary", over_ms: 310, budget_ms: 900, case: "a", attempt: 1, rep: 0 },
+    ]);
+    expect(s.worst).toEqual({ leg: "primary", case: "a", attempt: 1, rep: 0, budget_ms: 900 });
+    expect(s.adhered).toBe(false);
   });
 
   it("each invocation is judged against its OWN budget (over_ms is already end − that leg's deadline), so mixed budgets never cross-attribute", () => {
     // deep 2000ms budget finished 100ms late; balanced 900ms budget finished early — the deep breach is not masked by the balanced budget.
     const s = summarizeVectorDeadline([
-      { leg: "deep", over_ms: 300, budget_ms: 2000, case: "a", rep: 0 },
-      { leg: "primary", over_ms: -10, budget_ms: 900, case: "a", rep: 0 },
+      { leg: "deep", over_ms: 300, budget_ms: 2000, case: "a", attempt: 0, rep: 0 },
+      { leg: "primary", over_ms: -10, budget_ms: 900, case: "a", attempt: 0, rep: 0 },
     ]);
     expect(s.worst!.budget_ms).toBe(2000);         // the OFFENDING leg's own budget, never a run-wide max
     expect(s.adhered).toBe(false);
@@ -566,23 +587,38 @@ describe("summarizeFinalizationBreakdown — WHERE the reserve is spent (BUILD-3
 
 describe("summarizeBudgetElapsed — total handler elapsed vs the internal budget (codex turn-24 F4)", () => {
   const { summarizeBudgetElapsed, BUDGET_ELAPSED_TOLERANCE_MS } = require("../../src/eval/hook-run.ts");
-  const { HOOK_BUDGET_MS } = require("../../src/hooks/context-surfacing.ts");
+  const { assertHookBudgetConfig } = require("../../src/hooks/context-surfacing.ts");
+  const { duration } = require("../../src/clock.ts");
+  const RUN_BUDGET = assertHookBudgetConfig(); // the run's CAPTURED budget (codex migration r1 P4)
+  const HOOK_BUDGET_MS: number = RUN_BUDGET;
 
   it("no reps ⇒ within null", () => {
-    const s = summarizeBudgetElapsed([]);
+    const s = summarizeBudgetElapsed([], RUN_BUDGET);
     expect(s.within).toBeNull();
     expect(s.max_ms).toBeNull();
   });
 
   it("max within budget + tolerance ⇒ within true", () => {
-    const s = summarizeBudgetElapsed([100, HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS]);
+    const s = summarizeBudgetElapsed([100, HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS], RUN_BUDGET);
     expect(s.within).toBe(true);
   });
 
   it("a single rep past budget + tolerance ⇒ within false", () => {
-    const s = summarizeBudgetElapsed([100, HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS + 1]);
+    const s = summarizeBudgetElapsed([100, HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS + 1], RUN_BUDGET);
     expect(s.within).toBe(false);
     expect(s.max_ms).toBe(HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS + 1);
+  });
+
+  it("codex migration r1 P4: judges the budget it is GIVEN — the run's captured value — and never re-reads the environment", () => {
+    const prev = process.env.CLAWMEM_HOOK_BUDGET_MS;
+    try {
+      process.env.CLAWMEM_HOOK_BUDGET_MS = "12000"; // drifted AFTER capture
+      const s = summarizeBudgetElapsed([7000], duration(6000));
+      expect(s.budget_ms).toBe(6000);
+      expect(s.within).toBe(false); // judged against the executed 6000, not the drifted 12000
+    } finally {
+      if (prev === undefined) delete process.env.CLAWMEM_HOOK_BUDGET_MS; else process.env.CLAWMEM_HOOK_BUDGET_MS = prev;
+    }
   });
 });
 

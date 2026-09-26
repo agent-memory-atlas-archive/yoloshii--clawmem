@@ -64,6 +64,25 @@ describe("setup hooks — host timeout derived from the internal budget (BUILD-3
     }
   });
 
+  it("O1 §2: an UNSUPPORTED budget (above the maximum) is REFUSED at install — nothing is written, the reason names the value", () => {
+    const home = mkdtempSync(join(tmpdir(), "clawmem-sethooks-max-"));
+    try {
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      const r = runSetupHooks(home, "3e4");
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain("Refusing to install hooks");
+      expect(r.stderr).toContain("30000ms");
+      expect(existsSync(join(home, ".claude", "settings.json"))).toBe(false);
+      // Control: the boundary value itself installs and pins the floored budget.
+      const ok = runSetupHooks(home, "25000.9");
+      expect(ok.exitCode).toBe(0);
+      expect(readUserPromptEntry(home).command).toContain("CLAWMEM_HOOK_BUDGET_MS=25000 ");
+      expect(readUserPromptTimeout(home)).toBe(Math.ceil((STARTUP_ALLOWANCE_MS + 25000) / 1000));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("never reduces: an installed 30s clawmem timeout survives a re-install under the default budget", () => {
     const home = mkdtempSync(join(tmpdir(), "clawmem-sethooks-keep-"));
     try {

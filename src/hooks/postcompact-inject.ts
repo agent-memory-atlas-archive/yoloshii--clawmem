@@ -7,6 +7,7 @@
  */
 
 import { existsSync, readFileSync } from "fs";
+import { isoNow, toDate, epochNow } from "../clock.ts";
 import { join, resolve } from "path";
 import {
   type HookInput,
@@ -93,7 +94,7 @@ export async function postcompactInject(
   // Section 2: Recent decisions from vault (last 7 days)
   if (totalTokens < MAX_TOKEN_BUDGET) {
     try {
-      const cutoff = new Date();
+      const cutoff = toDate(epochNow());
       cutoff.setDate(cutoff.getDate() - 7);
       // §51.1 D13: content-currency caller — order, cutoff, and display on effectiveAt
       const recentDocs = store.getDocumentsByType("decision", 5, { orderBy: "effective" });
@@ -127,7 +128,7 @@ export async function postcompactInject(
   // Section 2b: Recent antipatterns (last 7 days)
   if (totalTokens < MAX_TOKEN_BUDGET) {
     try {
-      const cutoff = new Date();
+      const cutoff = toDate(epochNow());
       cutoff.setDate(cutoff.getDate() - 7);
       const recentAnti = store.getDocumentsByType("antipattern", 3, { orderBy: "effective" });
       const filteredAnti = recentAnti.filter(
@@ -213,7 +214,7 @@ export async function postcompactInject(
   try {
     store.insertUsage({
       sessionId: input.sessionId || "unknown",
-      timestamp: new Date().toISOString(),
+      timestamp: isoNow(),
       hookName: "postcompact-inject",
       injectedPaths: [],
       estimatedTokens: estimateTokens(context),

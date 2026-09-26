@@ -22,6 +22,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { monoNow, deadlineAfter, duration, isExpired, isoNow, toDate, epochNow, epochBefore } from "./clock.ts";
 import { pruneJudgeRuns } from "./judge-audit.ts";
 import type { LlamaCpp } from "./llm.ts";
 import {
@@ -55,7 +56,7 @@ export interface HeavyMaintenanceConfig {
   leaseTtlMs?: number;
   /** Worker lease name. Override only in tests (default "heavy-maintenance"). */
   workerName?: string;
-  /** Clock injection for unit tests — defaults to `() => new Date()`. */
+  /** Clock injection for unit tests — defaults to `() => toDate(epochNow())`. */
   clock?: () => Date;
 }
 
@@ -150,7 +151,7 @@ export function insertMaintenanceRun(
     metrics?: Record<string, unknown> | null;
   },
 ): number {
-  const startedAt = row.startedAt ?? new Date().toISOString();
+  const startedAt = row.startedAt ?? isoNow();
   const result = store.db.prepare(
     `INSERT INTO maintenance_runs
       (lane, phase, status, reason, selected_count, processed_count,
@@ -208,7 +209,7 @@ function finalizeMaintenanceRun(
     patch.updatedCount ?? 0,
     patch.rejectedCount ?? 0,
     patch.nullCallCount ?? 0,
-    patch.finishedAt ?? new Date().toISOString(),
+    patch.finishedAt ?? isoNow(),
     patch.metrics ? JSON.stringify(patch.metrics) : null,
     id,
   );
@@ -259,7 +260,7 @@ export function countRecentContextUsages(
   store: Store,
   minutes: number = 10,
 ): number {
-  const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+  const cutoff = toDate(epochBefore(epochNow(), duration(minutes * 60 * 1000))).toISOString();
   const row = store.db.prepare(
     `SELECT COUNT(*) AS cnt FROM context_usage WHERE timestamp > ?`,
   ).get(cutoff) as { cnt: number } | undefined;
@@ -373,7 +374,7 @@ export async function runHeavyMaintenanceTick(
 ): Promise<MaintenanceRunSummary[]> {
   const merged = { ...DEFAULT_CONFIG, ...cfg };
   const workerName = cfg.workerName ?? DEFAULT_WORKER_NAME;
-  const clock = cfg.clock ?? (() => new Date());
+  const clock = cfg.clock ?? (() => toDate(epochNow()));
   const results: MaintenanceRunSummary[] = [];
 
   const now = clock();
@@ -384,7 +385,7 @@ export async function runHeavyMaintenanceTick(
       phase: "gate",
       status: "skipped",
       reason: gate.reason ?? "unknown",
-      finishedAt: new Date().toISOString(),
+      finishedAt: isoNow(),
     });
     results.push(loadMaintenanceRun(store, skippedId));
     return results;
@@ -502,7 +503,7 @@ export async function runHeavyMaintenanceTick(
       phase: "gate",
       status: "skipped",
       reason: "lease_unavailable",
-      finishedAt: new Date().toISOString(),
+      finishedAt: isoNow(),
     });
     results.push(loadMaintenanceRun(store, skippedId));
   }
@@ -582,8 +583,8 @@ export function startHeavyMaintenanceWorker(
       heavyTimer = null;
       console.log("[heavy-lane] Worker stop signaled — draining in-flight tick");
     }
-    const deadline = Date.now() + HEAVY_STOP_DRAIN_TIMEOUT_MS;
-    while (heavyRunning && Date.now() < deadline) {
+    const deadline = deadlineAfter(monoNow(), duration(HEAVY_STOP_DRAIN_TIMEOUT_MS));
+    while (heavyRunning && !isExpired(deadline)) {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
     if (heavyRunning) {

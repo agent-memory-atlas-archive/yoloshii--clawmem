@@ -11,6 +11,7 @@
  */
 
 import { readFileSync } from "fs";
+import { isoNow } from "../clock.ts";
 import type { Store } from "../store.ts";
 import { parseGoldFile, resolveGoldExamples } from "./gold.ts";
 import { computeDocMetrics } from "./metrics.ts";
@@ -89,7 +90,7 @@ function readClawmemVersion(): string | null {
 export async function runEval(opts: RunEvalOptions): Promise<RunEvalResult> {
   const limit = opts.limit ?? 10;
   const minExamples = opts.minExamples ?? 30;
-  const createdAt = new Date().toISOString();
+  const createdAt = isoNow();
   const runId = `${createdAt.replace(/[:.]/g, "-")}-${opts.profile}`;
 
   const examples = parseGoldFile(opts.goldPath); // throws GoldFileError on any bad line

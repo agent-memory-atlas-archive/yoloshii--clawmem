@@ -13,6 +13,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { monoNow, deadlineAfter, duration, isExpired, isoNow, epochNow, epochMs } from "./clock.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
@@ -273,8 +274,8 @@ export async function stopConsolidationWorker(): Promise<void> {
     consolidationTimer = null;
     console.log("[consolidation] Worker stop signaled — draining in-flight tick");
   }
-  const deadline = Date.now() + STOP_DRAIN_TIMEOUT_MS;
-  while (isRunning && Date.now() < deadline) {
+  const deadline = deadlineAfter(monoNow(), duration(STOP_DRAIN_TIMEOUT_MS));
+  while (isRunning && !isExpired(deadline)) {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
   }
   if (isRunning) {
@@ -1022,7 +1023,7 @@ function updateTrends(store: Store): void {
     trend: string; created_at: string; updated_at: string;
   }[];
 
-  const now = Date.now();
+  const now = epochMs(epochNow());
   const DAY_MS = 86400000;
 
   for (const obs of observations) {
@@ -1165,7 +1166,7 @@ Return ONLY the JSON array. /no_think`;
 
   stats.drafted = parsed.length;
 
-  const timestamp = new Date().toISOString();
+  const timestamp = isoNow();
   const dateStr = timestamp.slice(0, 10);
 
   for (const deduction of parsed) {

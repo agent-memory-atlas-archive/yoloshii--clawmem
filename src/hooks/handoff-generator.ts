@@ -7,6 +7,7 @@
  */
 
 import type { Store } from "../store.ts";
+import { toDate, epochNow, epochMs } from "../clock.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -39,8 +40,8 @@ export async function handoffGenerator(
   const messages = readTranscript(transcriptPath, 200);
   if (messages.length < MIN_MESSAGES_FOR_HANDOFF) return makeEmptyOutput("handoff-generator");
 
-  const sessionId = input.sessionId || `session-${Date.now()}`;
-  const now = new Date();
+  const sessionId = input.sessionId || `session-${epochMs(epochNow())}`;
+  const now = toDate(epochNow());
   const timestamp = now.toISOString();
   const dateStr = timestamp.slice(0, 10);
 

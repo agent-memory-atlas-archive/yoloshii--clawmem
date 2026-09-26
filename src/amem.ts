@@ -6,6 +6,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { isoNow } from "./clock.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
 import type { Store } from "./store.ts";
@@ -781,7 +782,7 @@ Include all ${neighbors.length} neighbors in your response.`;
 
     // Insert links into memory_relations
     let linksCreated = 0;
-    const now = new Date().toISOString();
+    const now = isoNow();
     const linkedTargetIndexes = new Set<number>();
 
     for (const link of parsed) {

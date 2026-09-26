@@ -21,6 +21,7 @@
  * contract.
  */
 import { writeFileSync, mkdirSync } from "fs";
+import { isoNow } from "../clock.ts";
 import { join } from "path";
 import { parseBaselineReport, HookEvalIntegrityError, assertReplicatedMemberIdentity, ACCEPTANCE_AXIS_METRICS, type HookRunReport, type AcceptanceAxis, deriveValidBasisByStratum } from "./hook-run.ts";
 import { validateIdentityShape, PAIR_TREATMENTS, type RunIdentity, type PairTreatment } from "./run-identity.ts";
@@ -668,7 +669,7 @@ export function aggregateReplicatedRuns(members: { dir: string; report: HookRunR
 
   return {
     schema: "replicated-aggregate-v1",
-    created_at: new Date().toISOString(),
+    created_at: isoNow(),
     n: summaries.length,
     pilot,
     members: summaries,

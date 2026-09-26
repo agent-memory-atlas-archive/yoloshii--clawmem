@@ -37,7 +37,9 @@ import { createHash } from "crypto";
 import type { Store } from "../store.ts";
 import { resolveStore, DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL } from "../store.ts";
 import { normalizeRemoteLlmReasoningEffort, normalizeRemoteLlmNoThink } from "../llm.ts";
-import { contextSurfacing, RERANK_REQUEST_REV, HOOK_BUDGET_MS, DEFAULT_HOOK_BUDGET_MS, FINALIZATION_RESERVE_MS , resolveEvalNow } from "../hooks/context-surfacing.ts";
+import { contextSurfacing, RERANK_REQUEST_REV, assertHookBudgetConfig, DEFAULT_HOOK_BUDGET_MS, FINALIZATION_RESERVE_MS , resolveEvalNow } from "../hooks/context-surfacing.ts";
+import { evidenceMs, elapsed, monoNow, isoNow, epochNow, epochMs, type DurationMs } from "../clock.ts";
+import type { VectorLegDeadlineRecord } from "./hook-trace.ts";
 import { RERANK_LANE_WEIGHT, FUSION_POLICY_REV, RERANK_DEGENERACY_GATE_ACTIVE, ADMISSION_POLICY_ACTIVE, ADMISSION_POLICY_REV } from "../hooks/surfacing-fusion.ts";
 import { spawnEvalVectorDaemon, EvalVectorDaemonError, type EvalVectorDaemon, type EvalVecPrewarm } from "./vec-daemon-child.ts";
 import { daemonPing } from "../vector-daemon.ts";
@@ -190,7 +192,7 @@ export interface RunHookEvalOptions {
    * `finalization_breakdown` and the top-substage naming in the reserve gate
    * reason, so the report-level wiring is a tested product boundary.
    */
-  _testTimingSamples?: { finalization?: number[]; totals?: number[]; finalizationSubstages?: Record<string, number>[]; vectorLegs?: { leg: "primary" | "prior" | "deep"; over_ms: number; budget_ms: number; case: string; rep: number }[] };
+  _testTimingSamples?: { finalization?: number[]; totals?: number[]; finalizationSubstages?: Record<string, number>[]; vectorLegs?: VectorLegRunRecord[] };
   /**
    * TEST-ONLY seam, the shape codex specified in turn 30 (finding 3): a
    * transformer applied to each attempt's audit immediately after
@@ -330,7 +332,8 @@ export const OWNERSHIP_PING_TIMEOUT_MS = 30_000;
 
 /** The identity form of a resolved VectorExecSpec. `response_protocol` (codex t84 CR-5): this
  * build's client always REQUESTS hydrated-v1 on every daemon leg, and the runner REFUSES any
- * rep whose ok leg was served raw-hit (a legacy daemon on the socket) — so a completed
+ * rep whose ok leg was served raw-hit (a raw request answered on the socket — defense in depth: a
+ * legacy daemon's unattested raw answer is already `skew` since O1 §4) — so a completed
  * daemon-required run's identity truthfully records "hydrated-v1". */
 export function vectorExecIdentity(spec: VectorExecSpec): VectorExecIdentity {
   return spec.protocol === "daemon-required"
@@ -1119,7 +1122,17 @@ export interface HookRunReport {
    * t81 P1+P2 — a per-invocation safety bound, not a typical-case statistic);
    * `worst` names the offending leg/case/rep and its own budget. null = no rep.
    */
-  vector_deadline: { samples: number; max_over_ms: number | null; worst: { leg: "primary" | "prior" | "deep"; case: string; rep: number; budget_ms: number } | null; tolerance_ms: number; adhered: boolean | null };
+  vector_deadline: { samples: number; max_over_ms: number | null; worst: { leg: "primary" | "prior" | "deep"; case: string; attempt: number; rep: number; budget_ms: number } | null; tolerance_ms: number; adhered: boolean | null };
+  /**
+   * O1 §3 (the evidence contract — the fix for what cost the arc a day): EVERY rep's per-leg
+   * timing record, keyed `case` + `rep`, persisted in full — not only the rep-0 trace stream.
+   * Refusals a1/a2 had their worst breach in reps 1 and 2, whose traces were discarded, so
+   * attribution was unverifiable. Each record carries the monotonic `over_ms` / `budget_ms`, the
+   * span on both clocks (`clock_skew_ms` exposes a realtime STEP), the orthogonal `terminal_kind`
+   * × `status`, the harness-derived `timing` against the frozen tolerance, and the run's
+   * `deadline_protocol` identity (null until O1 activation). Empty when no vector leg completed.
+   */
+  vector_leg_records: VectorLegPersistedRecord[];
   /**
    * BUILD-4 turn-54 (codex turn-53 ruling R6): per-basis case counts DERIVED
    * from the case rows' admission_basis — a single recomputable source, so
@@ -1402,7 +1415,33 @@ const EVAL_ENV_KEYS = [
   "CLAWMEM_PROFILE", "CLAWMEM_HOOK_DEDUP_WINDOW_SEC", "CLAWMEM_SESSION_FOCUS",
   "CLAWMEM_SURFACE_SECONDARY_VAULTS", "CLAWMEM_VAULTS",
   "CLAWMEM_PRIOR_VECTOR_INPROC", "CLAWMEM_VECTOR_DAEMON_REQUIRED",
+  // Codex migration r1 P4: the budget the run executed under is part of the
+  // transaction — restored at run end whatever a case hook did to it.
+  "CLAWMEM_HOOK_BUDGET_MS",
 ] as const;
+
+/**
+ * Codex migration r1 P4: ONE run executes, identifies and judges ONE accepted
+ * budget. The handler keeps its single path to a budget (it reads the
+ * environment through `assertHookBudgetConfig`), so the evaluator proves the
+ * environment still resolves the budget captured at run start IMMEDIATELY
+ * before every handler invocation — no await separates this check from the
+ * handler's own read — and refuses the run on any drift, before that case is
+ * scored.
+ */
+function assertRunBudgetUnchanged(runBudget: DurationMs, where: string): void {
+  let current: DurationMs;
+  try {
+    current = assertHookBudgetConfig();
+  } catch (e) {
+    throw new HookEvalIntegrityError(`CLAWMEM_HOOK_BUDGET_MS became unsupported mid-run (${where}): ${(e as Error).message} — the run is REFUSED`);
+  }
+  if (evidenceMs(current) !== evidenceMs(runBudget)) {
+    throw new HookEvalIntegrityError(
+      `CLAWMEM_HOOK_BUDGET_MS changed mid-run (${where}): the run started under ${evidenceMs(runBudget)}ms and the environment now resolves ${evidenceMs(current)}ms — one run executes, identifies and judges ONE budget; the run is REFUSED`,
+    );
+  }
+}
 
 export async function runHookEval(opts: RunHookEvalOptions): Promise<RunHookEvalResult> {
   // Codex t77 F1: the evaluator's environment is a TRANSACTION. Every env
@@ -1426,11 +1465,17 @@ export async function runHookEval(opts: RunHookEvalOptions): Promise<RunHookEval
 
 async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHookEvalResult> {
   assertEvalNowConfig();
+  // O1 §2: an unsupported hook budget refuses the RUN before any case is
+  // scored — the handler would throw mid-rep otherwise, and a run under an
+  // unsupported budget is not a measurable contract. Codex migration r1 P4:
+  // the accepted value is CAPTURED — the identity, the budget summary and the
+  // per-invocation drift check all use this one value.
+  const runBudget = assertHookBudgetConfig();
   const limit = opts.limit ?? 10;
   const budgetMs = opts.budgetMs ?? 8000;
   const minExamples = opts.minExamples ?? 30;
   const latencyReps = Math.max(1, Math.floor(opts.latencyReps ?? 3));
-  const createdAt = new Date().toISOString();
+  const createdAt = isoNow();
   const runId = `${createdAt.replace(/[:.]/g, "-")}-hook`;
   const store = opts.store;
 
@@ -1725,7 +1770,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
       }
       // Fresh created_at keeps injected rows clear of setCachedResult's
       // newest-1000 opportunistic prune.
-      const stamp = new Date().toISOString();
+      const stamp = isoNow();
       const ins = store.db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`);
       for (const r of opts.expansionFreeze.rows) ins.run(r.hash, r.result, stamp);
     }
@@ -1766,7 +1811,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
   // Codex t80 P1: per-rep PRIMARY vector-leg wall time (trace.timings.vectorMs)
   // with the profile's declared vectorTimeout, for vector-exercising reps —
   // the measured evidence that the daemon-required deadline actually held.
-  const allVectorLegs: { leg: "primary" | "prior" | "deep"; over_ms: number; budget_ms: number; case: string; rep: number }[] = [];
+  const allVectorLegs: VectorLegRunRecord[] = [];
   // BUILD-3d.4 (codex turn-47 finding 2): per-substage finalization breakdown
   // across every escalated rep, so the report shows WHERE the reserve is spent
   // (filters/enrich/scoring/ordering/buildContext/inject/facts/tail) instead of
@@ -1833,8 +1878,8 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
       );
     }
     // Codex t84: capability attestation — the identity records response_protocol "hydrated-v1",
-    // so the child must ATTEST it can serve that protocol; a daemon that cannot would silently
-    // serve the raw-hit execution instead (caught per-rep too, but refuse at the ping).
+    // so the child must ATTEST it can serve that protocol; a daemon that cannot would answer the
+    // hydrated legs with raw hits — `skew` per leg since O1 (caught per-rep too, but refuse at the ping).
     if (!pong.protocols.includes("hydrated-v1")) {
       throw new HookEvalIntegrityError(
         `vector daemon ownership check failed ${when}: child pid ${pong.pid} does not attest the hydrated-v1 response protocol (advertised: ${pong.protocols.join(", ") || "none"}) — the daemon-required run's identity is response_protocol "hydrated-v1"; the run is REFUSED`
@@ -1914,7 +1959,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
         const sessionId = `eval-hook-${runId}-${index}-a${attempt}-r${rep}`;
         // Seed priors OLDEST-FIRST so the newest prior gets the highest row
         // id (the lookback query orders by id DESC).
-        const nowMs = Date.now();
+        const nowMs = epochMs(epochNow());
         for (let p = example.priors.length - 1; p >= 0; p--) {
           const prior = example.priors[p]!;
           store.insertUsage({
@@ -1935,10 +1980,11 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
         // the required protocol) refuses the run — a rep measured without
         // the daemon is not the daemon-required protocol.
         await assertDaemonOwned(`before case ${example.id} rep ${rep}`);
-        const t0 = performance.now();
+        assertRunBudgetUnchanged(runBudget, `case ${example.id} rep ${rep}`); // P4: synchronous up to the handler's own budget read
+        const t0 = monoNow();
         try {
           await contextSurfacing(store, { prompt: example.prompt, sessionId }, { trace: repTrace });
-          repElapsed.push(performance.now() - t0);
+          repElapsed.push(evidenceMs(elapsed(t0)));
           if (evalDaemon) {
             const lost = (repTrace.vectorLegs ?? []).filter(l => l.path === "absent");
             if (lost.length > 0) {
@@ -1946,13 +1992,23 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
                 `vector daemon lost during case ${example.id} rep ${rep}: ${lost.map(l => l.leg).join(", ")} leg(s) found no daemon on ${evalDaemon.sockPath} (child pid ${evalDaemon.pid} ${evalDaemon.alive() ? "still alive" : `exited ${evalDaemon.exitCode()}`}) — the daemon-required protocol was not executed; the run is REFUSED`
               );
             }
+            // O1 §4: a leg answered WITHOUT the deadline attestation ran under NO daemon-side
+            // deadline — a pre-O1 daemon on this vault's socket. Like `absent`, it is not the
+            // daemon-required protocol; refuse, never mislabel.
+            const skew = (repTrace.vectorLegs ?? []).filter(l => l.path === "skew");
+            if (skew.length > 0) {
+              throw new HookEvalIntegrityError(
+                `vector daemon on ${evalDaemon.sockPath} answered ${skew.map(l => l.leg).join(", ")} leg(s) without attesting deadline-rel-v1 during case ${example.id} rep ${rep} (child pid ${evalDaemon.pid}) — a daemon that ignores the relative budget is not the daemon-required protocol; the run is REFUSED`
+              );
+            }
             // Codex t84 CR-5: the identity records response_protocol "hydrated-v1" — an ok leg
-            // served RAW HITS (a legacy daemon answering this vault's socket) means a DIFFERENT
+            // served RAW HITS (a non-hydrated request; a legacy daemon's unattested raw answer is
+            // already `skew` since O1 §4, so this is defense in depth) means a DIFFERENT
             // execution (synchronous client-side hydrate) was measured; refuse, never mislabel.
             const rawHit = (repTrace.vectorLegs ?? []).filter(l => l.path === "ok" && l.protocol !== "hydrated-v1");
             if (rawHit.length > 0) {
               throw new HookEvalIntegrityError(
-                `daemon answered ${rawHit.map(l => l.leg).join(", ")} leg(s) with the raw-hit protocol during case ${example.id} rep ${rep} — the run's identity is vector_exec.response_protocol "hydrated-v1", so a raw-hit execution (legacy daemon on ${evalDaemon.sockPath}?) is a DIFFERENT measured contract; the run is REFUSED`
+                `daemon answered ${rawHit.map(l => l.leg).join(", ")} leg(s) with the raw-hit protocol during case ${example.id} rep ${rep} — the run's identity is vector_exec.response_protocol "hydrated-v1", so a raw-hit execution (a non-hydrated request answered on ${evalDaemon.sockPath}) is a DIFFERENT measured contract; the run is REFUSED`
               );
             }
             await assertDaemonOwned(`after case ${example.id} rep ${rep}`);
@@ -1961,15 +2017,16 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
           // EVERY repetition — rep-0-only measurement let an undersized
           // reserve hide in the discarded reps.
           if (typeof repTrace.timings.finalizationMs === "number") allFinalizations.push(repTrace.timings.finalizationMs);
-          // Codex t80 P1: the PRIMARY vector leg's wall time (scan + client
-          // hydrate) vs its profile budget — vectorMs is stamped only when the
-          // profile exercised the vector leg. A daemon-required run whose
-          // reported leg blew this budget has an UNMEASURED latency deadline.
-          // Codex t81 P1+P2: EVERY completed vector invocation (primary/prior/deep),
-          // each against its OWN measured deadline, tagged with case+rep so the
-          // MAX-overshoot gate can name the offending invocation.
+          // Codex t80 P1 → O1: the PRIMARY vector leg's MONOTONIC elapsed time
+          // (vectorMs, stamped only when the profile exercised the vector leg;
+          // under hydrated-v1 no client hydrate runs inside it). Codex t81
+          // P1+P2 + O1 §3: EVERY completed vector invocation (primary/prior/
+          // deep) is recorded against its OWN monotonic deadline, keyed case +
+          // attempt + rep, and the MAX overshoot drives the HARD
+          // vector_deadline_ok trust gate (codex t82 P1) — a breach FAILS the
+          // member; it is never a waivable or "unmeasured" latency axis.
           for (const d of repTrace.vectorLegDeadlines ?? []) {
-            allVectorLegs.push({ leg: d.leg, over_ms: d.over_ms, budget_ms: d.budget_ms, case: example.id, rep });
+            allVectorLegs.push({ ...d, case: example.id, attempt, rep });
           }
           if (repTrace.timings.finalizationSubstages) allFinalizationSubstages.push(repTrace.timings.finalizationSubstages);
           if (typeof repTrace.timings.totalMs === "number") allTotals.push(repTrace.timings.totalMs);
@@ -2236,7 +2293,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
     // BUILD-3a: the handler's effective internal budget — a budget difference
     // changes the escalation/rerank windows, so budget arms self-identify
     // (same class as the weight: codex turn-17 finding 1).
-    hook_budget_ms: HOOK_BUDGET_MS,
+    hook_budget_ms: evidenceMs(runBudget), // P4: the captured budget every rep executed under
     // BUILD-4 turn-55 (codex turn-54 finding 3): the EFFECTIVE frozen
     // evaluation clock (null = wall clock) — recorded through the SAME
     // resolver the handler's composite scoring consults, so the identity
@@ -2596,7 +2653,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
   // Codex turn-24 finding 4 (last clause): total handler elapsed is gated
   // against the internal budget — the budget is the CONTRACT, not advice.
   // Small tolerance absorbs timer granularity only.
-  const budgetElapsed = summarizeBudgetElapsed(allTotals);
+  const budgetElapsed = summarizeBudgetElapsed(allTotals, runBudget);
   // Codex t77 F4: the budget gate carries authoritative pass/fail semantics
   // ONLY under an authoritative latency protocol. Under in-process execution
   // on vector-exercising profiles neither direction establishes the daemon-
@@ -2625,7 +2682,7 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
   const vectorDeadlineOk: boolean | null = budgetAuthoritative ? vectorDeadline.adhered : null;
   if (vectorDeadlineOk === false) {
     gateReasons.push(
-      `measured vector deadline did NOT hold: the ${vdWorst?.leg} leg (case ${vdWorst?.case}, rep ${vdWorst?.rep}) finished ${vectorDeadline.max_over_ms}ms past its ${vdWorst?.budget_ms}ms deadline — the MAX overshoot across ${vectorDeadline.samples} vector invocation(s) (tolerance ${vectorDeadline.tolerance_ms}ms). A per-request deadline is a separate contract from the whole-handler budget: the member FAILS trust (codex t82 P1); this is not a latency-axis waiver.`
+      `measured vector deadline did NOT hold: the ${vdWorst?.leg} leg (case ${vdWorst?.case}, attempt ${vdWorst?.attempt}, rep ${vdWorst?.rep}) finished ${vectorDeadline.max_over_ms}ms past its ${vdWorst?.budget_ms}ms deadline — the MAX overshoot across ${vectorDeadline.samples} vector invocation(s) (tolerance ${vectorDeadline.tolerance_ms}ms). A per-request deadline is a separate contract from the whole-handler budget: the member FAILS trust (codex t82 P1); this is not a latency-axis waiver.`
     );
   }
   const trustPass = gateReasons.length === 0;
@@ -2679,6 +2736,8 @@ async function runHookEvalTransaction(opts: RunHookEvalOptions): Promise<RunHook
     finalization,
     finalization_breakdown: finalizationBreakdown,
     vector_deadline: vectorDeadline,
+    // O1 §3: every rep's records, in full, with the harness-derived timing class.
+    vector_leg_records: allVectorLegs.map(r => ({ ...r, timing: vectorLegTiming(r.over_ms), deadline_protocol: identity.deadline_protocol ?? null })),
     admission_basis_counts: admissionBasisCounts,
     budget_elapsed: budgetElapsed,
     vector_exec: vectorExecReport,
@@ -2847,19 +2906,39 @@ export const BUDGET_ELAPSED_TOLERANCE_MS = 50;
  * primary/prior/deep leg may run slightly past its declared deadline on timer
  * granularity + IPC without the daemon contract being violated. Wider than
  * the budget tolerance because a leg legitimately spends its whole timeout
- * PLUS the client hydrate.
+ * PLUS the bounded per-line decode of the daemon's answer (under hydrated-v1
+ * hydration runs daemon-side; the pre-t84 client hydrate is gone).
+ *
+ * O1 §3: `over_ms` is measured on the MONOTONIC clock — finish minus the leg's
+ * own monotonic deadline. The value is FROZEN at 150 ms and was NOT re-fitted
+ * against post-migration data: monotonic subtraction RESTORES the metric this
+ * tolerance always meant (milliseconds of lag) rather than redefining it —
+ * wall-clock sampling was the contamination, not the definition. The five
+ * rerun draws validate the migration against it; they never tune it.
  */
 export const VECTOR_DEADLINE_TOLERANCE_MS = 150;
+
+/** O1 §3: one vector invocation's record as the harness collects it — the trace record keyed by case + ATTEMPT + rep
+ * (codex migration r2 #6: the pair gate re-scores a case under a new attempt, and every attempt's legs stay evidence —
+ * case + rep alone would give two attempts indistinguishable keys while both feed the trust gate). */
+export type VectorLegRunRecord = VectorLegDeadlineRecord & { case: string; attempt: number; rep: number };
+/** O1 §3: the persisted form — plus the harness-derived timing class and the run's deadline-protocol identity. */
+export type VectorLegPersistedRecord = VectorLegRunRecord & { timing: VectorLegTiming; deadline_protocol: string | null };
+/** `early` = finished before its deadline; `on_time` = past it but within the frozen tolerance; `late` = beyond it. */
+export type VectorLegTiming = "early" | "on_time" | "late";
+export function vectorLegTiming(over_ms: number): VectorLegTiming {
+  return over_ms <= 0 ? "early" : over_ms <= VECTOR_DEADLINE_TOLERANCE_MS ? "on_time" : "late";
+}
 /**
  * Did the measured per-invocation vector deadline hold? Each sample is ONE
- * primary/prior/deep vector invocation: its overshoot past its OWN absolute
- * deadline (over_ms, client hydrate included) and the budget it ran under.
+ * primary/prior/deep vector invocation: its MONOTONIC overshoot past its OWN
+ * deadline (over_ms) and the budget it ran under.
  * `adhered` is judged on the MAX overshoot across every invocation (codex t81
  * P1): a request deadline is a per-invocation safety bound, not a typical-case
  * statistic — one late invocation anywhere breaks adherence, and no warm-up
  * rep may hide the cold first request. null adhered = no invocation to judge.
  */
-export function summarizeVectorDeadline(samples: { leg: "primary" | "prior" | "deep"; over_ms: number; budget_ms: number; case: string; rep: number }[]): { samples: number; max_over_ms: number | null; worst: { leg: "primary" | "prior" | "deep"; case: string; rep: number; budget_ms: number } | null; tolerance_ms: number; adhered: boolean | null } {
+export function summarizeVectorDeadline(samples: { leg: "primary" | "prior" | "deep"; over_ms: number; budget_ms: number; case: string; attempt: number; rep: number }[]): { samples: number; max_over_ms: number | null; worst: { leg: "primary" | "prior" | "deep"; case: string; attempt: number; rep: number; budget_ms: number } | null; tolerance_ms: number; adhered: boolean | null } {
   if (samples.length === 0) {
     return { samples: 0, max_over_ms: null, worst: null, tolerance_ms: VECTOR_DEADLINE_TOLERANCE_MS, adhered: null };
   }
@@ -2873,20 +2952,23 @@ export function summarizeVectorDeadline(samples: { leg: "primary" | "prior" | "d
   return {
     samples: samples.length,
     max_over_ms: worst.over_ms,
-    worst: { leg: worst.leg, case: worst.case, rep: worst.rep, budget_ms: worst.budget_ms },
+    worst: { leg: worst.leg, case: worst.case, attempt: worst.attempt, rep: worst.rep, budget_ms: worst.budget_ms },
     tolerance_ms: VECTOR_DEADLINE_TOLERANCE_MS,
     adhered: worst.over_ms <= VECTOR_DEADLINE_TOLERANCE_MS,
   };
 }
-export function summarizeBudgetElapsed(samples: number[]): { samples: number; max_ms: number | null; budget_ms: number; tolerance_ms: number; within: boolean | null } {
+export function summarizeBudgetElapsed(samples: number[], budget: DurationMs): { samples: number; max_ms: number | null; budget_ms: number; tolerance_ms: number; within: boolean | null } {
+  // O1 §2 + codex migration r1 P4: the SAME accepted budget the handler ran
+  // under — the run's captured value, passed in, never re-read here.
+  const budgetMs = evidenceMs(budget);
   const sorted = [...samples].sort((a, b) => a - b);
   const max = sorted.length ? sorted[sorted.length - 1]! : null;
   return {
     samples: sorted.length,
     max_ms: max,
-    budget_ms: HOOK_BUDGET_MS,
+    budget_ms: budgetMs,
     tolerance_ms: BUDGET_ELAPSED_TOLERANCE_MS,
-    within: max === null ? null : max <= HOOK_BUDGET_MS + BUDGET_ELAPSED_TOLERANCE_MS,
+    within: max === null ? null : max <= budgetMs + BUDGET_ELAPSED_TOLERANCE_MS,
   };
 }
 
@@ -2964,7 +3046,7 @@ export function renderHookReportMd(report: HookRunReport): string {
   const vd = report.vector_deadline;
   if (vd.samples > 0) {
     const w = vd.worst;
-    lines.push(`- vector deadline (max over ${vd.samples} primary/prior/deep invocation(s), +${vd.tolerance_ms}ms tol): ${vd.adhered === false ? `DID NOT HOLD — ${w?.leg} leg (case ${w?.case}, rep ${w?.rep}) ${vd.max_over_ms}ms past its ${w?.budget_ms}ms deadline${g.vector_deadline_ok === false ? " → TRUST FAIL (vector_deadline_ok gate)" : " (topology non-authoritative — not contract evidence)"}` : `held (worst overshoot ${vd.max_over_ms}ms)`}`);
+    lines.push(`- vector deadline (max over ${vd.samples} primary/prior/deep invocation(s), +${vd.tolerance_ms}ms tol): ${vd.adhered === false ? `DID NOT HOLD — ${w?.leg} leg (case ${w?.case}, attempt ${w?.attempt}, rep ${w?.rep}) ${vd.max_over_ms}ms past its ${w?.budget_ms}ms deadline${g.vector_deadline_ok === false ? " → TRUST FAIL (vector_deadline_ok gate)" : " (topology non-authoritative — not contract evidence)"}` : `held (worst overshoot ${vd.max_over_ms}ms)`}`);
   }
   if (report.admission_basis_counts) {
     const abc = Object.entries(report.admission_basis_counts).map(([k, v]) => `${k} ${v}`).join(" · ");

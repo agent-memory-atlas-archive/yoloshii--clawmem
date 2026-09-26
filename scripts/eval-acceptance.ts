@@ -27,6 +27,7 @@
  * Exit codes: 0 pass · 1 criteria failure · 2 degraded/infrastructure abort.
  */
 import { parseArgs } from "util";
+import { isoNow } from "../src/clock.ts";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { Database } from "bun:sqlite";
@@ -131,7 +132,7 @@ if (cmd === "freeze") {
   walConvert.exec("PRAGMA journal_mode = WAL");
   walConvert.close();
 
-  const asOf = new Date().toISOString();
+  const asOf = isoNow();
   const store = createStore(snapshotPath, { readonly: true });
   const llm = getDefaultLlamaCpp();
   const cases = loadCases();

@@ -114,6 +114,7 @@ function report(runId: string, drawFp: string, over: Partial<{
   return {
     run_id: runId,
     surface: "context-surfacing",
+    vector_leg_records: [],
     created_at: "2026-08-14T00:00:00.000Z",
     gold_path: "gold.jsonl", db_path: null, clawmem_version: null,
     limit: 10, budget_ms: 30000, min_examples: 1, audit_attested: true,

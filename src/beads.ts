@@ -8,6 +8,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { isoNow } from "./clock.ts";
 import { join } from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 
@@ -153,7 +154,7 @@ function normalizeBeadsIssue(raw: any): BeadsIssue {
     issue_type: raw.issue_type,
     assignee: raw.assignee,
     owner: raw.owner,
-    created_at: raw.created_at || new Date().toISOString(),
+    created_at: raw.created_at || isoNow(),
     updated_at: raw.updated_at,
     closed_at: raw.closed_at,
     close_reason: raw.close_reason,

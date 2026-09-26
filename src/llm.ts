@@ -25,7 +25,7 @@ type LlamaToken = any;
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
-import type { LegacyWallDeadline } from "./clock-legacy.ts";
+import { timeoutSignal, type MonoDeadline, epochNow, epochMs } from "./clock.ts";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -297,13 +297,13 @@ export interface LLM {
 
   /**
    * Expand a search query into multiple variations for different backends.
-   * Returns a list of Queryable objects. deadlineAt (BUILD-3a): absolute
-   * epoch-ms deadline — the remote generation gets a real abort and
+   * Returns a list of Queryable objects. `deadline` (BUILD-3a, O1): the
+   * caller's MONOTONIC deadline — the remote generation gets a real abort and
    * unabortable local inference is structurally skipped (codex turn-25
    * finding 1: the concrete class carried the option; the interface must
    * expose the contract to typed consumers).
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string, deadlineAt?: LegacyWallDeadline }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string, deadline?: MonoDeadline }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -922,11 +922,11 @@ export class LlamaCpp implements LLM {
   }
 
   private isRemoteLlmDown(): boolean {
-    return Date.now() < this.remoteLlmDownUntil;
+    return epochMs(epochNow()) < this.remoteLlmDownUntil;
   }
 
   private isRemoteEmbedDown(): boolean {
-    return Date.now() < this.remoteEmbedDownUntil;
+    return epochMs(epochNow()) < this.remoteEmbedDownUntil;
   }
 
   private isLoopbackUrl(url: string | null | undefined): boolean {
@@ -941,7 +941,7 @@ export class LlamaCpp implements LLM {
   }
 
   private noteRemoteFallback(kind: "embed" | "llm", message: string): void {
-    const now = Date.now();
+    const now = epochMs(epochNow());
     if (kind === "embed") {
       if (now < this.remoteEmbedFallbackNotifiedUntil) return;
       this.remoteEmbedFallbackNotifiedUntil = this.remoteEmbedDownUntil || (now + LlamaCpp.REMOTE_COOLDOWN_MS);
@@ -957,7 +957,7 @@ export class LlamaCpp implements LLM {
   }
 
   private markRemoteLlmDown(): void {
-    this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+    this.remoteLlmDownUntil = epochMs(epochNow()) + LlamaCpp.REMOTE_COOLDOWN_MS;
     this.remoteLlmFallbackNotifiedUntil = 0;
     this.noteRemoteFallback(
       "llm",
@@ -968,7 +968,7 @@ export class LlamaCpp implements LLM {
   }
 
   private markRemoteEmbedDown(): void {
-    this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+    this.remoteEmbedDownUntil = epochMs(epochNow()) + LlamaCpp.REMOTE_COOLDOWN_MS;
     this.remoteEmbedFallbackNotifiedUntil = 0;
     this.noteRemoteFallback(
       "embed",
@@ -1026,11 +1026,11 @@ export class LlamaCpp implements LLM {
     );
     if (kind === "llm") {
       this.remoteLlmHttpErrorStreak = 0;
-      this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+      this.remoteLlmDownUntil = epochMs(epochNow()) + LlamaCpp.REMOTE_COOLDOWN_MS;
       this.remoteLlmFallbackNotifiedUntil = 0;
     } else {
       this.remoteEmbedHttpErrorStreak = 0;
-      this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+      this.remoteEmbedDownUntil = epochMs(epochNow()) + LlamaCpp.REMOTE_COOLDOWN_MS;
       this.remoteEmbedFallbackNotifiedUntil = 0;
     }
   }
@@ -1156,7 +1156,7 @@ export class LlamaCpp implements LLM {
     const secs = parseInt(header, 10);
     if (!isNaN(secs)) return secs * 1000;
     const date = Date.parse(header);
-    if (!isNaN(date)) return Math.max(0, date - Date.now());
+    if (!isNaN(date)) return Math.max(0, date - epochMs(epochNow()));
     return null;
   }
 
@@ -1554,23 +1554,24 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string, deadlineAt?: LegacyWallDeadline } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string, deadline?: MonoDeadline } = {}): Promise<Queryable[]> {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
     const intent = options.intent;
     // BUILD-3a (codex turn-24 finding 3): a deadline-carrying caller (the
     // context-surfacing hook) gets a REAL abort on the remote fetch — an
-    // abandoned Promise.race does not stop the transport, and the pending
-    // work holds the hook PROCESS alive past its budget (the host waits on
-    // the process, not the handler's return).
-    const deadlineAt = options.deadlineAt;
-    const expandSignal = deadlineAt !== undefined
-      ? AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))
-      : undefined;
+    // abandoned race does not stop the transport, and the pending work
+    // holds the hook PROCESS alive past its budget (the host waits on the
+    // process, not the handler's return). O1: the signal is bounded by the
+    // monotonic remainder; an already-passed deadline skips the remote call
+    // outright (the typed fallback) instead of starting a fetch to abort it.
+    const deadline = options.deadline;
+    const expandSignal = deadline !== undefined ? timeoutSignal(deadline) : undefined;
+    if (deadline !== undefined && expandSignal === null) return expansionFallback(query, includeLexical);
 
     // Remote LLM path — no grammar constraint, parse output instead
     if (this.remoteLlmUrl && !this.isRemoteLlmDown()) {
-      const result = await this.expandQueryRemote(query, includeLexical, context, intent, expandSignal);
+      const result = await this.expandQueryRemote(query, includeLexical, context, intent, expandSignal ?? undefined);
       // Check if transport failure set cooldown during this call
       if (!this.isRemoteLlmDown()) return result;
       // Transport failure — fall through to local grammar path
@@ -1579,7 +1580,7 @@ export class LlamaCpp implements LLM {
     // A deadline-carrying caller must NEVER start unabortable local
     // inference (codex turn-24 finding 3 — structural, not launcher-
     // dependent): return the typed passthrough set instead.
-    if (deadlineAt !== undefined) {
+    if (deadline !== undefined) {
       return expansionFallback(query, includeLexical);
     }
 

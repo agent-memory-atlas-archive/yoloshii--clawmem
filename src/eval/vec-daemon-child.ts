@@ -33,6 +33,7 @@
  * hook-run.ts + context-surfacing.ts: CLAWMEM_VECTOR_DAEMON_REQUIRED).
  */
 import { existsSync, rmSync, statSync } from "node:fs";
+import { monoNow, deadlineAfter, duration, elapsed, evidenceMs, untilDeadline, testWallJumpAtScanStart } from "../clock.ts";
 import { fileURLToPath } from "node:url";
 import { createStore, prewarmVectors, searchVecMatch, type Store } from "../store.ts";
 import { startVectorDaemon, vecDaemonSocketPath, daemonPing, testSyncScanDelay, type VectorDaemonHandle } from "../vector-daemon.ts";
@@ -137,7 +138,8 @@ export async function spawnEvalVectorDaemon(dbPath: string, opts: SpawnEvalVecto
   }
   const sockPath = vecDaemonSocketPath(dbPath);
   const entry = opts._testChildEntry ?? EVAL_VEC_DAEMON_CHILD_ENTRY;
-  const t0 = Date.now();
+  const t0 = monoNow();
+  const readyDeadline = deadlineAfter(t0, duration(readyTimeoutMs)); // O1: readiness is a monotonic budget
   const proc = Bun.spawn([process.execPath, entry, "--db", dbPath, ...(opts.prewarm === "steady-state" ? ["--prewarm"] : [])], {
     stdin: "pipe",
     stdout: "pipe",
@@ -154,7 +156,7 @@ export async function spawnEvalVectorDaemon(dbPath: string, opts: SpawnEvalVecto
   let timedOut = false;
   let nonJson: string | null = null;
   while (readyLine === null && !timedOut && nonJson === null) {
-    const next = await withDeadline(reader.read(), readyTimeoutMs - (Date.now() - t0));
+    const next = await untilDeadline(reader.read(), readyDeadline);
     if (next.timedOut) { timedOut = true; break; }
     if (next.value.done) break; // child closed stdout without a ready line (it died)
     buf += decoder.decode(next.value.value as Uint8Array, { stream: true });
@@ -230,7 +232,7 @@ export async function spawnEvalVectorDaemon(dbPath: string, opts: SpawnEvalVecto
   if (exitCode !== null) {
     return refuse(`vector daemon child exited (code ${exitCode}) right after readiness (db ${dbPath}) — refusing before the first case`);
   }
-  const readyMs = Date.now() - t0;
+  const readyMs = evidenceMs(elapsed(t0));
   log(`[eval] vector daemon child pid ${proc.pid} ready in ${readyMs}ms on ${sockPath} (prewarm ${opts.prewarm}: ${ready.prewarm})`);
 
   let stopped: Promise<{ escalated: boolean; exitCode: number | null; socketRemoved: boolean }> | null = null;
@@ -300,11 +302,13 @@ async function childMain(argv: string[]): Promise<void> {
   try {
     // The PRODUCTION daemon — same server, same single-flight + deadline-on-receipt contract the
     // watcher runs. The scan is the real searchVecMatch (embed + synchronous MATCH); the test
-    // seam in front of it is the documented CLAWMEM_TEST_VEC_SCAN_SYNC_DELAY_MS busy-wait, a no-op
-    // unless that env is set.
-    handle = await startVectorDaemon(store, log, (query, model, limit, deadlineMs) => {
+    // seams in front of it are the documented CLAWMEM_TEST_VEC_SCAN_SYNC_DELAY_MS busy-wait and
+    // CLAWMEM_TEST_WALL_JUMP_AT_SCAN (a wall-clock step at scan start, landing between a request's
+    // receipt and its check-after-scan — the O1 §5 child-daemon locks), both no-ops unless set.
+    handle = await startVectorDaemon(store, log, (query, model, limit, deadline) => {
+      testWallJumpAtScanStart();
       testSyncScanDelay();
-      return searchVecMatch(store.db, query, model, limit, deadlineMs);
+      return searchVecMatch(store.db, query, model, limit, deadline);
     });
   } catch (e) {
     emit({ ready: false, error: `daemon start threw: ${(e as Error).message}` });

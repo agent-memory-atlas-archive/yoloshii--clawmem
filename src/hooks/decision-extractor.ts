@@ -49,7 +49,7 @@ import {
 import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
-import type { LegacyWallDeadline } from "../clock-legacy.ts";
+import { monoNow, deadlineAfter, deadlineBefore, remainingForTimeout, shorterThan, duration, isExpired, signalAfter, evidenceMs, type MonoDeadline, toDate, epochNow, epochMs } from "../clock.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
 // original {decision, preference, milestone, problem} gate, which rejected 77% of
@@ -97,11 +97,11 @@ export async function checkMergePolicy(
   contentType: string,
   body: string,
   collection: string,
-  /** s342 D2: absolute deadline (already net of the persistence reserve) that
-   *  bounds the dedup embedding. Past it, dedup degrades to a plain insert —
+  /** s342 D2 / O1: monotonic deadline (already net of the persistence reserve)
+   *  that bounds the dedup embedding. Past it, dedup degrades to a plain insert —
    *  saveMemory's hash dedup still applies — rather than starting a model call
    *  outside the Stop budget. */
-  deadlineMs?: LegacyWallDeadline,
+  deadline?: MonoDeadline,
 ): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
   const policy = getMergePolicy(contentType);
 
@@ -112,12 +112,12 @@ export async function checkMergePolicy(
   if (recentDocs.length === 0) return { action: 'insert' };
 
   if (policy === 'dedup_check') {
-    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+    if (deadline !== undefined && isExpired(deadline)) {
       return { action: 'insert' };
     }
     // Vector similarity check against recent entries
     try {
-      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3, undefined, undefined, undefined, deadlineMs);
+      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3, undefined, undefined, undefined, deadline);
       const sameType = results.filter(r =>
         r.collectionName === collection &&
         r.score >= DEDUP_SIMILARITY_THRESHOLD
@@ -133,7 +133,7 @@ export async function checkMergePolicy(
   }
 
   if (policy === 'merge_recent') {
-    const cutoff = new Date();
+    const cutoff = toDate(epochNow());
     cutoff.setDate(cutoff.getDate() - MERGE_RECENT_DAYS);
     const recent = recentDocs.find(d =>
       d.modifiedAt && new Date(d.modifiedAt) >= cutoff
@@ -812,10 +812,11 @@ async function detectContradictions(
   newObservations: Observation[],
   sessionId: string,
   docIdByObservation?: ReadonlyMap<Observation, number>,
-  /** s342 D2: the Stop handler's whole-handler deadline. When present, the
-   *  judge call is skipped below the remaining-budget floor (audited as
-   *  `skipped_budget`) and an in-flight call is bounded by the remainder. */
-  deadlineAt?: LegacyWallDeadline,
+  /** s342 D2 / O1: the Stop handler's whole-handler MONOTONIC deadline. When
+   *  present, the judge call is skipped below the remaining-budget floor
+   *  (audited as `skipped_budget`) and an in-flight call is bounded by the
+   *  remainder. */
+  deadline?: MonoDeadline,
 ): Promise<number> {
   const decisions = newObservations.filter(o => o.type === "decision");
   if (decisions.length === 0) return 0;
@@ -870,10 +871,12 @@ async function detectContradictions(
 
   // s342 D2: the floor gates the WHOLE contradiction phase — including the
   // candidate-retrieval embedding below, which is itself a model call — so a
-  // near-exhausted budget never starts ANY of it.
-  if (deadlineAt !== undefined) {
-    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
-    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+  // near-exhausted budget never starts ANY of it. O1: every phase bound is the
+  // whole-handler deadline minus the persistence reserve, on the monotonic clock.
+  const phaseDeadline = deadline !== undefined ? deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)) : undefined;
+  if (phaseDeadline !== undefined) {
+    const remaining = remainingForTimeout(phaseDeadline);
+    if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
       insertJudgeRunBestEffort(store.db, {
         sessionId,
         consumer: "decision-extractor",
@@ -885,7 +888,7 @@ async function detectContradictions(
         outcome: "skipped_budget",
       });
       console.warn(
-        `[decision-extractor] contradiction phase skipped: ${remaining}ms of the ` +
+        `[decision-extractor] contradiction phase skipped: ${remaining === null ? 0 : evidenceMs(remaining)}ms of the ` +
         `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
         `no contradiction was evaluated.`,
       );
@@ -895,7 +898,7 @@ async function detectContradictions(
 
   // Vector search for existing decisions on overlapping topics — the embedding
   // is bounded by the whole-handler deadline minus the persistence reserve.
-  const searchDeadline = deadlineAt !== undefined ? deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0013 */ : undefined;
+  const searchDeadline = phaseDeadline;
   const queryText = newFacts.join(". ");
   let existingDocs: SearchResult[];
   try {
@@ -925,9 +928,9 @@ async function detectContradictions(
   // s342 D2: the judge shares the whole-handler deadline — never START a call
   // near budget exhaustion, and bound an in-flight one by the remainder.
   let judgeSignal: AbortSignal | undefined;
-  if (deadlineAt !== undefined) {
-    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
-    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+  if (phaseDeadline !== undefined) {
+    const remaining = remainingForTimeout(phaseDeadline);
+    if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
       insertJudgeRunBestEffort(store.db, {
         sessionId,
         consumer: "decision-extractor",
@@ -940,13 +943,13 @@ async function detectContradictions(
         outcome: "skipped_budget",
       });
       console.warn(
-        `[decision-extractor] contradiction judge skipped: ${remaining}ms of the ` +
+        `[decision-extractor] contradiction judge skipped: ${remaining === null ? 0 : evidenceMs(remaining)}ms of the ` +
         `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
         `no contradiction was evaluated.`,
       );
       return 0;
     }
-    judgeSignal = AbortSignal.timeout(remaining);
+    judgeSignal = signalAfter(remaining);
   }
 
   try {
@@ -1151,7 +1154,7 @@ export async function decisionExtractor(
   store: Store,
   input: HookInput
 ): Promise<HookOutput> {
-  const sessionId = input.sessionId || `session-${Date.now()}`;
+  const sessionId = input.sessionId || `session-${epochMs(epochNow())}`;
 
   // Judge-audit retention (§J7, code-review t3 finding 1 / t4 finding 1): prune as the
   // handler's FIRST act — before transcript validation, so literally every invocation,
@@ -1166,7 +1169,9 @@ export async function decisionExtractor(
   // kills mid-write. Operating requirement (docs/reference/configuration.md):
   // the installed host hook timeout must exceed this budget plus safety.
   const stopBudget = resolveStopBudgetMs();
-  const deadlineAt = Date.now() + stopBudget.budgetMs as LegacyWallDeadline /* O1-DEBT-0012 */;
+  // O1: the whole-handler deadline is MONOTONIC — a realtime step during the
+  // Stop hook can no longer extend or cut every model-bearing phase at once.
+  const deadline = deadlineAfter(monoNow(), duration(stopBudget.budgetMs));
   if (stopBudget.invalid) {
     console.error(`[decision-extractor] ${stopBudget.invalid}`);
   }
@@ -1185,7 +1190,7 @@ export async function decisionExtractor(
         sessionId,
         mode: causalMode,
         newObservations: newObs,
-        deadlineAt,
+        deadline,
         invalidConfigNotes: stopBudget.invalid ? [stopBudget.invalid] : [],
         phaseSkipNotes,
       });
@@ -1214,18 +1219,18 @@ export async function decisionExtractor(
   }
 
 
-  const now = new Date();
+  const now = toDate(epochNow());
   const dateStr = now.toISOString().slice(0, 10);
   const timestamp = now.toISOString();
 
   // Try observer first for structured observations. s342 D2: extraction has
   // the SAME pre-call floor as the judge and the causal step — near budget
   // exhaustion it is skipped outright, never started with a degenerate timeout.
-  const extractionRemaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+  const extractionRemaining = remainingForTimeout(deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
   let observations: Observation[] = [];
-  if (extractionRemaining < CAUSAL_MIN_BUDGET_MS) {
+  if (extractionRemaining === null || shorterThan(extractionRemaining, duration(CAUSAL_MIN_BUDGET_MS))) {
     const note =
-      `observation extraction skipped: ${extractionRemaining}ms of the Stop budget ` +
+      `observation extraction skipped: ${extractionRemaining === null ? 0 : evidenceMs(extractionRemaining)}ms of the Stop budget ` +
       `remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor`;
     phaseSkipNotes.push(note);
     console.warn(`[decision-extractor] ${note}.`);
@@ -1275,7 +1280,7 @@ export async function decisionExtractor(
 
     // Detect contradictions with existing decisions
     try {
-      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation, deadlineAt);
+      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation, deadline);
       if (contradictions > 0) {
         console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
       }
@@ -1304,7 +1309,7 @@ export async function decisionExtractor(
 
   // Check existing merge policy first (vector-based dedup for decisions),
   // bounded by the whole-handler deadline minus the persistence reserve.
-  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0014 */);
+  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
 
   if (mergeResult.action === 'skip') {
     process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
@@ -1353,7 +1358,7 @@ export async function decisionExtractor(
 
       // Check existing merge policy first (merge_recent for antipatterns),
       // under the same whole-handler deadline bound.
-      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0015 */);
+      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
 
       if (antiMerge.action === 'skip') {
         // Near-duplicate — skip

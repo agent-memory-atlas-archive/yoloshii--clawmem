@@ -1,5 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
 import { withRetryAndFeedback, type ParseOutcome } from "../../src/llm-retry.ts";
+import { duration } from "../../src/clock.ts";
 
 function makeLlm(responses: Array<string | null | Error>) {
   const generate = mock(async (_prompt: string, _opts: unknown) => {
@@ -104,7 +105,7 @@ describe("withRetryAndFeedback", () => {
       llm: { generate },
       maxTokens: 100,
       maxAttempts: 3,
-      timeoutMs: 5,
+      timeoutMs: duration(5),
       parse: parseJsonArray,
     });
     expect(result).toBeNull();
@@ -154,7 +155,7 @@ describe("withRetryAndFeedback", () => {
       initialPrompt: "P",
       llm,
       maxTokens: 100,
-      timeoutMs: 0,
+      timeoutMs: duration(0),
       parse: parseJsonArray,
     });
     expect(result).toBeNull();
@@ -179,7 +180,7 @@ describe("withRetryAndFeedback", () => {
       llm: { generate },
       maxTokens: 100,
       maxAttempts: 3,
-      timeoutMs: 30,
+      timeoutMs: duration(30),
       parse: parseJsonArray,
     });
     const elapsed = Date.now() - started;
@@ -205,7 +206,7 @@ describe("withRetryAndFeedback", () => {
       llm: { generate },
       maxTokens: 100,
       maxAttempts: 3,
-      timeoutMs: 30,
+      timeoutMs: duration(30),
       parse: parseJsonArray,
     });
     const elapsed = Date.now() - started;

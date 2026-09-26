@@ -26,6 +26,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { isoNow } from "./clock.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
 import { extractJsonFromLLM } from "./amem.ts";
@@ -633,7 +634,7 @@ export async function runConversationSynthesis(
             link.relationType,
             link.weight ?? DEFAULT_LINK_WEIGHT,
             JSON.stringify({ origin: "conversation-synthesis" }),
-            new Date().toISOString(),
+            isoNow(),
           );
         result.linksResolved++;
       } catch (err) {

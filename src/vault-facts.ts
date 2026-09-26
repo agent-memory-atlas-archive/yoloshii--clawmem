@@ -45,6 +45,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { isoNow } from "./clock.ts";
 import { resolveEntityTypeExact, ensureEntityCanonical } from "./entity.ts";
 
 // =============================================================================
@@ -412,7 +413,7 @@ export interface BuildVaultFactsOptions {
   maxTriplesPerEntity?: number;
   /** Token estimator. Defaults to ~4 chars per token heuristic. */
   estimateTokens?: (s: string) => number;
-  /** ISO "now" used to filter `validTo > now`. Defaults to `new Date().toISOString()`. */
+  /** ISO "now" used to filter `validTo > now`. Defaults to `isoNow()`. */
   now?: string;
 }
 
@@ -446,7 +447,7 @@ export function buildVaultFactsBlock(
 
   const maxPerEntity = options.maxTriplesPerEntity ?? 10;
   const estimate = options.estimateTokens ?? DEFAULT_ESTIMATE_TOKENS;
-  const now = options.now ?? new Date().toISOString();
+  const now = options.now ?? isoNow();
 
   // Collect all current triples from all entities, deduping across
   // entities by (subject, predicate, object). Without this, prompts that

@@ -90,6 +90,36 @@ describe("hook replay-eval — end-to-end on the real handler", () => {
     else process.env.CLAWMEM_NO_LOCAL_MODELS = priorNoLocal;
   });
 
+  it("codex migration r1 P4: ONE budget per run — a case hook that changes CLAWMEM_HOOK_BUDGET_MS mid-run is REFUSED before that case is scored, and the environment is restored", async () => {
+    const goldPath = writeGold([
+      { id: "budget-a", prompt: OAUTH_PROMPT, profile: "speed", labels: { must_include: [OAUTH_DOC] }, split: "tuning", tags: ["budget"] },
+      { id: "budget-b", prompt: OAUTH_PROMPT, profile: "speed", labels: { must_include: [OAUTH_DOC] }, split: "holdout", tags: ["budget"] },
+    ]);
+    const prev = process.env.CLAWMEM_HOOK_BUDGET_MS;
+    process.env.CLAWMEM_HOOK_BUDGET_MS = "6000";
+    try {
+      // A VALID but different value: drift, not an invalid config — the run would otherwise execute
+      // case b under 7000 while its identity and summary judged 6000.
+      await expect(runHookEval({
+        goldPath, store, minExamples: 1, audited: true,
+        _testOnCaseStart: ({ index }) => { if (index === 1) process.env.CLAWMEM_HOOK_BUDGET_MS = "7000"; },
+      })).rejects.toThrow(/CLAWMEM_HOOK_BUDGET_MS changed mid-run \(case budget-b rep 0\): the run started under 6000ms and the environment now resolves 7000ms/);
+      expect(process.env.CLAWMEM_HOOK_BUDGET_MS).toBe("6000"); // restored by the run's env transaction
+      // An unsupported value mid-run is refused the same way.
+      await expect(runHookEval({
+        goldPath, store, minExamples: 1, audited: true,
+        _testOnCaseStart: ({ index }) => { if (index === 1) process.env.CLAWMEM_HOOK_BUDGET_MS = "30000"; },
+      })).rejects.toThrow(/became unsupported mid-run \(case budget-b rep 0\)/);
+      expect(process.env.CLAWMEM_HOOK_BUDGET_MS).toBe("6000");
+      // Undisturbed, the run's identity records the captured budget.
+      const { report } = await runHookEval({ goldPath, store, minExamples: 1, audited: true });
+      expect(report.identity!.hook_budget_ms).toBe(6000);
+      expect(report.budget_elapsed.budget_ms).toBe(6000);
+    } finally {
+      if (prev === undefined) delete process.env.CLAWMEM_HOOK_BUDGET_MS; else process.env.CLAWMEM_HOOK_BUDGET_MS = prev;
+    }
+  }, 30_000);
+
   it("replays labeled cases through the real pipeline with isolation and scores them", async () => {
     // Pre-existing co-activation state that the run must preserve byte-identically.
     store.recordCoActivation(["test/x.md", "test/y.md"]);
@@ -479,7 +509,8 @@ describe("hook replay-eval — end-to-end on the real handler", () => {
 
     // BUILD-3a: the internal budget self-identifies; a budget difference is
     // a treatment — refused like the weight.
-    const { HOOK_BUDGET_MS: EFFECTIVE_BUDGET } = await import("../../src/hooks/context-surfacing.ts");
+    const { assertHookBudgetConfig } = await import("../../src/hooks/context-surfacing.ts");
+    const EFFECTIVE_BUDGET: number = assertHookBudgetConfig();
     expect(baselineReport.identity.hook_budget_ms).toBe(EFFECTIVE_BUDGET);
     const budgetMismatch = patchBaseline("budget-mismatch.json", id => { id.hook_budget_ms = 9999; });
     await expect(runHookEval({ goldPath, store, minExamples: 1, audited: true, baselinePath: budgetMismatch, ...declare }))
@@ -1098,6 +1129,25 @@ describe("BUILD-3b/3c: draw binding v3 + in-run pair gate", () => {
     }
   }, 240_000);
 
+  it("codex migration r2 #6: a RETRIED case's leg records are keyed by ATTEMPT — both attempts persist under distinct (leg, case, attempt, rep) keys, and the worst names its attempt", async () => {
+    const realSearchVec = store.searchVec;
+    store.searchVec = (async () => []) as Store["searchVec"]; // hermetic in-process vector leg: no embedding, no network
+    try {
+      const goldPath = writeGold(PAIR_GOLD);
+      const partner = newDir("pair-att-a");
+      await runHookEval({ goldPath, store, minExamples: 1, audited: true, profileOverride: "balanced", latencyReps: 1, outDir: partner });
+      doctorTrace(partner, "pg-miss", t => { t.sessionTopic = "poisoned-topic-no-run-will-produce"; }); // forces a retry of pg-miss
+      const res = await runHookEval({ goldPath, store, minExamples: 1, audited: true, profileOverride: "balanced", latencyReps: 1, pairWith: partner, pairMinValid: 2, pairMaxRetries: 1, outDir: newDir("pair-att-b") });
+      expect(res.report.pair_audit!.retried).toBe(1);
+      const recs = res.report.vector_leg_records;
+      const keys = recs.map(r => `${r.leg}|${r.case}|${r.attempt}|${r.rep}`);
+      expect(new Set(keys).size).toBe(keys.length); // pre-fix: pg-miss's two attempts collided on case + rep
+      expect(recs.filter(r => r.case === "pg-miss" && r.leg === "primary").map(r => r.attempt).sort()).toEqual([0, 1]);
+      const top = recs.reduce((a, b) => (b.over_ms > a.over_ms ? b : a));
+      expect(res.report.vector_deadline.worst).toMatchObject({ leg: top.leg, case: top.case, attempt: top.attempt, rep: top.rep });
+    } finally { store.searchVec = realSearchVec; }
+  }, 240_000);
+
   it("a retried attempt's enforced violation survives into the trust gate AND the artifacts (codex turn-30 F3 seam)", async () => {
     const goldPath = writeGold(PAIR_GOLD);
     const partner = newDir("pair-inv-a");
@@ -1308,12 +1358,19 @@ describe("BUILD-3d: registered treatments at the runHookEval boundary (codex tur
     const goldPath = writeGold(GOLD);
     const breached = await runHookEval({
       goldPath, store, minExamples: 1, audited: true, latencyReps: 1,
-      _testTimingSamples: { vectorLegs: [{ leg: "primary", over_ms: 2230, budget_ms: 900, case: "rt-tune", rep: 0 }] },
+      // O1 §3: the injected sample is a COMPLETE per-rep record (span on both clocks, terminal kind, status).
+      _testTimingSamples: { vectorLegs: [{ leg: "primary", over_ms: 2230, budget_ms: 900, case: "rt-tune", attempt: 0, rep: 0, mono_elapsed_ms: 3130, wall_elapsed_ms: 3130, clock_skew_ms: 0, terminal_kind: "completion", status: "ok" }] },
       outDir: newDir("vd-breach"),
     });
     expect(breached.report.vector_deadline.adhered).toBe(false);
     expect(breached.report.vector_deadline.max_over_ms).toBe(2230);
-    expect(breached.report.vector_deadline.worst).toEqual({ leg: "primary", case: "rt-tune", rep: 0, budget_ms: 900 });
+    expect(breached.report.vector_deadline.worst).toEqual({ leg: "primary", case: "rt-tune", attempt: 0, rep: 0, budget_ms: 900 });
+    // O1 §3: EVERY rep's record is persisted in full, keyed case + rep, with the harness-derived
+    // timing class and the run's deadline-protocol identity (null before O1 activation) — a late
+    // SUCCESS is distinguishable from a late abandonment in the artifact itself.
+    expect(breached.report.vector_leg_records).toEqual([{ leg: "primary", over_ms: 2230, budget_ms: 900, case: "rt-tune", attempt: 0, rep: 0, mono_elapsed_ms: 3130, wall_elapsed_ms: 3130, clock_skew_ms: 0, terminal_kind: "completion", status: "ok", timing: "late", deadline_protocol: null }]);
+    const persisted = JSON.parse(readFileSync(breached.artifacts!.runJsonPath, "utf8")) as { vector_leg_records: unknown[] };
+    expect(persisted.vector_leg_records).toEqual(breached.report.vector_leg_records);
     // The breach is an INDEPENDENT trust failure (codex t82 P1) — never a
     // waivable latency axis: the member FAILS.
     expect(breached.report.gates.vector_deadline_ok).toBe(false);
@@ -1332,15 +1389,40 @@ describe("BUILD-3d: registered treatments at the runHookEval boundary (codex tur
     // Converse: every injected invocation within its deadline ⇒ gate passes.
     const warm = await runHookEval({
       goldPath, store, minExamples: 1, audited: true, latencyReps: 1,
-      _testTimingSamples: { vectorLegs: [{ leg: "primary", over_ms: -420, budget_ms: 900, case: "rt-tune", rep: 0 }] },
+      _testTimingSamples: { vectorLegs: [{ leg: "primary", over_ms: -420, budget_ms: 900, case: "rt-tune", attempt: 0, rep: 0, mono_elapsed_ms: 480, wall_elapsed_ms: -4520, clock_skew_ms: -5000, terminal_kind: "completion", status: "ok" }] },
       outDir: newDir("vd-warm"),
     });
     expect(warm.report.vector_deadline.adhered).toBe(true);
     expect(warm.report.gates.vector_deadline_ok).toBe(true);
+    // O1 §3: a wall STEP during the leg is visible from the artifact while the monotonic verdict stands.
+    expect(warm.report.vector_leg_records[0]).toMatchObject({ timing: "early", clock_skew_ms: -5000, mono_elapsed_ms: 480 });
     expect(warm.report.gates.reasons.some((r: string) => /measured vector deadline/.test(r))).toBe(false);
     expect(warm.report.vector_exec!.latency_authoritative).toBe(true);
     expect(warm.report.vector_exec!.note).toBeNull();
   }, 180_000);
+
+  it("codex migration r2 #2: REAL per-rep collection — every rep's own leg record is persisted, and a breach in rep 1 (never rep 0) is the attributed worst", async () => {
+    const goldPath = writeGold([{ id: "rt-reps", prompt: OAUTH_PROMPT, profile: "balanced", labels: { must_include: [OAUTH_DOC] }, split: "tuning", tags: ["reps"] }]);
+    const realSearchVec = store.searchVec;
+    let calls = 0;
+    // The in-process vector leg (no daemon serves this vault): the 2nd rep's synchronous scan overruns the
+    // 900 ms leg deadline; the others answer at once. The stall spins on the RAW clock.
+    store.searchVec = (async () => {
+      calls++;
+      if (calls === 2) { const until = performance.now() + 1200; while (performance.now() < until) { /* stall */ } }
+      return [];
+    }) as Store["searchVec"];
+    try {
+      const r = await runHookEval({ goldPath, store, minExamples: 1, audited: true, latencyReps: 3, outDir: newDir("vd-reps") });
+      const recs = r.report.vector_leg_records.filter(x => x.leg === "primary");
+      expect(recs.map(x => [x.case, x.attempt, x.rep])).toEqual([["rt-reps", 0, 0], ["rt-reps", 0, 1], ["rt-reps", 0, 2]]);
+      expect(recs[1]!.over_ms).toBeGreaterThan(150);
+      expect(recs[0]!.over_ms).toBeLessThanOrEqual(0);
+      expect(recs[2]!.over_ms).toBeLessThanOrEqual(0);
+      expect(r.report.vector_deadline.worst).toMatchObject({ leg: "primary", case: "rt-reps", attempt: 0, rep: 1 });
+      expect(r.report.vector_deadline.adhered).toBe(false);
+    } finally { store.searchVec = realSearchVec; }
+  }, 120_000);
 
   it("admission_policy pair on SPEED cases: the per-case ledger records base AND treatment exposure with no rerank lane (ship-draw aggregate refusal 2026-08-26)", async () => {
     // The 2026-08-26 shipping draws: five clean admission_policy members were

@@ -6,6 +6,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "node:crypto";
 
 // =============================================================================
@@ -215,7 +216,7 @@ export function wasPromptSeenRecently(store: Store, hookName: string, prompt: st
   if (!normalized) return false;
 
   const hash = createHash("sha256").update(normalized).digest("hex");
-  const now = new Date();
+  const now = toDate(epochNow());
   const nowIso = now.toISOString();
 
   const row = store.db
@@ -430,7 +431,7 @@ export function logInjection(
   try {
     const usageId = store.insertUsage({
       sessionId,
-      timestamp: new Date().toISOString(),
+      timestamp: isoNow(),
       hookName,
       injectedPaths,
       estimatedTokens,

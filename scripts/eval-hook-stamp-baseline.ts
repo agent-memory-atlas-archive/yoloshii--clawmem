@@ -47,6 +47,7 @@
  *     [--fallback-observed none|unknown]   # REQUIRED when attesting local_fallback=allowed
  */
 import { parseArgs } from "util";
+import { isoNow } from "../src/clock.ts";
 import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdtempSync, cpSync, rmSync } from "fs";
 import { resolve, join } from "path";
 import { tmpdir } from "os";
@@ -193,10 +194,10 @@ const identity: RunIdentity = {
     served_rerank: await probeRerankFingerprint(process.env.CLAWMEM_RERANK_URL),
   },
   latency_protocol: { reps, aggregation: "lower-median" },
-  attested: `retro-stamped ${new Date().toISOString().slice(0, 10)} by scripts/eval-hook-stamp-baseline.ts`,
+  attested: `retro-stamped ${isoNow().slice(0, 10)} by scripts/eval-hook-stamp-baseline.ts`,
 };
 
-const backup = `${runPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}-prestamp`;
+const backup = `${runPath}.bak-${isoNow().replace(/[:.]/g, "-")}-prestamp`;
 copyFileSync(runPath, backup);
 const raw = JSON.parse(readFileSync(runPath, "utf-8")) as Record<string, unknown>;
 raw.identity = identity;

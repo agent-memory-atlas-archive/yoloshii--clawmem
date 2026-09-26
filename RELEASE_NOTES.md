@@ -85,6 +85,27 @@ In the replay-eval, daemon ownership is re-verified before and after every rep, 
 and an in-process replay's budget gate is reported as unmeasured (raw timing kept as a
 diagnostic) rather than as a pass or an overrun.
 
+**Deadlines are monotonic now (O1).** Every deadline in the hook used to be an absolute
+wall-clock instant compared against `Date.now()`, so an NTP step moved every deadline at once
+and silently falsified the timing evidence the trust gate scores (measured on the release
+host: a time daemon stepping +3.6 s every ~36 s produced four refused draws with multi-second
+"overruns" that never happened). The handler now derives every deadline from ONE monotonic
+anchor at entry; the daemon wire carries a **relative remaining budget** (`remainingBudgetMs`,
+sampled immediately before the write) instead of an absolute deadline, and the daemon's own
+deadline is advisory (check-before / check-after each synchronous phase — never cancellation);
+expansion and rerank transports are cut by monotonic signals; the Stop hook's phase floors are
+monotonic too. A pre-O1 request carrying `deadlineMs` is refused as version skew by field
+presence, and a pre-O1 daemon that ignores the budget is classified `skew` — the leg degrades
+to FTS with a once-per-process warning naming the socket (restart `clawmem watch`). Only the
+clock module samples a platform clock; two static audits (a raw-clock ratchet and a typed seam
+audit over branded `MonoDeadline` / `DurationMs` / `EpochMs` values, both at zero debt) keep it
+that way. The timing evidence changed with it: every rep's per-leg record is persisted
+(`vector_leg_records`: monotonic `over_ms`, the span on both clocks with `clock_skew_ms`
+exposing a realtime step, an orthogonal terminal kind × execution path, and a timing class
+against the **frozen** 150 ms tolerance — never re-fitted). `CLAWMEM_HOOK_BUDGET_MS` gained a **maximum of 25000**
+(the wire ceiling): larger values are refused by the hook, by `clawmem setup hooks` and are
+reported by `clawmem doctor`; the fallback and clamp behaviours below the maximum are unchanged.
+
 ### Bookkeeping left the hook
 
 After the payload is assembled the hook does zero SQLite/filesystem work in normal production mode (the one disclosed exception: the diagnostic `CLAWMEM_SURFACING_TRACE=1` trace persist). Turn

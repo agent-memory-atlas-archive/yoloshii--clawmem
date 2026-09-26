@@ -63,3 +63,55 @@ export const HYDRATED_RERANK_TEXT_LEN = 2000;
 
 /** Gate-token source slice — `body.slice(0, 4000)`, passesCurrentQueryGate's exact slice. */
 export const HYDRATED_GATE_TEXT_LEN = 4000;
+
+// ─── O1: relative deadline propagation (O1-DESIGN-monotonic-deadlines.md §2, §4) ──
+
+/**
+ * Version tag of the RELATIVE-BUDGET deadline protocol on the daemon wire. A
+ * request carries `remainingBudgetMs` (a whole count of milliseconds still
+ * available to the leg, sampled immediately before the write) instead of an
+ * absolute wall-clock `deadlineMs`; `performance.now()` origins are
+ * per-process, so an absolute monotonic instant is meaningless to the
+ * receiver, and an absolute wall instant is exactly the steppable quantity O1
+ * removes. The CLIENT holds the authoritative timer; the daemon's deadline is
+ * ADVISORY and trails the client by one-way transit (documented, not
+ * corrected). A request still carrying `deadlineMs` is version skew and is
+ * REFUSED without constructing a deadline from it.
+ *
+ * Orthogonal to `hydrated-v1` (daemon-side projection): both are advertised in
+ * the readiness pong's `protocols`, and every scan response attests
+ * `deadlineProtocol` so a client can tell a daemon that implements the
+ * relative budget from one that silently ignored the field.
+ */
+export const DEADLINE_PROTOCOL = "deadline-rel-v1";
+
+/**
+ * Contract ceiling on `remainingBudgetMs` (O1 §2, codex rev-6 F4): a
+ * non-integer or out-of-range value is version/config skew, refused before
+ * the scan, never clamped (the t89 P3 convention). EQUAL to the context-
+ * surfacing hook's supported maximum internal budget (`MAX_HOOK_BUDGET_MS`
+ * re-exports it): a deep leg can inherit nearly the whole work window, so
+ * a protocol ceiling below the largest supported hook budget would reject a
+ * previously valid configuration as skew — the ceiling therefore covers
+ * every supported budget, and an unsupported budget is refused BEFORE the
+ * handler runs (`assertHookBudgetConfig`). 25_000 is a NEWLY SELECTED
+ * interactive maximum borrowing the value of a shipped, model-bearing
+ * DEFAULT (`DEFAULT_STOP_BUDGET_MS`), not an inherited repository maximum
+ * (the Stop lane's implemented maximum is 300_000); the production default
+ * stays 6000. Opting into the ceiling can block prompt submission for up to
+ * the derived host timeout, ceil((1500 + 25000) / 1000) = 27 s.
+ */
+export const MAX_LEG_BUDGET_MS = 25_000;
+
+/**
+ * The top-level run-identity value for the handler / evaluator timing
+ * contract (O1 §4): every deadline decision, the finalization/trust timing,
+ * expansion and rerank cancellation derive from one monotonic anchor and
+ * relative windows. Recorded as `deadline_protocol` for EVERY run (speed-only
+ * and in-process included — the handler's timing changed in all of them);
+ * absent ⇒ comparison surfaces fail closed. DEFINING this constant is inert;
+ * STAMPING it into run identity and advertising `DEADLINE_PROTOCOL` in the
+ * pong is the activation, permitted only once both O1 ratchets hold zero
+ * entries (O1 §6 step 4).
+ */
+export const DEADLINE_PROTOCOL_IDENTITY = "monotonic-relative-v1";

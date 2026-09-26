@@ -45,6 +45,7 @@
  */
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, statSync } from "node:fs";
+import { isoNow, epochNow, epochMs } from "../clock.ts";
 import { dirname, join } from "node:path";
 import type { Store } from "../store.ts";
 import { resolveStore } from "../store.ts";
@@ -274,7 +275,7 @@ export function applySurfacingBookkeeping(
         const vaultUsageId = vaultStore.insertUsage({
           dedupeKey: `${job.jobId}:${unit}:mirror`,
           sessionId: job.sessionId,
-          timestamp: new Date().toISOString(),
+          timestamp: isoNow(),
           hookName: "context-surfacing",
           injectedPaths: group.docs.map(d => d.displayPath),
           estimatedTokens: 0,
@@ -313,7 +314,7 @@ export function writeSurfacingBookkeepingSpoolJob(dbPath: string, job: Surfacing
   try {
     const dir = spoolDirForDb(dbPath);
     mkdirSync(dir, { recursive: true });
-    const name = `${Date.now()}-${process.pid}-${spoolSeq++}.json`;
+    const name = `${epochMs(epochNow())}-${process.pid}-${spoolSeq++}.json`;
     const tmp = join(dir, `${name}.tmp`);
     const final = join(dir, name);
     writeFileSync(tmp, JSON.stringify(job));
@@ -370,7 +371,7 @@ export function drainSurfacingBookkeepingSpool(
   } catch {
     return out; // no spool dir — nothing pending
   }
-  const now = opts?.now ?? Date.now();
+  const now = opts?.now ?? epochMs(epochNow());
 
   // Pass 1 — housekeeping over non-.json entries: reclaim dead-pid claims,
   // reap stale .tmp orphans (and stale claims whose pid probe is unusable).

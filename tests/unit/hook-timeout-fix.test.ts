@@ -319,8 +319,14 @@ describe("resolveStore forwards the busy_timeout cap to a NAMED vault (B3 High-f
   });
 });
 
-describe("resolveHookBudgetMs — the authoritative internal budget (BUILD-3a C2c/C3)", () => {
-  const { resolveHookBudgetMs, DEFAULT_HOOK_BUDGET_MS, MIN_HOOK_BUDGET_MS } = require("../../src/hooks/context-surfacing.ts");
+describe("parseHookBudgetConfig — the authoritative internal budget (BUILD-3a C2c/C3; O1 §2 discriminated parser)", () => {
+  const { parseHookBudgetConfig, DEFAULT_HOOK_BUDGET_MS, MIN_HOOK_BUDGET_MS } = require("../../src/hooks/context-surfacing.ts");
+  // The accepted branch's effective integer — every case in this block is accepted (the maximum is exercised in hook-budget-config.test.ts).
+  const resolveHookBudgetMs = (raw: string | undefined): number => {
+    const cfg = parseHookBudgetConfig(raw);
+    if (!cfg.valid) throw new Error(`unexpected refusal: ${cfg.reason}`);
+    return cfg.effectiveMs;
+  };
 
   it("returns the default when unset / empty / whitespace / unparseable", () => {
     expect(resolveHookBudgetMs(undefined)).toBe(DEFAULT_HOOK_BUDGET_MS);

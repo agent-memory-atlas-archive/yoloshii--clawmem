@@ -1,3 +1,4 @@
+import { toDate, epochNow } from "./clock.ts";
 /**
  * ClawMem Memory Module - SAME composite scoring layer
  *
@@ -102,7 +103,7 @@ function effectiveHalfLife(
   baseHalfLife: number,
   accessCount: number,
   lastAccessedAt?: Date | string | null,
-  now: Date = new Date()
+  now: Date = toDate(epochNow())
 ): number {
   if (!isFinite(baseHalfLife) || accessCount <= 0) return baseHalfLife;
 
@@ -122,7 +123,7 @@ function effectiveHalfLife(
 export function recencyScore(
   modifiedAt: Date | string,
   contentType: string,
-  now: Date = new Date(),
+  now: Date = toDate(epochNow()),
   accessCount: number = 0,
   lastAccessedAt?: Date | string | null
 ): number {
@@ -147,7 +148,7 @@ export function confidenceScore(
   contentType: string,
   decayAt: Date | string,
   accessCount: number,
-  now: Date = new Date(),
+  now: Date = toDate(epochNow()),
   lastAccessedAt?: Date | string | null,
   modifiedAtForBackfill?: Date | string
 ): number {
@@ -348,7 +349,7 @@ function canonicalMemoryMultiplier(path: string, contentType: string, query: str
 export type CompositeScoringOptions = {
   /** Query-scoped weights override. Replaces DEFAULT_WEIGHTS; NOT applied under recency intent unless forceWeights. */
   weights?: CompositeWeights;
-  /** Injected clock for deterministic scoring (tests/eval). Defaults to new Date(). */
+  /** Injected clock for deterministic scoring (tests/eval). Defaults to toDate(epochNow()). */
   now?: Date;
   /** Test/experiment only: apply `weights` even under recency intent (bypass the RECENCY_WEIGHTS switch). */
   forceWeights?: boolean;
@@ -368,7 +369,7 @@ export function applyCompositeScoring(
   const weights = (recencyIntent && !options?.forceWeights)
     ? RECENCY_WEIGHTS
     : (options?.weights ?? (recencyIntent ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS));
-  const now = options?.now ?? new Date();
+  const now = options?.now ?? toDate(epochNow());
 
   const scored = results.map(r => {
     // §51.1: rank recency by content time — authorship when known, filing time

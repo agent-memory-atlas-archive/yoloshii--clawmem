@@ -27,6 +27,7 @@
  * Writes nothing: read-only store, no access recording, no co-activation writes.
  */
 import { parseArgs } from "util";
+import { toDate, epochNow } from "../src/clock.ts";
 import { readFileSync } from "fs";
 import { createStore, DEFAULT_EMBED_MODEL } from "../src/store.ts";
 import { enrichResults } from "../src/search-utils.ts";
@@ -196,7 +197,7 @@ let targeted = 0;
 let poolMisses = 0;
 
 const coFn: CoActivationFn = (path: string) => store.getCoActivated(path);
-const now = new Date();
+const now = toDate(epochNow());
 
 for (const evalCase of cases) {
   const det = await store.searchVecDetailed(evalCase.query, DEFAULT_EMBED_MODEL, pool, { excludeCollections: ["_clawmem"] });

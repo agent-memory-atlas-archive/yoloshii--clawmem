@@ -11,6 +11,7 @@
  * off / shadow / on.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { monoNow, deadlineAfter, duration, type MonoDeadline } from "../../src/clock.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -71,13 +72,13 @@ function mkNewObs(path: string, facts: string[]): { docId: number; facts: string
 }
 
 const step = (llm: any, observations: Array<{ docId: number; facts: string[] }>, opts?: {
-  mode?: "shadow" | "on"; deadlineAt?: number;
+  mode?: "shadow" | "on"; deadline?: MonoDeadline;
 }) =>
   runCausalStep(store, llm, {
     sessionId: "cw-test",
     mode: opts?.mode ?? "on",
     newObservations: observations,
-    deadlineAt: opts?.deadlineAt ?? Date.now() + 25_000,
+    deadline: opts?.deadline ?? deadlineAfter(monoNow(), duration(25_000)),
   });
 
 const edgeRows = () => store.db.prepare(
@@ -450,7 +451,7 @@ describe("runCausalStep", () => {
     const llm: any = { generate: async () => { calls++; return { text: "[]", model: "stub", done: true }; } };
 
     const result = await step(llm, [a, b],
-      { deadlineAt: Date.now() + PERSIST_RESERVE_MS + 100 });
+      { deadline: deadlineAfter(monoNow(), duration(PERSIST_RESERVE_MS + 100)) });
 
     expect(result.outcome).toBe("skipped_budget");
     expect(calls).toBe(0);
@@ -471,7 +472,7 @@ describe("runCausalStep", () => {
       sessionId: "cw-test",
       mode: "shadow",
       newObservations: [],
-      deadlineAt: Date.now() + 25_000,
+      deadline: deadlineAfter(monoNow(), duration(25_000)),
       invalidConfigNotes: ["CLAWMEM_STOP_BUDGET_MS=\"abc\" is not a positive integer — using 25000"],
     });
     expect(result.outcome).toBe("no_candidates");
@@ -716,7 +717,7 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     expect(embedTexts.length).toBeLessThanOrEqual(1);
   }, 20_000);
 
-  test("checkMergePolicy dedup embedding obeys its absolute deadline: past it, no embed starts", async () => {
+  test("checkMergePolicy dedup embedding obeys its MONOTONIC deadline (O1): past it, no embed starts", async () => {
     (store as any).ensureVecTable(4);
     // Two recent decision docs so dedup_check has candidates to compare against.
     mkDoc("decisions/recent-1.md", {});
@@ -731,12 +732,12 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     const { checkMergePolicy } = await import("../../src/hooks/decision-extractor.ts");
 
     // Past deadline → degrade to a plain insert with ZERO embedding calls.
-    const past = await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", Date.now() - 1);
+    const past = await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", deadlineAfter(monoNow(), duration(0)));
     expect(past.action).toBe("insert");
     expect(embedCalls).toBe(0);
 
     // In-budget → the dedup embedding runs (bounded by the same deadline).
-    await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", Date.now() + 10_000);
+    await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", deadlineAfter(monoNow(), duration(10_000)));
     expect(embedCalls).toBe(1);
   });
 });

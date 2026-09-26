@@ -7,6 +7,7 @@
  */
 
 import type { TranscriptMessage } from "./hooks.ts";
+import type { DurationMs } from "./clock.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
@@ -397,7 +398,7 @@ export async function extractObservations(
   /** s342 D2: the Stop handler threads its remaining whole-handler budget here
    *  so extraction cannot outlive `CLAWMEM_STOP_BUDGET_MS`. Omitted → the
    *  retry helper's default wall-clock cap applies (non-hook callers). */
-  opts?: { timeoutMs?: number }
+  opts?: { timeoutMs?: DurationMs }
 ): Promise<Observation[]> {
   if (messages.length < 4) return [];
 

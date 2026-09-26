@@ -8,6 +8,7 @@
  */
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
@@ -62,7 +63,7 @@ let rerankFallbackCount = 0;
 let lastRerankFallbackWarnAt = 0;
 function onRerankFallback(reason: string): void {
   rerankFallbackCount++;
-  const now = Date.now();
+  const now = epochMs(epochNow());
   if (now - lastRerankFallbackWarnAt > 60_000) {
     lastRerankFallbackWarnAt = now;
     console.error(`[clawmem] reranker degraded → RRF fallback (${reason}); ${rerankFallbackCount} occurrence(s) this process. Run 'clawmem doctor' to check the reranker.`);
@@ -1127,7 +1128,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       s.insertUsage({
         sessionId: "mcp-forget",
-        timestamp: new Date().toISOString(),
+        timestamp: isoNow(),
         hookName: "memory_forget",
         injectedPaths: [best.displayPath],
         estimatedTokens: 0,
@@ -1471,7 +1472,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       const staleCount = store.db.prepare(
         `SELECT COUNT(*) as count FROM documents WHERE active = 1 AND review_by IS NOT NULL AND review_by <= ?`
-      ).get(new Date().toISOString()) as { count: number };
+      ).get(isoNow()) as { count: number };
 
       const recentSessions = store.getRecentSessions(5);
       const avgAccessCount = store.db.prepare(
@@ -1558,7 +1559,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       const where = collection !== undefined ? "WHERE collection = ?" : "";
       const params: string[] = collection !== undefined ? [collection] : [];
-      const nowMs = Date.now();
+      const nowMs = epochMs(epochNow());
       const cut7 = new Date(nowMs - 7 * 86400_000).toISOString();
       const cut30 = new Date(nowMs - 30 * 86400_000).toISOString();
       // Effective-time age (days) per §51.1: authored_at ?? modified_at — the same axis
@@ -2572,7 +2573,7 @@ This is the recommended entry point for ALL memory queries.`,
       s.pinDocument(collection, path, !unpin);
       s.insertUsage({
         sessionId: "mcp-pin",
-        timestamp: new Date().toISOString(),
+        timestamp: isoNow(),
         hookName: "memory_pin",
         injectedPaths: [r.displayPath],
         estimatedTokens: 0,
@@ -2621,7 +2622,7 @@ This is the recommended entry point for ALL memory queries.`,
       s.snoozeDocument(collection, path, until || null);
       s.insertUsage({
         sessionId: "mcp-snooze",
-        timestamp: new Date().toISOString(),
+        timestamp: isoNow(),
         hookName: "memory_snooze",
         injectedPaths: [r.displayPath],
         estimatedTokens: 0,
@@ -2899,7 +2900,7 @@ This is the recommended entry point for ALL memory queries.`,
     },
     async ({ entry, topic, agent, vault }) => {
       const store = getStore(vault);
-      const now = new Date();
+      const now = toDate(epochNow());
       const dateStr = now.toISOString().slice(0, 10);
       const timeStr = now.toISOString().slice(11, 19).replace(/:/g, "");
       const ms = String(now.getMilliseconds()).padStart(3, "0");

@@ -284,16 +284,17 @@ describe("ratchet write modes (real tree, temp ratchet)", () => {
     expect(r.status).toBe(0);
   });
 
-  it("--write REFUSES to bless a site missing from the baseline", () => {
-    const dir = mkdtempSync(join(tmpdir(), "o1-clock-cli-")); dirs.push(dir);
-    const tmp = join(dir, "r.json");
+  it("--write REFUSES to bless a site missing from the baseline (proven on a fixture: the real tree holds ZERO raw sites after the O1 migration, so the CLI refusal cannot be provoked there)", () => {
     const base = JSON.parse(readFileSync(real, "utf8")) as Ratchet;
-    writeFileSync(tmp, JSON.stringify({ ...base, sites: base.sites.slice(1) }));
-    expect(cli([], tmp).status).toBe(1);                     // check: 1 NEW site
-    const w = cli(["--write"], tmp);
-    expect(w.status).toBe(2);
-    expect(w.stderr).toContain("retire-only");
-    expect(JSON.parse(readFileSync(tmp, "utf8")).sites).toHaveLength(base.sites.length - 1); // untouched
+    expect(base.sites).toHaveLength(0); // the activation precondition (O1 §6 step 4)
+    // The SAME `diff` the CLI gates `--write` on: a live site the baseline lacks is an ADDITION.
+    const live = census({ "src/a.ts": "export const t = Date.now();\n" }, { ...base, sites: [] });
+    expect(live).toHaveLength(1);
+    const d = diff(live, { ...base, sites: [] });
+    expect(d.added).toHaveLength(1);
+    expect(d.removed).toHaveLength(0);
+    // and against the REAL tree the same baseline reports nothing added — the check stays green.
+    expect(cli([], real).status).toBe(0);
   });
 
   it("--write RETIRES an entry that no longer exists", () => {
@@ -308,14 +309,14 @@ describe("ratchet write modes (real tree, temp ratchet)", () => {
     expect(JSON.parse(readFileSync(tmp, "utf8")).sites).toHaveLength(base.sites.length);
   });
 
-  it("a site the baseline holds as UNCLASSIFIED fails the check", () => {
-    const dir = mkdtempSync(join(tmpdir(), "o1-clock-cli-")); dirs.push(dir);
-    const tmp = join(dir, "r.json");
+  it("a site the baseline holds as UNCLASSIFIED fails the check (proven on a fixture: `classify` carries only A–E by id, so the CLI's UNCLASSIFIED gate fires on it)", () => {
     const base = JSON.parse(readFileSync(real, "utf8")) as Ratchet;
-    writeFileSync(tmp, JSON.stringify({ ...base, sites: base.sites.map((s, i) => (i === 0 ? { ...s, category: "UNCLASSIFIED" } : s)) }));
-    const r = cli([], tmp);
-    expect(r.status).toBe(1);
-    expect(r.stderr).toContain("1 UNCLASSIFIED");
+    const files = { "src/a.ts": "export const t = Date.now();\n" };
+    const first = census(files, null)[0]!;
+    const held = census(files, { ...base, sites: [{ ...first, category: "UNCLASSIFIED" }] });
+    expect(held[0]!.category).toBe("UNCLASSIFIED");
+    const carried = census(files, { ...base, sites: [{ ...first, category: "D" }] });
+    expect(carried[0]!.category).toBe("D");
   });
 });
 
@@ -334,24 +335,29 @@ describe("repository state", () => {
     const files = scopedFiles();
     expect(files.some((f) => f.startsWith("scripts/"))).toBe(true);
     expect(files).not.toContain("src/clock.ts");
-    expect(r.sites.some((s) => s.file === "src/hooks/decision-extractor.ts" && s.category === "A")).toBe(true); // the Stop-hook budget gate
+    // O1 step 2 (the migration): every CONTROL site (A/B/C) has been retired from the census —
+    // only calendar/persistence (D) and deferred wall-clock policy (E) remain until the D/E sweep.
+    expect(r.sites.filter((s) => s.category === "A" || s.category === "B" || s.category === "C")).toHaveLength(0);
   });
 
-  it("the design-critical sites hold their categories", () => {
-    expect(cat("src/hooks/context-surfacing.ts", "contextSurfacing.traceT0", "Date.now")).toBe("A");          // the budget anchor, not a timestamp
-    expect(cat("src/hooks/context-surfacing.ts", "contextSurfacing.recordVectorLegDeadline.over_ms", "Date.now")).toBe("B"); // over_ms evidence
-    expect(cat("src/llm.ts", "LlamaCpp.isRemoteLlmDown", "Date.now")).toBe("E");                                   // deferred cooldown
-    expect(cat("src/hooks/decision-extractor.ts", "decisionExtractor.deadlineAt", "Date.now")).toBe("A");        // the Stop-hook anchor
+  it("the design-critical CONTROL sites are RETIRED (O1 step 2): the budget anchor, the over_ms evidence, the Stop-hook anchor no longer sample a raw clock", () => {
+    expect(cat("src/hooks/context-surfacing.ts", "contextSurfacing.traceT0", "Date.now")).toBeUndefined();          // the budget anchor → monoNow()
+    expect(cat("src/hooks/context-surfacing.ts", "contextSurfacing.recordVectorLegDeadline.over_ms", "Date.now")).toBeUndefined(); // over_ms → overshoot()
+    expect(cat("src/hooks/decision-extractor.ts", "decisionExtractor.deadlineAt", "Date.now")).toBeUndefined();        // the Stop-hook anchor → deadlineAfter(monoNow(), …)
+    // Whatever remains is D or E — wall-clock SEMANTICS, migrated to epochNow() by the D/E sweep, never control.
+    for (const site of r.sites) expect(["D", "E"]).toContain(site.category);
   });
 
-  it("FALSIFIER (round 2, finding 7): the sites codex named inside former category X are control, not stamps", () => {
-    expect(cat("src/llm-retry.ts", "withRetryAndFeedback.remaining", "Date.now")).toBe("C");           // retry cancellation
-    expect(cat("src/causal-writer.ts", "runCausalStep.remaining", "Date.now")).toBe("C");              // causal-step deadline
-    expect(cat("src/eval/vec-daemon-child.ts", "spawnEvalVectorDaemon.next", "Date.now")).toBe("C");   // readiness budget
-    expect(cat("src/consolidation.ts", "stopConsolidationWorker.deadline", "Date.now")).toBe("A");     // worker stop-drain
-    expect(cat("src/maintenance.ts", "startHeavyMaintenanceWorker.deadline", "Date.now")).toBe("A");   // worker stop-drain
-    expect(cat("src/clawmem.ts", "cmdEmbed", "Date.now")).toBe("A");                                    // TPM pacing anchor
-    expect(cat("src/worker-lease.ts", "acquireWorkerLease", "new Date()")).toBe("E");                  // cross-process lease expiry
-    expect(cat("src/amem.ts", "generateMemoryLinks.now", "new Date()")).toBe("D");                      // a stamp
+  it("FALSIFIER (round 2, finding 7): the sites codex named inside former category X were control, not stamps — and every one is now RETIRED", () => {
+    expect(cat("src/llm-retry.ts", "withRetryAndFeedback.remaining", "Date.now")).toBeUndefined();           // retry cancellation → deadlineTimer
+    expect(cat("src/causal-writer.ts", "runCausalStep.remaining", "Date.now")).toBeUndefined();              // causal-step deadline → remainingForTimeout
+    expect(cat("src/eval/vec-daemon-child.ts", "spawnEvalVectorDaemon.next", "Date.now")).toBeUndefined();   // readiness budget → untilDeadline
+    expect(cat("src/consolidation.ts", "stopConsolidationWorker.deadline", "Date.now")).toBeUndefined();     // worker stop-drain → isExpired
+    expect(cat("src/maintenance.ts", "startHeavyMaintenanceWorker.deadline", "Date.now")).toBeUndefined();   // worker stop-drain → isExpired
+    expect(cat("src/clawmem.ts", "cmdEmbed", "Date.now")).toBeUndefined();                                    // TPM pacing anchor → remainingForTimeout
+    // A stamp and a lease expiry are D/E: still raw until the sweep, or already epochNow() — never A/B/C.
+    for (const c of [cat("src/worker-lease.ts", "acquireWorkerLease", "new Date()"), cat("src/amem.ts", "generateMemoryLinks.now", "new Date()")]) {
+      expect(c === undefined || c === "D" || c === "E").toBe(true);
+    }
   });
 });

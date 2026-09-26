@@ -744,9 +744,12 @@ describe("BUILD-3a: budget-derived rerank window at the real handler (subprocess
   const DRIVER = join(import.meta.dir, "../helpers/budget-guard-driver.ts");
   const JUNK3A = "test/m/budget-junk.md";
 
-  function runBudgetDriver(budget: string | null, expandDelayMs: number, opts?: { mode?: string; httpDelayMs?: number; expandHttpDelayMs?: number; vectorSyncDelayMs?: number; priorSlowFirstMs?: number; fileAwareSlowFirstMs?: number }) {
+  function runBudgetDriver(budget: string | null, expandDelayMs: number, opts?: { mode?: string; httpDelayMs?: number; expandHttpDelayMs?: number; vectorSyncDelayMs?: number; priorSlowFirstMs?: number; fileAwareSlowFirstMs?: number; wallJump?: string }) {
     const env = { ...process.env } as Record<string, string>;
     delete env.CLAWMEM_HOOK_BUDGET_MS;
+    // O1 §5: an optional realtime STEP in the driver process ("<atUptimeMs>:<deltaMs>", read by the clock module).
+    delete env.CLAWMEM_TEST_WALL_JUMP;
+    if (opts?.wallJump) env.CLAWMEM_TEST_WALL_JUMP = opts.wallJump;
     delete env.CLAWMEM_RERANK_LANE_WEIGHT;
     delete env.CLAWMEM_SESSION_FOCUS;
     delete env.CLAWMEM_VAULTS;
@@ -846,10 +849,11 @@ describe("BUILD-3a: budget-derived rerank window at the real handler (subprocess
     expect(r.rerankAttempted).toBe(true);
     expect(r.rankingKey).toBe("rerank");
     // Codex turn-23 F1: the production call's OPTIONS are regression-locked —
-    // removing deadlineAt (or requireLiveCoverage) from the handler's
-    // store.rerank call turns these red. deadlineAt is absolute: its delta
-    // from process start must equal budget − FINALIZATION_RESERVE (6000−500)
-    // minus the small pre-handler startup, never a per-call relative window.
+    // removing `deadline` (or requireLiveCoverage) from the handler's
+    // store.rerank call turns these red. `deadline` is a MONOTONIC instant
+    // (O1): its delta from the driver's monotonic start must equal budget −
+    // FINALIZATION_RESERVE (6000−500) plus the small pre-handler startup,
+    // never a per-call relative window.
     expect(r.requireLiveCoverage).toBe(true);
     expect(r.deadlineDeltaMs).not.toBeNull();
     expect(r.deadlineDeltaMs!).toBeGreaterThan(5500 - 400);
@@ -882,6 +886,31 @@ describe("BUILD-3a: budget-derived rerank window at the real handler (subprocess
     expect(wallMs).toBeLessThan(2300);           // PROCESS exit, not just handler return
     expect(r.finalPaths).toContain("test/m/ib1.md");
   }, 40_000);
+
+  // O1 §6 transport boundary locks under a realtime STEP (§5): forward and backward wall jumps
+  // inside the driver process change NONE of the outcomes above. Pre-O1, a backward step of 5 s
+  // during the window made `AbortSignal.timeout(deadlineAt - Date.now())` 5 s longer, so the
+  // remote batch / fetch ran to its full delay and the handler blew its budget.
+  for (const [label, wallJump] of [["BACKWARD −5 s", "300:-5000"], ["FORWARD +5 s", "300:5000"]] as const) {
+    it(`O1 §5: REAL store.rerank + delayed HTTP under budget 2000 with a ${label} wall step mid-window — the batch still aborts at the MONOTONIC window edge`, () => {
+      const r = runBudgetDriver("2000", 0, { mode: "real-http-delay", httpDelayMs: 2500, wallJump });
+      expect(r.rerankCalls).toBeGreaterThanOrEqual(1);
+      expect(r.rerankAttempted).toBe(true);
+      expect(r.rerankFailed).toBe(true);
+      expect(r.rankingKey).toBe("rrf");
+      expect(r.finalPaths).not.toContain(JUNK3A);
+      expect(r.elapsedMs).toBeLessThan(2400);
+    }, 40_000);
+
+    it(`O1 §5: REAL expansion + delayed LLM under budget 1000 with a ${label} wall step — the transport abort and the PROCESS exit still honor the monotonic budget`, () => {
+      const t0 = Date.now();
+      const r = runBudgetDriver("1000", 0, { expandHttpDelayMs: 2500, wallJump: wallJump.replace("300:", "200:") });
+      const wallMs = Date.now() - t0;
+      expect(r.elapsedMs).toBeLessThan(1300);
+      expect(wallMs).toBeLessThan(2300);
+      expect(r.finalPaths).toContain("test/m/ib1.md");
+    }, 40_000);
+  }
 
   it("pathological SYNC vector overrun past the window: optional legs SKIP, the primary-FTS floor still delivers (codex turn-25 F2)", () => {
     // A synchronous 900ms busy-wait in the vector leg cannot be interrupted

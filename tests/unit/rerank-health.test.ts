@@ -3,6 +3,7 @@
 // ~1e-11 scores that passed liveness yet silently collapsed ranking to RRF, and partial endpoint
 // output that zero-fills into a false-pass. See RERANKER-HEALTH-GUARD-DESIGN.md.
 import { test, expect, describe, afterEach, beforeEach } from "bun:test";
+import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { createStore, RerankCoverageError, RerankMalformedResponseError, rerankCacheKey, rerankTextHash, rerankTransmittedText, rerankProviderNamespace, writeRerankProviderFingerprint, revokeRerankProviderFingerprint, isRerankProviderRevoked, readRerankProviderFingerprint, rerankIdentityState, _setRerankStateReadHook, RERANK_PROVIDER_ATTESTATION_TTL_MS } from "../../src/store.ts";
 import { blendRerank, RERANK_DEGENERATE_FLOOR } from "../../src/search-utils.ts";
 import { probeRerankHealth, assessRerankDegeneracy, RERANK_CALIB_FLOOR, RERANK_DISCRIM_MARGIN, RERANK_REQUEST_SPREAD_FLOOR, type GoldenTriple } from "../../src/health/rerank-health.ts";
@@ -369,7 +370,7 @@ describe("probeRerankHealth", () => {
   });
 });
 
-describe("store.rerank deadlineAt (BUILD-3a: no untimed local fallback, bounded batches)", () => {
+describe("store.rerank deadline (BUILD-3a, O1: no untimed local fallback, bounded batches)", () => {
   const originalFetch = globalThis.fetch;
   const originalUrl = process.env.CLAWMEM_RERANK_URL;
   const originalNoLocal = process.env.CLAWMEM_NO_LOCAL_MODELS;
@@ -399,7 +400,7 @@ describe("store.rerank deadlineAt (BUILD-3a: no untimed local fallback, bounded 
     }) as unknown as typeof fetch;
     const store = createStore(":memory:");
     await expect(
-      store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadlineAt: Date.now() - 1 }),
+      store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadline: deadlineAfter(monoNow(), duration(0)) }),
     ).rejects.toBeInstanceOf(RerankCoverageError);
     expect(calls).toBe(0); // the pre-batch deadline check ran before any fetch
   });
@@ -411,7 +412,7 @@ describe("store.rerank deadlineAt (BUILD-3a: no untimed local fallback, bounded 
         { index: 1, relevance_score: 0.2 },
       ] }), { status: 200 })) as unknown as typeof fetch;
     const store = createStore(":memory:");
-    const out = await store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadlineAt: Date.now() + 10_000 });
+    const out = await store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadline: deadlineAfter(monoNow(), duration(10_000)) });
     expect(out[0]!.file).toBe("a");
     expect(out[0]!.score).toBe(0.7);
   });
@@ -431,9 +432,39 @@ describe("store.rerank deadlineAt (BUILD-3a: no untimed local fallback, bounded 
     }) as unknown as typeof fetch;
     const store = createStore(":memory:");
     await expect(
-      store.rerank("q", docs6, "m", undefined, { noCache: true, requireLiveCoverage: true, deadlineAt: Date.now() + 50 }),
+      store.rerank("q", docs6, "m", undefined, { noCache: true, requireLiveCoverage: true, deadline: deadlineAfter(monoNow(), duration(50)) }),
     ).rejects.toBeInstanceOf(RerankCoverageError);
     expect(calls).toBe(1); // batch 1 attempted; batch 2 stopped by the deadline
+  });
+
+  test("codex migration r2 #3: batch 1 finishes INSIDE the window, so batch 2 starts — and aborts on the REMAINING window, never a fresh full timeout", async () => {
+    // 6 docs → 2 batches under a 300 ms deadline (the hook's form). Batch 1 answers at ~150 ms; batch 2 honors its
+    // signal and hangs until it aborts. Remainder-bounded: batch 2 aborts at ~300 ms total. A fresh
+    // per-batch timeout would let it run to ~450 ms (150 + 300).
+    const docs6 = Array.from({ length: 6 }, (_, i) => ({ file: `d${i}`, text: `text number ${i}` }));
+    let calls = 0;
+    globalThis.fetch = (async (_url: unknown, init?: { signal?: AbortSignal }) => {
+      calls++;
+      if (calls === 1) {
+        await new Promise((r) => setTimeout(r, 150));
+        return new Response(JSON.stringify({ results: [0, 1, 2, 3].map((index) => ({ index, relevance_score: 0.5 })) }), { status: 200 });
+      }
+      return await new Promise<Response>((_resolve, reject) => {
+        const sig = init?.signal;
+        if (!sig) return reject(new Error("batch 2 was dispatched without a signal"));
+        if (sig.aborted) return reject(sig.reason);
+        sig.addEventListener("abort", () => reject(sig.reason), { once: true });
+      });
+    }) as unknown as typeof fetch;
+    const store = createStore(":memory:");
+    const t0 = performance.now();
+    await expect(
+      store.rerank("q", docs6, "m", undefined, { noCache: true, requireLiveCoverage: true, deadline: deadlineAfter(monoNow(), duration(300)) }),
+    ).rejects.toBeInstanceOf(RerankCoverageError);
+    const took = performance.now() - t0;
+    expect(calls).toBe(2);                    // batch 1 finished inside the window, so batch 2 was started
+    expect(took).toBeGreaterThanOrEqual(280); // batch 2 ran on what was left…
+    expect(took).toBeLessThan(400);           // …and aborted at the ORIGINAL deadline, not 150 + 300
   });
 
   test("remote fails under a deadline: the local fallback is NOT taken (deadline callers fail to the guard, never to unbounded CPU inference)", async () => {
@@ -443,10 +474,10 @@ describe("store.rerank deadlineAt (BUILD-3a: no untimed local fallback, bounded 
       return new Response("err", { status: 500 });
     }) as unknown as typeof fetch;
     const store = createStore(":memory:");
-    // Without deadlineAt this path would reach getDefaultLlamaCpp(); with it,
+    // Without `deadline` this path would reach getDefaultLlamaCpp(); with it,
     // the fallback is skipped and coverage throws instead.
     await expect(
-      store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadlineAt: Date.now() + 10_000 }),
+      store.rerank("q", docs, "m", undefined, { noCache: true, requireLiveCoverage: true, deadline: deadlineAfter(monoNow(), duration(10_000)) }),
     ).rejects.toBeInstanceOf(RerankCoverageError);
     expect(calls).toBeGreaterThanOrEqual(1);
   });

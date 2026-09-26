@@ -1,3 +1,4 @@
+import { DEADLINE_PROTOCOL_IDENTITY } from "../vector-protocol.ts";
 /**
  * Run-identity contract for the hook replay-eval — the SHARED definition of
  * what makes two runs comparable.
@@ -194,6 +195,19 @@ export interface RunIdentity {
    * vector legs ran under is unidentifiable).
    */
   vector_exec?: VectorExecIdentity;
+  /**
+   * O1 §4: the handler / evaluator TIMING contract — `DEADLINE_PROTOCOL_IDENTITY`
+   * ("monotonic-relative-v1") once O1 is ACTIVATED: every deadline decision,
+   * the finalization/trust timing, expansion and rerank cancellation derive
+   * from one monotonic anchor and relative windows. Top-level, not under
+   * `vector_exec`: the handler's timing changed in speed-only and in-process
+   * runs too. Stamped from the exported implementation constant, never a CLI
+   * option. Absent = a pre-activation report; from the activation commit on,
+   * every comparison surface (acceptance, pair, replicated members, aggregate)
+   * FAILS CLOSED on absence. Defining the constant is inert; stamping it here
+   * is the activation (O1 §6 step 4).
+   */
+  deadline_protocol?: string;
   /** Set ONLY by attestation tooling (retro-stamped baselines) — never by a live run. */
   attested?: string;
 }
@@ -256,6 +270,11 @@ export function validateIdentityShape(v: unknown, bad: (msg: string) => never): 
   if (typeof reps !== "number" || !Number.isInteger(reps) || reps < 1) bad("identity.latency_protocol.reps is not a positive integer");
   if ((lp as Record<string, unknown>).aggregation !== "lower-median") bad(`identity.latency_protocol.aggregation is not "lower-median"`);
   if (o.attested !== undefined && typeof o.attested !== "string") bad("identity.attested is not a string");
+  // O1 §4: optional until activation; when present it must be the ONE identity this code
+  // implements — any other value was not written by this build.
+  if (o.deadline_protocol !== undefined && o.deadline_protocol !== DEADLINE_PROTOCOL_IDENTITY) {
+    bad(`identity.deadline_protocol is not "${DEADLINE_PROTOCOL_IDENTITY}" (got ${JSON.stringify(o.deadline_protocol)}) — the only handler timing contract this build implements`);
+  }
   // ranking_policy is optional (absent = legacy pre-turn-18 report); when
   // present its shape must be valid or the comparison would silently skip
   // the strict checks (codex turn-17 finding 1).

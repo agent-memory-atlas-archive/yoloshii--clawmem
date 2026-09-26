@@ -19,8 +19,9 @@
  * pairing in BOTH directions under TypeScript's own applicability rules, every
  * applicable index paired, no preference anywhere; rounds 2–7 retained).
  *
- * The clock brands (`src/clock.ts`, `src/clock-legacy.ts`) make an epoch, a
- * monotonic instant, a duration and a deadline non-interchangeable — but only
+ * The clock brands (`src/clock.ts`; the legacy brand's `src/clock-legacy.ts`
+ * is retired from the tree and lives on only in this audit's fixtures) make an
+ * epoch, a monotonic instant, a duration and a deadline non-interchangeable — but only
  * where the compiler can see, and only if something RUNS the compiler. Bun does
  * not. This audit is the gate. Every check is driven by the TypeScript program;
  * nothing is a regex.
@@ -206,6 +207,8 @@ const REPO = resolve(import.meta.dir, "..");
 const RATCHET = process.env.O1_SEAM_RATCHET ? resolve(process.env.O1_SEAM_RATCHET) : join(REPO, "o1-seam-debt.json");
 
 export const CLOCK_MODULE = "src/clock.ts";
+/** The legacy brand's module — RETIRED from the real tree at the O1 migration (zero debt entries); the fixture
+ * tests still write it, and `Brands` simply skips it when the program has no such file. */
 export const LEGACY_MODULE = "src/clock-legacy.ts";
 export const LEGACY_BRAND = "LegacyWallDeadline";
 

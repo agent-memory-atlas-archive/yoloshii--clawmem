@@ -19,7 +19,7 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { DEFAULT_RERANK_MODEL, RerankCoverageError, RerankMalformedResponseError, writeRerankProviderFingerprint, revokeRerankProviderFingerprint, type Store } from "../store.ts";
 import type { Database } from "bun:sqlite";
-import type { DurationMs } from "../clock.ts";
+import { duration } from "../clock.ts";
 
 // Thresholds — LOCKED from a live zerank-2-seq baseline (2026-06-26, 8-pair golden set):
 //   relevant scores 0.9233-0.9700, hard-neg max 0.3120, min margin 0.6417, 0/8 inverted.
@@ -220,7 +220,7 @@ export async function probeRerankHealth(
 ): Promise<RerankHealthResult> {
   const calibFloor = opts.thresholds?.calibFloor ?? RERANK_CALIB_FLOOR;
   const discrimMargin = opts.thresholds?.discrimMargin ?? RERANK_DISCRIM_MARGIN;
-  const timeoutMs = (opts.timeoutMs ?? RERANK_PROBE_TIMEOUT_MS) as DurationMs /* O1-DEBT-0010 */;
+  const timeoutMs = duration(opts.timeoutMs ?? RERANK_PROBE_TIMEOUT_MS); // O1: a validated construction, not an assertion
   const model = opts.model ?? DEFAULT_RERANK_MODEL;
   const triples = opts.triples ?? loadGoldenSet();
 

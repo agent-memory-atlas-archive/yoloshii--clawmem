@@ -18,6 +18,7 @@
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { monoNow, elapsed, evidenceMs } from "../clock.ts";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { buildMcpServer } from "../mcp.ts";
 import type { GoldExample } from "./types.ts";
@@ -68,11 +69,11 @@ export async function replayQueryExample(
   };
   if (example.collection) args.collection = example.collection;
 
-  const t0 = performance.now();
+  const t0 = monoNow();
   const res = await client.callTool({ name: "query", arguments: args }) as {
     structuredContent?: { results?: { path?: string }[] };
   };
-  const elapsedMs = performance.now() - t0;
+  const elapsedMs = evidenceMs(elapsed(t0));
 
   const orderedPaths = (res.structuredContent?.results ?? [])
     .map(r => r.path ?? "")

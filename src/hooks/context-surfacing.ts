@@ -50,9 +50,11 @@ import {
   persistSurfacingTrace,
   type SurfacingTrace,
   type TraceEmptyReason,
+  type VectorLegTerminal,
 } from "../eval/hook-trace.ts";
 import { PROFILES } from "../config.ts";
-import type { LegacyWallDeadline } from "../clock-legacy.ts";
+import { monoNow, duration, evidenceMs, deadlineAfter, deadlineBefore, earliest, isExpired, remainingForTimeout, elapsed, allotted, overshoot, raceDeadline, spanStart, spanEvidence, type DurationMs, type MonoDeadline, type MonoInstant, type Span, toDate, epochNow, epochMs, epochBefore } from "../clock.ts";
+import { MAX_LEG_BUDGET_MS } from "../vector-protocol.ts";
 
 // =============================================================================
 // Config
@@ -74,16 +76,133 @@ export { RERANK_REQUEST_REV } from "../store.ts";
  * non-finite, or non-positive values fall back to the default — the budget
  * can never be disabled, only sized. Values below MIN_HOOK_BUDGET_MS clamp
  * up (a sub-second budget cannot complete even the fast path honestly).
+ *
+ * O1 §2 (codex rev-6 F4 / rev-7 F4 / rev-8 F4): the budget now has a
+ * MAXIMUM, `MAX_HOOK_BUDGET_MS` (= the daemon wire's `MAX_LEG_BUDGET_MS`,
+ * 25_000 — see vector-protocol.ts for the grounding), and the parse is a
+ * DISCRIMINATED result: the accepted branch carries the branded `DurationMs`
+ * the handler and the evaluator identity consume — there is no other path to
+ * a budget — while the rejected branch carries diagnostics and NO usable
+ * budget. Order: normalize exactly as before (fallback, clamp, floor), THEN
+ * validate the effective integer — so `"25000.9"` floors to the supported
+ * 25000 and is accepted, while `"3e4"` normalizes to 30000 and is refused.
+ * Positive flooring can only decrease a value, so validation second can never
+ * manufacture an over-max integer from an in-range input.
+ *
+ *   - `assertHookBudgetConfig()` runs at hook STARTUP (cmdHook) and inside
+ *     the handler itself: an unsupported value refuses the RUN with a clear
+ *     stderr line (the hook stays fail-open for the prompt);
+ *   - `clawmem setup hooks` refuses to install an unsupported value;
+ *   - `clawmem doctor` reads and REPORTS an unsupported installed value
+ *     without crashing — `parseHookBudgetConfig` never throws.
  */
 export const DEFAULT_HOOK_BUDGET_MS = 6000;
 export const MIN_HOOK_BUDGET_MS = 1000;
-export function resolveHookBudgetMs(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return DEFAULT_HOOK_BUDGET_MS;
+/** The supported maximum internal budget — EQUAL to the wire ceiling by construction (O1 §2). */
+export const MAX_HOOK_BUDGET_MS = MAX_LEG_BUDGET_MS;
+
+export type HookBudgetConfig =
+  | {
+      valid: true;
+      /** The budget the handler runs under — the ONLY source of a hook budget. */
+      budget: DurationMs;
+      /** The same value as a plain number, for diagnostics and host-timeout arithmetic. */
+      effectiveMs: number;
+      raw: string | undefined;
+      /** Set when the raw value was normalized (fallback or clamp) — reported, never fatal. */
+      note: string | null;
+    }
+  | {
+      valid: false;
+      raw: string;
+      /** What the value normalizes to — shown so the operator sees why it is refused. */
+      effectiveMs: number;
+      reason: string;
+    };
+
+/** Non-throwing parser over `CLAWMEM_HOOK_BUDGET_MS` (see above for the table). */
+export function parseHookBudgetConfig(raw: string | undefined): HookBudgetConfig {
+  const accept = (effectiveMs: number, note: string | null): HookBudgetConfig =>
+    ({ valid: true, budget: duration(effectiveMs), effectiveMs, raw, note });
+  if (raw === undefined || raw.trim() === "") return accept(DEFAULT_HOOK_BUDGET_MS, null);
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_HOOK_BUDGET_MS;
-  return Math.max(MIN_HOOK_BUDGET_MS, Math.floor(n));
+  if (!Number.isFinite(n) || n <= 0) {
+    return accept(DEFAULT_HOOK_BUDGET_MS, `CLAWMEM_HOOK_BUDGET_MS=${JSON.stringify(raw)} is not a positive finite number — using the default ${DEFAULT_HOOK_BUDGET_MS}ms`);
+  }
+  const effectiveMs = Math.max(MIN_HOOK_BUDGET_MS, Math.floor(n));
+  if (effectiveMs > MAX_HOOK_BUDGET_MS) {
+    return {
+      valid: false,
+      raw,
+      effectiveMs,
+      reason: `CLAWMEM_HOOK_BUDGET_MS=${raw} normalizes to ${effectiveMs}ms, above the supported maximum ${MAX_HOOK_BUDGET_MS}ms — set a value ≤ ${MAX_HOOK_BUDGET_MS} (at the maximum the host hook timeout must be ≥ ${Math.ceil((STARTUP_ALLOWANCE_MS + MAX_HOOK_BUDGET_MS) / 1000)}s and a prompt can block that long)`,
+    };
+  }
+  return accept(effectiveMs, effectiveMs !== n ? `CLAWMEM_HOOK_BUDGET_MS=${raw} normalized to ${effectiveMs}ms` : null);
 }
-export const HOOK_BUDGET_MS = resolveHookBudgetMs(process.env.CLAWMEM_HOOK_BUDGET_MS);
+
+/** Thrown by `assertHookBudgetConfig` for an unsupported budget — the run is refused, never silently resized. */
+/** A shell word the shell passes VERBATIM: no quoting, escaping, expansion, globbing or operators (empty allowed). */
+const SHELL_PLAIN_WORD = /^[^\s'"\\$`;|&<>(){}*?[\]#~!]*$/;
+
+/** What an installed hook COMMAND carries for `CLAWMEM_HOOK_BUDGET_MS` (see `readInstalledHookBudget`). */
+export type InstalledHookBudget =
+  | { kind: "absent" }
+  | { kind: "assigned"; raw: string; config: HookBudgetConfig }
+  | { kind: "noncanonical"; detail: string };
+
+/**
+ * Codex migration r1 P5: the budget an installed hook command carries, read STRUCTURALLY — never a
+ * token regex that keeps shell quoting. The one form this can verify is what `clawmem setup hooks`
+ * writes: a LEADING shell prefix assignment `CLAWMEM_HOOK_BUDGET_MS=<plain word>` (other plain
+ * `NAME=word` prefix assignments may sit beside it) and no other mention of the variable anywhere
+ * in the command. A plain word reaches the process verbatim, so its value is parsed by
+ * `parseHookBudgetConfig` exactly as the hook will parse it — an unsupported value such as `3e4`
+ * is REPORTED, not hidden. Anything else that mentions the variable — a quoted or escaped value,
+ * an expansion, an `env`/`export` form, an assignment after the executable, a repeat — is
+ * `noncanonical`: the value the shell passes cannot be verified here, and a doctor that guessed
+ * would report green on a budget the hook refuses (`"30000"` read as a non-number → the default).
+ */
+export function readInstalledHookBudget(command: string): InstalledHookBudget {
+  const VAR = "CLAWMEM_HOOK_BUDGET_MS";
+  const mentions = command.split(VAR).length - 1;
+  if (mentions === 0) return { kind: "absent" };
+  let raw: string | null = null;
+  for (const token of command.trim().split(/\s+/)) {
+    const eq = token.indexOf("=");
+    // The prefix-assignment block ends at the first token that is not `NAME=…` (the executable).
+    if (eq <= 0 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(token.slice(0, eq))) break;
+    const name = token.slice(0, eq);
+    const value = token.slice(eq + 1);
+    if (!SHELL_PLAIN_WORD.test(value)) {
+      return { kind: "noncanonical", detail: `the ${name} prefix assignment is not a plain shell word (${JSON.stringify(token)})` };
+    }
+    if (name === VAR) {
+      if (raw !== null) return { kind: "noncanonical", detail: `${VAR} is assigned more than once in the command prefix` };
+      raw = value;
+    }
+  }
+  if (raw === null) return { kind: "noncanonical", detail: `${VAR} appears in the command but not as a leading plain prefix assignment (${JSON.stringify(command)})` };
+  if (mentions !== 1) return { kind: "noncanonical", detail: `${VAR} is mentioned more than once in the command` };
+  return { kind: "assigned", raw, config: parseHookBudgetConfig(raw) };
+}
+
+export class HookBudgetConfigError extends Error {
+  constructor(message: string) { super(message); this.name = "HookBudgetConfigError"; }
+}
+
+/**
+ * The hook budget, or a `HookBudgetConfigError`. The handler calls this at
+ * entry and the CLI calls it at hook startup; the evaluator stamps its
+ * identity from it. Reads the process environment on every call — the parse
+ * is trivial and a module-level constant would be exactly the "usable budget
+ * under an invalid config" this contract forbids.
+ */
+export function assertHookBudgetConfig(raw: string | undefined = process.env.CLAWMEM_HOOK_BUDGET_MS): DurationMs {
+  const cfg = parseHookBudgetConfig(raw);
+  if (!cfg.valid) throw new HookBudgetConfigError(cfg.reason);
+  return cfg.budget;
+}
 
 /**
  * Tail of the budget reserved for finalization (failure guard, filters,
@@ -237,35 +356,53 @@ export async function contextSurfacing(
   // harness's to keep, never written into the vault under diagnosis.
   const selfArmed = !opts?.trace && liveSurfacingTraceEnabled();
   const trace = opts?.trace ?? (selfArmed ? newSurfacingTrace() : undefined);
-  const traceT0 = Date.now();
+  // O1: THE anchor — monotonic. Its only consumers are durations (totalMs) and
+  // the budget deadlines below; no wall-clock instant is ever persisted from it.
+  const traceT0 = monoNow();
+  // O1 §1/§2: ONE monotonic anchor, and the ONLY path to a budget — an
+  // unsupported value throws HERE, at TRUE handler entry (codex migration r1
+  // P1): before the turn-index read, the gates, dedup, or any early return, so
+  // an unsupported budget refuses EVERY invocation — including the ones that
+  // would have returned empty — and no observable work runs under it. cmdHook
+  // refuses before stdin or the store; a direct caller such as the eval harness
+  // refuses at run start. BUILD-3a (C2c/C3): the budget clock anchors at
+  // handler entry (turn-index, gating and dedup work spend the budget too;
+  // codex turn-23 finding 3), and every deadline in this handler derives from
+  // the internal budget. The rerank window ends a FINALIZATION_RESERVE before
+  // the internal deadline so a full-window rerank still leaves time for the
+  // guard/ordering/emit tail. Every control decision below is `isExpired` on a
+  // deadline derived from these two; a realtime step moves none of them.
+  const hookBudget = assertHookBudgetConfig();
+  const internalDeadline = deadlineAfter(traceT0, hookBudget);
+  const workDeadline = deadlineBefore(internalDeadline, duration(FINALIZATION_RESERVE_MS));
   // BUILD-3a: set when the deep escalation block concludes (success or
   // catch) — everything after it is finalization, measured against
   // FINALIZATION_RESERVE_MS by the observed eval invariant.
-  let escalationEndAt: number | null = null;
+  let escalationEndAt: MonoInstant | null = null;
   // BUILD-3d.4: substage stamps across the finalization window (escalation
   // end → emit). finStamp records a monotonic boundary timestamp; finish()
   // turns the reached stamps into per-substage deltas so the harness can see
   // WHERE the reserve is spent (codex turn-47 finding 2). Recording is
-  // unconditional (Date.now() is free); the breakdown is computed only for
+  // unconditional (monoNow() is free); the breakdown is computed only for
   // deep reps (escalationEndAt !== null), matching finalizationMs.
-  const finStamps: Record<string, number> = {};
-  const finStamp = (label: string): void => { finStamps[label] = Date.now(); };
+  const finStamps: Record<string, MonoInstant> = {};
+  const finStamp = (label: string): void => { finStamps[label] = monoNow(); };
   const finish = (out: HookOutput, outcome: "injected" | "empty", emptyReason?: TraceEmptyReason): HookOutput => {
     if (trace) {
       trace.outcome = outcome;
       trace.emptyReason = emptyReason ?? null;
-      trace.timings.totalMs = Date.now() - traceT0;
+      trace.timings.totalMs = evidenceMs(elapsed(traceT0));
       // t60 (codex F59-3): postOutputMs is a property of the PAYLOAD boundary,
       // not of the deep finalization clock — measure payload-assembled → emit
       // for every payload-bearing profile (balanced/speed included). Stays
       // null when no payload was assembled (empty outcomes).
       {
-        const emitAt = Date.now();
+        const emitAt = monoNow();
         const payloadAt = finStamps["payload"];
-        trace.timings.postOutputMs = payloadAt !== undefined ? emitAt - payloadAt : null;
+        trace.timings.postOutputMs = payloadAt !== undefined ? evidenceMs(elapsed(payloadAt, emitAt)) : null;
       }
       if (escalationEndAt !== null) {
-        const emitAt = Date.now();
+        const emitAt = monoNow();
         // BUILD-5 (the t48 option-B contract change, codex-authorized):
         // finalizationMs bounds escalation end → PAYLOAD ASSEMBLED — the
         // output-critical construction the reserve exists to protect. The
@@ -275,20 +412,20 @@ export async function contextSurfacing(
         // return never assembles a payload; its finalization runs to emit.
         const payloadAt = finStamps["payload"];
         const finalEndAt = payloadAt ?? emitAt;
-        trace.timings.finalizationMs = finalEndAt - escalationEndAt;
+        trace.timings.finalizationMs = evidenceMs(elapsed(escalationEndAt, finalEndAt));
         // Deltas from escalation end through whichever boundaries were
         // reached (an early empty return sets fewer stamps). "tail" is the
         // remainder after the last boundary up to the payload boundary.
         const order = ["filters", "enrich", "scoring", "ordering", "buildContext", "facts"];
         const sub: Record<string, number> = {};
-        let prev = escalationEndAt;
+        let prev: MonoInstant = escalationEndAt;
         for (const k of order) {
           const t = finStamps[k];
           if (t === undefined) break;
-          sub[k] = t - prev;
+          sub[k] = evidenceMs(elapsed(prev, t));
           prev = t;
         }
-        sub.tail = finalEndAt - prev;
+        sub.tail = evidenceMs(elapsed(prev, finalEndAt));
         trace.timings.finalizationSubstages = sub;
       }
       if (selfArmed) {
@@ -356,15 +493,7 @@ export async function contextSurfacing(
   const profile = getActiveProfile();
   const maxResults = profile.maxResults;
   const tokenBudget = profile.tokenBudget;
-  // BUILD-3a (C2c/C3): the budget clock anchors at HANDLER ENTRY (traceT0 —
-  // turn-index, gating and dedup work spend the budget too; codex turn-23
-  // finding 3), and every deadline in this handler derives from the internal
-  // budget. The rerank window ends a FINALIZATION_RESERVE before the
-  // internal deadline so a full-window rerank still leaves time for the
-  // guard/ordering/emit tail.
-  const startTime = traceT0;
-  const internalDeadlineAt = startTime + HOOK_BUDGET_MS as LegacyWallDeadline /* O1-DEBT-0001 */;
-  const workDeadlineAt = internalDeadlineAt - FINALIZATION_RESERVE_MS as LegacyWallDeadline /* O1-DEBT-0002 */;
+  // (The budget and its deadlines were acquired at handler entry — see traceT0.)
 
   if (trace) {
     // Mirror getActiveProfile's name resolution (unknown names fall back to balanced).
@@ -494,29 +623,66 @@ export async function contextSurfacing(
   // CURRENT PROMPT + resolved session topic on EVERY leg — the prior leg searches with joined
   // priors and deep legs with expansion variants, but presentation is always the current prompt.
   const hydration = { presentationQuery: prompt, intent: sessionTopic };
-  // Codex t81 P1+P2: one measured record per COMPLETED vector invocation — its
-  // finish vs its OWN absolute deadline (over_ms > 0 ⇒ finished LATE, INCLUDING
-  // the synchronous client hydrate), and the duration it was actually allotted.
-  const recordVectorLegDeadline = (leg: "primary" | "prior" | "deep", deadlineAbs: LegacyWallDeadline, startedAt: number): void => {
-    if (trace) (trace.vectorLegDeadlines ??= []).push({ leg, over_ms: Date.now() - deadlineAbs, budget_ms: deadlineAbs - startedAt });
+  // Codex t81 P1+P2 / O1 §3: one measured record per COMPLETED vector invocation —
+  // its finish vs its OWN monotonic deadline (over_ms > 0 ⇒ finished LATE), the
+  // window it was allotted, the span on BOTH clocks (clock_skew_ms exposes a
+  // realtime step), and the terminal kind derived from how the race settled ×
+  // the invocation's classified path: completion (settled, `ok`), abandonment
+  // (the deadline won — the handler's race timer, or the daemon client's own
+  // authoritative timer, which classifies the path `deadline`), fallback
+  // (settled on any other non-ok path, or threw).
+  // Codex migration r1 S1: the path is INVOCATION-LOCAL — each invocation owns
+  // its recorder and its record reads exactly that invocation's outcome, never
+  // a search of the shared leg-named ledger (deep invocations share one name; a
+  // late or missing classification must not borrow another invocation's).
+  // Codex migration r1 S2: every finish-time quantity derives from ONE terminal
+  // sample `end`, and each quantity leaves the branded world through
+  // `evidenceMs` here — so over_ms = mono_elapsed_ms − budget_ms exactly
+  // whenever the invocation started before its deadline.
+  type VectorLegRace = "settled" | "timeout" | "threw";
+  const isVectorTimeout = (e: unknown): boolean => e instanceof Error && e.message === "vector timeout";
+  const vectorLegInvocation = (leg: "primary" | "prior" | "deep") => {
+    let status: VecExecStatus | null = null;
+    const toLedger = recordVectorLeg(leg);
+    return {
+      onPath: (path: VecExecStatus, protocol?: VecResponseProtocol): void => { status = path; toLedger(path, protocol); },
+      status: (): VecExecStatus | null => status,
+    };
+  };
+  const recordVectorLegDeadline = (leg: "primary" | "prior" | "deep", deadline: MonoDeadline, started: Span, end: Span, race: VectorLegRace, status: VecExecStatus | null): void => {
+    if (!trace) return;
+    const terminal: VectorLegTerminal = race === "timeout" || status === "deadline" ? "abandonment"
+      : race === "settled" && status === "ok" ? "completion" : "fallback";
+    const span = spanEvidence(started, end);
+    (trace.vectorLegDeadlines ??= []).push({
+      leg,
+      over_ms: evidenceMs(overshoot(deadline, end.mono)),
+      budget_ms: evidenceMs(allotted(started.mono, deadline)),
+      mono_elapsed_ms: evidenceMs(span.mono),
+      wall_elapsed_ms: evidenceMs(span.wall),
+      clock_skew_ms: evidenceMs(span.skew),
+      terminal_kind: terminal,
+      status,
+    });
   };
 
   // Current vector leg (if profile allows)
   let vectorResults: SearchResult[] = [];
   if (profile.useVector) {
-    let vectorTimer: ReturnType<typeof setTimeout> | undefined;
-    let primaryDeadlineAbs: LegacyWallDeadline | undefined;
-    const vectorT0 = Date.now();
+    let primaryDeadline: MonoDeadline | undefined;
+    let primaryRace: VectorLegRace = "threw";
+    const vectorStart = spanStart();
+    const primaryLeg = vectorLegInvocation("primary");
     try {
-      // Pass a wall-clock deadline into searchVec: the Promise.race below abandons the vector
+      // Pass a MONOTONIC deadline into searchVec (O1): the race below abandons the vector
       // promise on timeout but cannot CANCEL it (and cannot interrupt its synchronous scan). The
       // deadline makes searchVec self-abort before the blocking MATCH, so a slow embed cannot let
       // an already-timed-out vector leg resume and re-block the hook after it fell back to FTS.
       // Capped by the work deadline MINUS the candidate floor reserve
       // (codex turn-23 finding 3 + turn-25 finding 2): the vector leg can
       // never eat the primary-FTS/fusion floor's reserved slice.
-      const vectorDeadline = Math.min(Date.now() + profile.vectorTimeout, workDeadlineAt - CANDIDATE_FLOOR_RESERVE_MS) as LegacyWallDeadline /* O1-DEBT-0003 */;
-      primaryDeadlineAbs = vectorDeadline;
+      const vectorDeadline = earliest(deadlineAfter(vectorStart.mono, duration(profile.vectorTimeout)), deadlineBefore(workDeadline, duration(CANDIDATE_FLOOR_RESERVE_MS)));
+      primaryDeadline = vectorDeadline;
       // searchVecBounded runs Step 1 (the blocking MATCH) in the vector daemon when it is live, so the
       // Promise.race timer below can ACTUALLY fire (this event loop stays free during the scan). When the
       // daemon is absent it falls back to the in-process searchVec unchanged; when the daemon is
@@ -526,28 +692,28 @@ export async function contextSurfacing(
       // refuses the run as daemon loss) and the in-process synchronous scan is never entered, so the
       // timer above is authoritative by construction. Production hooks never set it.
       const vectorPromise = vectorDaemonRequired
-        ? searchVecDaemonRequired(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, recordVectorLeg("primary"), hydration)
-        : searchVecBounded(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, recordVectorLeg("primary"), hydration);
-      const timeoutPromise = new Promise<SearchResult[]>((_, reject) => {
-        vectorTimer = setTimeout(() => reject(new Error("vector timeout")), Math.max(1, vectorDeadline - Date.now()));
-      });
-      vectorResults = await Promise.race([vectorPromise, timeoutPromise]);
+        ? searchVecDaemonRequired(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, primaryLeg.onPath, hydration)
+        : searchVecBounded(store, prompt, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline, primaryLeg.onPath, hydration);
+      // raceDeadline clears its own timer whichever side settles: a pending (ref'd) timer would
+      // keep the Bun hook process alive for the full vectorTimeout after results are in hand.
+      vectorResults = await raceDeadline(vectorPromise, vectorDeadline, () => new Error("vector timeout"));
+      primaryRace = "settled";
     } catch (e) {
+      primaryRace = isVectorTimeout(e) ? "timeout" : "threw";
       // Vector search unavailable, timed out, or errored — fall back to BM25. A vault-wide
       // embedding-model mismatch is a persistent config error, not a transient miss: surface it
       // loudly once, then degrade (the hook stays fail-open).
       warnOnceOnVectorModelMismatch(e);
     } finally {
-      // Clear the timer when the vector promise won the race: a pending (ref'd) setTimeout keeps the
-      // Bun hook process alive for the full vectorTimeout after results are already in hand.
-      if (vectorTimer) clearTimeout(vectorTimer);
       // Recorded on EVERY path — the timed-out leg is exactly the one whose
-      // wall time the replay-eval must see (success-only stamping left it
+      // elapsed time the replay-eval must see (success-only stamping left it
       // null whenever the race timer won against the daemon's own deadline).
-      if (trace) trace.timings.vectorMs = Date.now() - vectorT0;
+      // ONE terminal sample for both the leg timing and its deadline record (codex migration r1 S2).
+      const vectorEnd = spanStart();
+      if (trace) trace.timings.vectorMs = evidenceMs(elapsed(vectorStart.mono, vectorEnd.mono));
       // Codex t81 P2: the primary leg's finish vs its OWN deadline (the min()
-      // above), measured in the finally so the late client hydrate is included.
-      if (primaryDeadlineAbs !== undefined) recordVectorLegDeadline("primary", primaryDeadlineAbs, vectorT0);
+      // above), measured in the finally so a late client-side decode is included.
+      if (primaryDeadline !== undefined) recordVectorLegDeadline("primary", primaryDeadline, vectorStart, vectorEnd, primaryRace, primaryLeg.status());
     }
   }
   if (vectorResults.length > 0) lanes.push({ lane: "vector", results: vectorResults });
@@ -573,12 +739,12 @@ export async function contextSurfacing(
   // Skipped once the work window has closed (codex turn-25 finding 2) — the
   // prior leg is a supplement; a pathological earlier overrun (a sync scan
   // the race could not interrupt) must not also spend the reserved tail.
-  if (priorLegEnabled && Date.now() < workDeadlineAt) {
+  if (priorLegEnabled && !isExpired(workDeadline)) {
     for (const p of priors) {
       // Re-checked before EVERY search (codex turn-26): a first synchronous
       // search that crosses the deadline must not let the remaining ones
       // start inside the finalization reserve.
-      if (Date.now() >= workDeadlineAt) break;
+      if (isExpired(workDeadline)) break;
       try {
         const hits = store.searchFTS(p, 5);
         if (hits.length > 0) lanes.push({ lane: "prior-fts", results: hits, variantQuery: p });
@@ -598,26 +764,24 @@ export async function contextSurfacing(
     const priorVectorAllowed = priorVecInproc || vectorDaemonLikelyAvailable(store.dbPath);
     // Re-checked immediately before starting (codex turn-26): the FTS loop
     // above may have consumed the window.
-    if (profile.useVector && priorVectorAllowed && Date.now() < workDeadlineAt) {
+    if (profile.useVector && priorVectorAllowed && !isExpired(workDeadline)) {
       const joinedPriors = priors.join("\n\n").slice(0, MULTI_TURN_MAX_CHARS);
       const priorTimeout = Math.min(400, profile.vectorTimeout);
-      let priorTimer: ReturnType<typeof setTimeout> | undefined;
       // Hoisted out of the try so the finally can attribute the leg's deadline (codex t81 P2).
-      const priorLegStart = Date.now();
-      const priorDeadline = Math.min(priorLegStart + priorTimeout, workDeadlineAt) as LegacyWallDeadline /* O1-DEBT-0004 */;
+      const priorStart = spanStart();
+      const priorDeadline = earliest(deadlineAfter(priorStart.mono, duration(priorTimeout)), workDeadline);
+      let priorRace: VectorLegRace = "threw";
+      const priorLeg = vectorLegInvocation("prior");
       try {
         const priorVecPromise = priorVecInproc
-          ? searchVecBounded(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, recordVectorLeg("prior"), hydration)
-          : searchVecDaemonRequired(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, recordVectorLeg("prior"), hydration);
-        const priorTimeoutPromise = new Promise<SearchResult[]>((_, reject) => {
-          priorTimer = setTimeout(() => reject(new Error("vector timeout")), Math.max(1, priorDeadline - Date.now()));
-        });
-        const priorVec = await Promise.race([priorVecPromise, priorTimeoutPromise]);
+          ? searchVecBounded(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, priorLeg.onPath, hydration)
+          : searchVecDaemonRequired(store, joinedPriors, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, priorDeadline, priorLeg.onPath, hydration);
+        const priorVec = await raceDeadline(priorVecPromise, priorDeadline, () => new Error("vector timeout"));
+        priorRace = "settled";
         if (priorVec.length > 0) lanes.push({ lane: "prior-vector", results: priorVec, variantQuery: joinedPriors });
-      } catch (e) { warnOnceOnVectorModelMismatch(e); /* prior leg is supplementary — non-fatal */ }
+      } catch (e) { priorRace = isVectorTimeout(e) ? "timeout" : "threw"; warnOnceOnVectorModelMismatch(e); /* prior leg is supplementary — non-fatal */ }
       finally {
-          if (priorTimer) clearTimeout(priorTimer);
-          recordVectorLegDeadline("prior", priorDeadline, priorLegStart); // codex t81 P2: prior leg vs its own dynamic deadline
+          recordVectorLegDeadline("prior", priorDeadline, priorStart, spanStart(), priorRace, priorLeg.status()); // codex t81 P2: prior leg vs its own dynamic deadline
         }
     }
   }
@@ -629,7 +793,7 @@ export async function contextSurfacing(
   // Every downstream secondary-vault path (snooze routing, enrichment, the recall
   // mirror) keys off the `_fromVault` tag set here, so this single gate starves
   // them all when disabled.
-  if (surfaceSecondaryVaults() && getVaultPath("skill") && Date.now() < workDeadlineAt) {
+  if (surfaceSecondaryVaults() && getVaultPath("skill") && !isExpired(workDeadline)) {
     try {
       const skillStore = resolveStore("skill", skillStoreOpts);
       const skillResults = skillStore.searchFTS(prompt, 5);
@@ -648,11 +812,11 @@ export async function contextSurfacing(
   // File-path extraction stays on the raw current prompt so priors cannot
   // pollute the file-specific discovery channel with stale filenames.
   const fileMatches = [...prompt.matchAll(FILE_PATH_RE)].map(m => m[1]!.trim()).filter(Boolean);
-  if (fileMatches.length > 0 && Date.now() < workDeadlineAt) {
+  if (fileMatches.length > 0 && !isExpired(workDeadline)) {
     for (const fp of fileMatches.slice(0, 3)) {
       // Re-checked before EVERY search (codex turn-26) — same rule as the
       // prior loop: one crossing search must not admit the rest.
-      if (Date.now() >= workDeadlineAt) break;
+      if (isExpired(workDeadline)) break;
       try {
         const fileResults = store.searchFTS(fp, 2);
         if (fileResults.length > 0) lanes.push({ lane: "file-aware", results: fileResults, variantQuery: fp });
@@ -682,27 +846,21 @@ export async function contextSurfacing(
   let rerankedKeysDesc: string[] | null = null;
   let expansionLanesAdded = false;
   if (profile.deepEscalation && results.length >= 2) {
-    const elapsed = Date.now() - startTime;
+    const escalationDeadline = deadlineAfter(traceT0, duration(profile.escalationBudgetMs));
     // Entry needs BOTH the profile's escalation window AND the whole-handler
     // budget still open (codex turn-23 finding 3).
-    if (elapsed < profile.escalationBudgetMs && Date.now() < workDeadlineAt) {
-      let expandTimer: ReturnType<typeof setTimeout> | undefined;
+    if (!isExpired(escalationDeadline) && !isExpired(workDeadline)) {
       try {
         // Phase 1: Query expansion — discover candidates BM25+vector missed.
         // Bounded by the remaining budget (codex turn-23 finding 3): the LLM
         // call itself is not signal-aware, so the race abandons it on expiry
         // — the rejection lands in the escalation catch (expansion recorded
         // failed, the guard arbitrates), same pattern as the vector legs.
-        const expandRemaining = workDeadlineAt - Date.now();
-        const expandTimeout = new Promise<never>((_, reject) => {
-          expandTimer = setTimeout(() => reject(new Error("expansion timeout")), Math.max(1, expandRemaining));
-        });
-        // deadlineAt gives the expansion transport a REAL abort and
+        // `deadline` gives the expansion transport a REAL abort and
         // structurally disables local inference (codex turn-24 finding 3) —
         // the race alone abandons the promise but the pending work would
         // hold the hook PROCESS past its budget.
-        const expanded = await Promise.race([store.expandQuery(prompt, DEFAULT_QUERY_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never expansion intent */, { deadlineAt: workDeadlineAt }), expandTimeout]);
-        if (expandTimer) clearTimeout(expandTimer);
+        const expanded = await raceDeadline(store.expandQuery(prompt, DEFAULT_QUERY_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never expansion intent */, { deadline: workDeadline }), workDeadline, () => new Error("expansion timeout"));
         if (trace) {
           trace.expansion = {
             attempted: true,
@@ -712,7 +870,7 @@ export async function contextSurfacing(
         }
         if (expanded.length > 0) {
           for (const eq of expanded.slice(0, 3)) {
-            if (Date.now() >= workDeadlineAt) break; // hard stop at the work deadline (reserve preserved)
+            if (isExpired(workDeadline)) break; // hard stop at the work deadline (reserve preserved)
             if (trace?.expansion) {
               const v = trace.expansion.variants[expanded.indexOf(eq)];
               if (v) v.used = true;
@@ -726,24 +884,21 @@ export async function contextSurfacing(
               // late synchronous MATCH (the deadline arg makes the abandoned promise self-abort
               // before the scan) — mirroring the balanced leg above. The loop guard only breaks
               // BETWEEN iterations, so without the race a slow embed here can still blow the budget.
-              const deepLegStart = Date.now();
-              const remainingMs = workDeadlineAt - deepLegStart;
-              if (remainingMs <= 0) break;
-              let deepTimer: ReturnType<typeof setTimeout> | undefined;
+              const deepStart = spanStart();
+              if (remainingForTimeout(workDeadline, deepStart.mono) === null) break;
+              let deepRace: VectorLegRace = "threw";
+              const deepLeg = vectorLegInvocation("deep"); // one recorder PER invocation (codex migration r1 S1)
               try {
                 // Daemon-REQUIRED under the eval's daemon-backed protocol (codex t76 constraint 4:
                 // primary AND deep), same contract as the primary leg above.
                 const deepVec = vectorDaemonRequired
-                  ? searchVecDaemonRequired(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadlineAt, recordVectorLeg("deep"), hydration)
-                  : searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadlineAt, recordVectorLeg("deep"), hydration);
-                const deepTimeout = new Promise<SearchResult[]>((_, reject) => {
-                  deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
-                });
-                hits = await Promise.race([deepVec, deepTimeout]);
-              } catch (e) { warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
+                  ? searchVecDaemonRequired(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadline, deepLeg.onPath, hydration)
+                  : searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, workDeadline, deepLeg.onPath, hydration);
+                hits = await raceDeadline(deepVec, workDeadline, () => new Error("vector timeout"));
+                deepRace = "settled";
+              } catch (e) { deepRace = isVectorTimeout(e) ? "timeout" : "threw"; warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
               finally {
-                if (deepTimer) clearTimeout(deepTimer);  // don't let a pending timer keep the hook process alive
-                recordVectorLegDeadline("deep", workDeadlineAt, deepLegStart); // codex t81 P2: each deep invocation vs the work deadline it was bounded by
+                recordVectorLegDeadline("deep", workDeadline, deepStart, spanStart(), deepRace, deepLeg.status()); // codex t81 P2: each deep invocation vs the work deadline it was bounded by
               }
             }
             if (hits.length > 0) {
@@ -774,7 +929,7 @@ export async function contextSurfacing(
         // open — the internal deadline minus the finalization reserve. A
         // rerank that would eat the reserve is not attempted at all (the
         // failure guard arbitrates instead).
-        if (Date.now() < workDeadlineAt && results.length >= 3) {
+        if (!isExpired(workDeadline) && results.length >= 3) {
           // Rerank ids are the VAULT-QUALIFIED identity (candidateKey) so a
           // cross-vault same-path pair never receives each other's scores
           // (codex turn-7 SPEC-5). The id is opaque to the reranker. The
@@ -802,11 +957,11 @@ export async function contextSurfacing(
           // 1). Under the flag the store THROWS on incomplete coverage
           // (before the zero-fill), which lands in the escalation catch —
           // the rerank is discarded and the failure guard arbitrates.
-          // deadlineAt bounds every remote batch to the remaining rerank
+          // `deadline` bounds every remote batch to the remaining rerank
           // window AND disables the untimed local fallback inside
           // store.rerank (BUILD-3a: no untimed local fallback — missing
           // scores surface as a coverage error and the guard arbitrates).
-          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never rerank intent (RERANK_REQUEST_REV bumped) */, { requireLiveCoverage: true, deadlineAt: workDeadlineAt });
+          const reranked = await store.rerank(prompt, toRerank, DEFAULT_RERANK_MODEL, undefined /* t61 F60-1: session topic is presentation-only — never rerank intent (RERANK_REQUEST_REV bumped) */, { requireLiveCoverage: true, deadline: workDeadline });
           if (reranked.length > 0) {
             const rerankedMap = new Map(reranked.map(r => [r.file, r.score]));
             if (trace?.rerank) {
@@ -853,10 +1008,9 @@ export async function contextSurfacing(
             // ordering ignores them and the failure guard below arbitrates.
           }
         }
-        if (trace) trace.timings.escalationMs = Date.now() - startTime;
+        if (trace) trace.timings.escalationMs = evidenceMs(elapsed(traceT0));
       } catch {
         // Escalation failed (GPU down, timeout, etc.) — continue with fast-path results
-        if (expandTimer) clearTimeout(expandTimer); // pending race timer must not keep the hook process alive
         if (trace) {
           // Failure = the rerank never COMPLETED coverage (orderingApplied is
           // legitimately false on a completed zero-weight rerank).
@@ -864,12 +1018,12 @@ export async function contextSurfacing(
           else if (trace.expansion == null) trace.expansion = { attempted: true, variants: [], failed: true };
         }
       }
-      escalationEndAt = Date.now();
+      escalationEndAt = monoNow();
     }
     // A deep case whose window closed BEFORE escalation must still measure
     // the finalization tail — otherwise pre-escalation overruns silently
     // lose their reserve sample (codex turn-24 finding 4).
-    if (escalationEndAt === null) escalationEndAt = Date.now();
+    if (escalationEndAt === null) escalationEndAt = monoNow();
   }
 
   // Failure guard (CONTRACT-1d): prior-only and expansion-only candidates
@@ -907,7 +1061,7 @@ export async function contextSurfacing(
   if (results.length === 0) { return finish(makeEmptyOutput("context-surfacing"), "empty", "all-filtered"); }
 
   // Filter out snoozed documents
-  const now = new Date();
+  const now = toDate(epochNow());
   const beforeSnooze = trace ? results : null;
   results = results.filter(r => {
     // filepath is a virtual path (clawmem://collection/path) but findActiveDocument
@@ -1288,7 +1442,7 @@ export async function contextSurfacing(
   // here loses only the learning signal. Injection-time co-activation logging
   // left the path entirely at BUILD-5 (C5). postOutputMs measures this
   // handoff (pure memory work), outside the finalization reserve.
-  if (Date.now() >= internalDeadlineAt) {
+  if (isExpired(internalDeadline)) {
     if (trace) trace.timings.postOutputSkipped = true;
   } else if (input.sessionId) {
     try {
@@ -1311,7 +1465,7 @@ export async function contextSurfacing(
       setPendingSurfacingBookkeeping({
         v: 1,
         kind: "surfacing-bookkeeping",
-        jobId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        jobId: `${epochMs(epochNow()).toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
         sessionId: input.sessionId,
         turnIndex,
         usageId: alignmentUsageId,
@@ -1642,7 +1796,7 @@ export function fetchRecentPriorQueries(
     // countRecentContextUsages fix — datetime('now', ...) returns a
     // space-separated string that sorts incorrectly against the
     // T-separated ISO 8601 timestamps stored in context_usage).
-    const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000).toISOString();
+    const cutoff = toDate(epochBefore(epochNow(), duration(maxAgeMinutes * 60 * 1000))).toISOString();
     // Self-match guard lives in SQL so a duplicate submit/retry cannot eat
     // into the lookback budget. Turn 18 review found that filtering in
     // application code with `LIMIT lookback + 1` under-fills when multiple

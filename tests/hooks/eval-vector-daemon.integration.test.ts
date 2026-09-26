@@ -209,10 +209,11 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
     expect(caseD.outcome).toBe("injected");
     expect(caseD.metrics.mustIncludeRecall).toBe(1); // FTS carried the turn
     const traceD = readFileSync(join(outD, "traces.jsonl"), "utf-8").split("\n").filter(Boolean).map(l => JSON.parse(l)).find((t: { id: string }) => t.id === "b1").trace;
-    // The daemon was present and bounded the leg: the client timed out
-    // ("error" — never "absent", never the in-process scan) and the vector
+    // The daemon was present and bounded the leg: the client's own deadline
+    // ended it ("deadline" — never "absent", never the in-process scan, and
+    // since codex migration r1 S1 never the generic "error") and the vector
     // wall time is the deadline, not the scan.
-    expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "error" }]);
+    expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "deadline" }]);
     expect(traceD.timings.vectorMs).toBeLessThan(1500);
     expect(traceD.timings.vectorMs).toBeGreaterThanOrEqual(800);
     expect(traceD.fusion.lanes.map((l: { lane: string }) => l.lane)).toContain("fts-fallback");
@@ -273,8 +274,9 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
     expect(d.stderr).toContain("vector daemon child pid");
     const rd = JSON.parse(readFileSync(join(outD, "hook-run.json"), "utf-8"));
     const traceD = readFileSync(join(outD, "traces.jsonl"), "utf-8").split("\n").filter(Boolean).map(l => JSON.parse(l)).find((t: { id: string }) => t.id === "b1").trace;
-    // The daemon never answered within the deadline — the leg was CUT OFF, never a late ok.
-    expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "error" }]);
+    // The daemon never answered within the deadline — the leg was CUT OFF by the client's own
+    // deadline (codex migration r1 S1: `deadline`, recorded as abandonment), never a late ok.
+    expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "deadline" }]);
     // The leg finished essentially AT its own deadline: the timer could actually fire because
     // the hook's loop was free while the DAEMON stalled — the whole point of Path A.
     expect(traceD.vectorLegDeadlines[0].leg).toBe("primary");
@@ -311,8 +313,9 @@ describe("daemon-backed hook replay-eval (codex t76)", () => {
       expect(d.stderr).toContain("vector daemon child pid");
       const rd = JSON.parse(readFileSync(join(out, "hook-run.json"), "utf-8"));
       const traceD = readFileSync(join(out, "traces.jsonl"), "utf-8").split("\n").filter(Boolean).map(l => JSON.parse(l)).find((t: { id: string }) => t.id === "b1").trace;
-      // Never a late ok: the stalled decode was reclassified.
-      expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "error" }]);
+      // Never a late ok: the after-parse monotonic check found the deadline crossed (codex
+      // migration r1 S1: `deadline`, never the generic `error`).
+      expect(traceD.vectorLegs).toEqual([{ leg: "primary", path: "deadline" }]);
       // The measured overrun exceeded tolerance → the INDEPENDENT hard gate fails the member.
       expect(rd.vector_deadline.adhered).toBe(false);
       expect(rd.vector_deadline.max_over_ms).toBeGreaterThan(150);

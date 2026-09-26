@@ -5,6 +5,7 @@
  */
 
 import { Glob } from "bun";
+import { isoNow } from "./clock.ts";
 import { readFileSync, statSync } from "fs";
 import { basename, relative } from "path";
 import matter from "gray-matter";
@@ -288,7 +289,7 @@ export async function indexCollection(
       }
 
       const contentHash = hashContent(content);
-      const now = new Date().toISOString();
+      const now = isoNow();
 
       // Check if document already exists
       const existing = store.findActiveDocument(collectionName, relativePath);

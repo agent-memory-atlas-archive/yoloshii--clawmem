@@ -11,6 +11,7 @@
  */
 
 import type { Store } from "../store.ts";
+import { isoNow, toDate, epochNow, epochMs } from "../clock.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeEmptyOutput,
@@ -42,8 +43,8 @@ export async function sessionBootstrap(
   store: Store,
   input: HookInput
 ): Promise<HookOutput> {
-  const sessionId = input.sessionId || `session-${Date.now()}`;
-  const now = new Date().toISOString();
+  const sessionId = input.sessionId || `session-${epochMs(epochNow())}`;
+  const now = isoNow();
 
   // Register the session
   try {
@@ -256,7 +257,7 @@ function getCurrentFocus(
   store: Store,
   maxTokens: number
 ): { text: string; paths: string[] } | null {
-  const cutoff = new Date();
+  const cutoff = toDate(epochNow());
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 
@@ -268,7 +269,7 @@ function getCurrentFocus(
   const deductions = store.getDocumentsByType("deductive", 5, { orderBy: "effective" });
 
   // Rank by: pinned first, then recency, then access_count
-  const now = Date.now();
+  const now = epochMs(epochNow());
   const rankDoc = (d: any) => {
     const pinBoost = d.pinned ? 1000 : 0;
     const daysSince = (now - new Date(d.effectiveAt).getTime()) / 86400000;
@@ -364,7 +365,7 @@ function getStaleNotes(
   store: Store,
   maxTokens: number
 ): { text: string; paths: string[] } | null {
-  const cutoff = new Date();
+  const cutoff = toDate(epochNow());
   cutoff.setDate(cutoff.getDate() - STALE_LOOKBACK_DAYS);
   const stale = store.getStaleDocuments(cutoff.toISOString());
 

@@ -31,7 +31,7 @@
  *    fingerprint rechecked null-safely under the write lock.
  */
 
-import type { LegacyWallDeadline } from "./clock-legacy.ts";
+import { monoNow, deadlineAfter, deadlineBefore, deadlineTimer, earliest, elapsed, evidenceMs, isoNow, remainingForTimeout, shorterThan, untilDeadline, duration, type MonoDeadline, type MonoInstant } from "./clock.ts";
 import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type { Store } from "./store.ts";
@@ -180,7 +180,7 @@ export function insertCausalRun(db: Database, input: {
     input.source,
     input.mode,
     input.outcome,
-    new Date().toISOString(),
+    isoNow(),
   ) as { id: number };
   return row.id;
 }
@@ -201,7 +201,7 @@ export function insertCausalEvent(db: Database, runId: number, ev: CausalEventIn
     ev.targetFactOrdinal ?? null,
     ev.confidence ?? null,
     ev.detail == null ? null : ev.detail.slice(0, EVENT_DETAIL_MAX),
-    new Date().toISOString(),
+    isoNow(),
   );
 }
 
@@ -228,7 +228,7 @@ function finalizeCausalRun(db: Database, runId: number, patch: {
   edgesWritten?: number;
   edgesRefused?: number;
   edgesErrored?: number;
-  startedAtMs: number;
+  startedAt: MonoInstant;
 }): void {
   db.prepare(
     `UPDATE causal_runs SET
@@ -251,8 +251,8 @@ function finalizeCausalRun(db: Database, runId: number, patch: {
     patch.edgesWritten ?? 0,
     patch.edgesRefused ?? 0,
     patch.edgesErrored ?? 0,
-    new Date().toISOString(),
-    Date.now() - patch.startedAtMs,
+    isoNow(),
+    evidenceMs(elapsed(patch.startedAt)),
     runId,
   );
 }
@@ -268,12 +268,12 @@ export function finalizeCliCausalRun(
   db: Database,
   runId: number,
   outcome: "cli_ok" | "cli_error",
-  startedAtMs: number,
+  startedAt: MonoInstant,
 ): void {
   try {
     db.prepare(
       `UPDATE causal_runs SET outcome = ?, finished_at = ?, duration_ms = ? WHERE id = ?`,
-    ).run(outcome, new Date().toISOString(), Date.now() - startedAtMs, runId);
+    ).run(outcome, isoNow(), evidenceMs(elapsed(startedAt)), runId);
   } catch (err) {
     console.error(
       `[causal-writer] run ${runId} finalization (${outcome}) failed: ${err} — ` +
@@ -386,41 +386,36 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-const SINGLE_SHOT_TIMEOUT = Symbol("causal-single-shot-timeout");
 
 /** ONE generate() call, hard wall-clock bound (the llm-retry race discipline),
  *  no retry, no feedback — strict single-shot parsing per the Q5 ruling. */
 async function singleShotGenerate(
   llm: CausalLlm,
   prompt: string,
-  timeoutMs: number,
+  deadline: MonoDeadline,
 ): Promise<{ kind: "ok"; text: string; model: string } | { kind: "timeout" } | { kind: "error"; message: string }> {
+  // O1: one monotonic deadline drives both the abort (an abort-aware backend
+  // stops) and the race (a signal-ignoring backend cannot hold the handler).
   const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<typeof SINGLE_SHOT_TIMEOUT>((resolve) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      resolve(SINGLE_SHOT_TIMEOUT);
-    }, timeoutMs);
-  });
+  const cancelAbort = deadlineTimer(deadline, () => controller.abort());
   try {
     const inFlight = llm.generate(prompt, {
       maxTokens: CAUSAL_MAX_TOKENS,
       temperature: CAUSAL_TEMPERATURE,
       signal: controller.signal,
     });
-    const raced = await Promise.race([inFlight, deadline]);
-    if (raced === SINGLE_SHOT_TIMEOUT) {
+    const raced = await untilDeadline(inFlight, deadline);
+    if (raced.timedOut) {
       inFlight.catch(() => {});
       return { kind: "timeout" };
     }
-    const text = raced?.text ?? "";
+    const text = raced.value?.text ?? "";
     if (!text) return { kind: "error", message: "LLM returned an empty response" };
-    return { kind: "ok", text, model: raced?.model || "unknown" };
+    return { kind: "ok", text, model: raced.value?.model || "unknown" };
   } catch (err) {
     return { kind: "error", message: err instanceof Error ? err.message : String(err) };
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    cancelAbort();
   }
 }
 
@@ -504,7 +499,8 @@ export async function runCausalStep(
     sessionId: string | null;
     mode: "shadow" | "on";
     newObservations: ObservationWithDoc[];
-    deadlineAt: LegacyWallDeadline;
+    /** O1: the Stop handler's MONOTONIC whole-handler deadline. */
+    deadline: MonoDeadline;
     /** Config anomalies detected by the handler (bad budget/window env values),
      *  audited as document-scope `invalid_config` events on this run. */
     invalidConfigNotes?: string[];
@@ -515,7 +511,7 @@ export async function runCausalStep(
   },
 ): Promise<CausalStepResult> {
   const db = store.db;
-  const startedAtMs = Date.now();
+  const startedAt = monoNow();
   const runKey = randomUUID();
   // UNIQUE NOT NULL on causal_runs.run_key: a collision fails LOUDLY here, before
   // any inference result exists — never as a silent write_noop downstream.
@@ -554,7 +550,7 @@ export async function runCausalStep(
       edgesWritten: result.edgesWritten,
       edgesRefused: result.edgesRefused,
       edgesErrored: result.edgesErrored,
-      startedAtMs,
+      startedAt,
     });
     return result;
   };
@@ -675,14 +671,17 @@ export async function runCausalStep(
   }
 
   // --- D2: one call under the whole-handler deadline -------------------------
-  const remaining = opts.deadlineAt - Date.now() - PERSIST_RESERVE_MS;
-  if (remaining < CAUSAL_MIN_BUDGET_MS) {
+  // O1: the phase deadline is the whole-handler deadline minus the persistence
+  // reserve; the call is additionally capped at CAUSAL_CALL_CAP_MS from now.
+  const phaseDeadline = deadlineBefore(opts.deadline, duration(PERSIST_RESERVE_MS));
+  const remaining = remainingForTimeout(phaseDeadline);
+  if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
     return finalize("skipped_budget", { newDocCount: newDocs.length, windowDocCount });
   }
 
   const prompt = buildCausalPrompt(facts);
   const promptSha256 = sha256Hex(prompt);
-  const generated = await singleShotGenerate(llm, prompt, Math.min(remaining, CAUSAL_CALL_CAP_MS));
+  const generated = await singleShotGenerate(llm, prompt, earliest(phaseDeadline, deadlineAfter(monoNow(), duration(CAUSAL_CALL_CAP_MS))));
   if (generated.kind === "timeout") {
     return finalize("timeout", { promptSha256, newDocCount: newDocs.length, windowDocCount });
   }
@@ -857,7 +856,7 @@ export async function runCausalStep(
     // durable classification, so no candidate is ever recorded as both admitted
     // and failed.
     const writeGroup = db.transaction(() => {
-      const nowIso = new Date().toISOString();
+      const nowIso = isoNow();
       const edge = selectEdge.get(sourceDocId, targetDocId) as
         { weight: number | null; metadata: string | null; created_at: string | null } | undefined;
       const preExisting = !!edge;
@@ -1066,7 +1065,7 @@ export type ResolutionManifest = {
 export function buildResolutionManifest(entries: CensusEntry[]): ResolutionManifest {
   return {
     version: CAUSAL_FINGERPRINT_VERSION,
-    generatedAt: new Date().toISOString(),
+    generatedAt: isoNow(),
     edges: entries.map(e => ({
       sourceId: e.row.source_id,
       targetId: e.row.target_id,
@@ -1145,7 +1144,7 @@ export function applyResolution(
       db.prepare(INSERT_LEGACY_SIGHTING_SQL).run(
         edge.sourceId, edge.targetId,
         null, null, "",
-        row.weight, opts.runKey, opts.runId, row.created_at ?? new Date().toISOString(),
+        row.weight, opts.runKey, opts.runId, row.created_at ?? isoNow(),
       );
       insertCausalEvent(db, opts.runId, {
         scope: "write", eventType: "legacy_materialized",
@@ -1167,7 +1166,7 @@ export function applyResolution(
     ).run(
       row.source_id, row.target_id, row.relation_type, row.weight, row.metadata,
       row.created_at, row.contradict_confidence,
-      new Date().toISOString(), opts.runKey, opts.operatorNote ?? null, edge.fingerprint,
+      isoNow(), opts.runKey, opts.operatorNote ?? null, edge.fingerprint,
     );
     db.prepare(
       `DELETE FROM memory_relations WHERE source_id = ? AND target_id = ? AND relation_type = 'causal'`,

@@ -7,6 +7,7 @@
  */
 
 import type { Store } from "../store.ts";
+import { toDate, epochNow } from "../clock.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -31,7 +32,7 @@ export async function stalenessCheck(
   store: Store,
   input: HookInput
 ): Promise<HookOutput> {
-  const now = new Date();
+  const now = toDate(epochNow());
 
   // Find documents with review_by in the past
   const reviewDue = findReviewDue(store, now);

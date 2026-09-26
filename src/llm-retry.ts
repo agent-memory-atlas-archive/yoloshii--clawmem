@@ -12,7 +12,7 @@
  *    reconstructed prompt (original prompt + parse error + response excerpt)
  *    — never a conversation continuation, no message-history accumulation.
  *  - One overall timeout budget bounds ALL attempts combined as a HARD
- *    wall-clock deadline: no attempt starts past it, and an in-flight
+ *    MONOTONIC deadline (O1 — immune to wall-clock steps): no attempt starts past it, and an in-flight
  *    generate() is raced against it — a backend that ignores the abort
  *    signal cannot hold the helper past the budget.
  *  - Fail-open on exhaustion: terminal failure returns null, which is the
@@ -21,6 +21,7 @@
  */
 
 import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
+import { monoNow, deadlineAfter, deadlineTimer, duration, elapsed, evidenceMs, isExpired, type DurationMs } from "./clock.ts";
 import type { GenerateResult } from "./llm.ts";
 
 export type ParseOutcome<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -45,37 +46,37 @@ export async function withRetryAndFeedback<T>(params: {
   maxTokens: number;
   temperature?: number;
   maxAttempts?: number;
-  timeoutMs?: number;
+  /** O1: a branded duration — the helper anchors its own monotonic deadline from it. */
+  timeoutMs?: DurationMs;
   /** Identifies the call site in the terminal-failure log line. */
   label?: string;
 }): Promise<T | null> {
   const maxAttempts = params.maxAttempts ?? 3;
-  const timeoutMs = params.timeoutMs ?? MAX_LLM_GENERATE_TIMEOUT_MS;
+  const timeoutMs = params.timeoutMs ?? duration(MAX_LLM_GENERATE_TIMEOUT_MS);
   const temperature = params.temperature ?? 0.3;
   const label = params.label ?? "llm-retry";
 
   let prompt = params.initialPrompt;
   let lastError = "timeout budget exhausted before the first attempt";
   let attemptsMade = 0;
-  const startTime = Date.now();
-  const deadlineAt = startTime + timeoutMs;
+  const startTime = monoNow();
+  const deadline = deadlineAfter(startTime, timeoutMs);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // Hard wall-clock bound, part 1: never START an attempt past the deadline.
-    const remaining = deadlineAt - Date.now();
-    if (remaining <= 0) break;
+    // Hard MONOTONIC bound, part 1 (O1): never START an attempt past the deadline.
+    if (isExpired(deadline)) break;
     attemptsMade = attempt;
 
     const controller = new AbortController();
-    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-    // Hard wall-clock bound, part 2: at the deadline, abort the signal (an
+    let cancelDeadline: () => void = () => {};
+    // Hard monotonic bound, part 2: at the deadline, abort the signal (an
     // abort-aware backend stops) AND win the race (a signal-ignoring backend
     // cannot hold the helper past the budget).
-    const deadline = new Promise<typeof DEADLINE_EXPIRED>((resolve) => {
-      deadlineTimer = setTimeout(() => {
+    const expiry = new Promise<typeof DEADLINE_EXPIRED>((resolve) => {
+      cancelDeadline = deadlineTimer(deadline, () => {
         controller.abort();
         resolve(DEADLINE_EXPIRED);
-      }, remaining);
+      });
     });
     try {
       const inFlight = params.llm.generate(prompt, {
@@ -83,12 +84,12 @@ export async function withRetryAndFeedback<T>(params: {
         temperature,
         signal: controller.signal,
       });
-      const raced = await Promise.race([inFlight, deadline]);
+      const raced = await Promise.race([inFlight, expiry]);
       if (raced === DEADLINE_EXPIRED) {
         // Abandon the aborted call (swallowing its eventual settlement) and
         // terminate — never start another attempt after the deadline.
         inFlight.catch(() => {});
-        lastError = `overall timeout of ${timeoutMs}ms exceeded during generate`;
+        lastError = `overall timeout of ${evidenceMs(timeoutMs)}ms exceeded during generate`;
         break;
       }
       const lastResponse = raced?.text ?? "";
@@ -122,12 +123,12 @@ export async function withRetryAndFeedback<T>(params: {
       lastError = err instanceof Error ? err.message : String(err);
       if (attempt >= maxAttempts) break;
     } finally {
-      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      cancelDeadline();
     }
   }
 
   console.warn(
-    `[llm-retry] ${label}: exhausted after ${attemptsMade} attempt(s) / ${Date.now() - startTime}ms — failing open (last error: ${lastError.slice(0, 200)})`,
+    `[llm-retry] ${label}: exhausted after ${attemptsMade} attempt(s) / ${evidenceMs(elapsed(startTime))}ms — failing open (last error: ${lastError.slice(0, 200)})`,
   );
   return null;
 }

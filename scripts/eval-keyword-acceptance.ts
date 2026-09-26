@@ -18,6 +18,8 @@
  * Exit codes: 0 verdict produced · 1 fixture/integrity failure · 2 infra abort.
  */
 import { parseArgs } from "util";
+import { isoNow } from "../src/clock.ts";
+import { monoNow, elapsed, evidenceMs } from "../src/clock.ts";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { Database } from "bun:sqlite";
@@ -176,7 +178,7 @@ if (cmd === "freeze") {
   walConvert.exec("PRAGMA journal_mode = WAL");
   walConvert.close();
 
-  const asOf = new Date().toISOString();
+  const asOf = isoNow();
   const store = createStore(snapshotPath, { readonly: true });
   const cases = loadCases();
   const frozen: FrozenCase[] = [];
@@ -357,9 +359,9 @@ for (const fc of manifest.cases) {
   let d: ProximityOutcome<ScoredResult>;
   if (fc.id === S516.coldProbeId) {
     if (s516OracleTouched) fail(`§51.6 G7c: oracle touched before designated cold probe ${S516.coldProbeId}`);
-    const t0 = performance.now();
+    const t0 = monoNow();
     d = proximityRerankDetailed(bFull, fc.query);
-    s516ColdMs = performance.now() - t0;
+    s516ColdMs = evidenceMs(elapsed(t0));
   } else {
     d = proximityRerankDetailed(bFull, fc.query);
   }
@@ -376,9 +378,9 @@ for (const fc of manifest.cases) {
     checkStatus(proximityRerankDetailed(bFull, fc.query).status, "warm-up");
     const times: number[] = [];
     for (let i = 0; i < S516.g7Reps; i++) {
-      const t0 = performance.now();
+      const t0 = monoNow();
       const rd = proximityRerankDetailed(bFull, fc.query);
-      times.push(performance.now() - t0);
+      times.push(evidenceMs(elapsed(t0)));
       checkStatus(rd.status, `timed rep ${i + 1}`);
     }
     times.sort((x, y) => x - y);

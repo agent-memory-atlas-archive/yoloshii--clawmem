@@ -1,3 +1,4 @@
+import { isoNow } from "../clock.ts";
 /**
  * Context-surfacing provenance trace — the per-stage diagnostics envelope
  * (RANKING-DEFECT-HANDOFF Addendum 5, BUILD-0 / CONTRACT-5).
@@ -348,19 +349,45 @@ export interface SurfacingTrace {
    */
   vectorLegs?: { leg: "primary" | "prior" | "deep"; path: import("../vector-daemon.ts").VecExecStatus; protocol?: import("../vector-daemon.ts").VecResponseProtocol }[];
   /**
-   * Codex t80 P1 / t81 P1+P2: one entry per COMPLETED vector INVOCATION
-   * (primary once, prior once, deep once per expansion query) — its measured
-   * wall time vs its OWN absolute deadline. `over_ms` = finish − assigned
-   * deadline (positive = finished LATE; under hydrated-v1 that covers only the
-   * bounded per-line response decode — hydration runs daemon-side — while the
-   * raw-hit compat path still includes the synchronous client hydrate that
-   * runs after the daemon answered). `budget_ms` = the duration
-   * that invocation was actually allotted (its deadline − its start), which is
-   * the real per-leg bound (the min() for primary, the dynamic bound for
-   * prior/deep), NOT the nominal profile timeout. The eval enforces the MAX
-   * overshoot across every invocation of the run.
+   * Codex t80 P1 / t81 P1+P2, O1 §3: one record per COMPLETED vector
+   * INVOCATION (primary once, prior once, deep once per expansion query) —
+   * see VectorLegDeadlineRecord. The eval enforces the MAX overshoot across
+   * every invocation of the run and persists every rep's records.
    */
-  vectorLegDeadlines?: { leg: "primary" | "prior" | "deep"; over_ms: number; budget_ms: number }[];
+  vectorLegDeadlines?: VectorLegDeadlineRecord[];
+}
+
+/** O1 §3 evidence contract — the terminal dimension of one vector invocation, orthogonal to its execution path. */
+export type VectorLegTerminal = "completion" | "abandonment" | "fallback";
+
+/**
+ * One COMPLETED vector invocation's timing record (codex t80 P1 / t81 P1+P2; O1 §3).
+ *
+ * `over_ms` = finish − the invocation's OWN deadline, MONOTONIC (positive =
+ * finished LATE; under hydrated-v1 that covers only the bounded per-line
+ * response decode — hydration runs daemon-side). `budget_ms` = the window the
+ * invocation was actually allotted (its deadline − its start): the real per-leg
+ * bound (the min() for primary, the dynamic bound for prior/deep), NOT the
+ * nominal profile timeout. `mono_elapsed_ms` is the authoritative duration,
+ * `wall_elapsed_ms` the same span on the wall clock, and `clock_skew_ms` their
+ * difference — a realtime STEP, visible from the artifact (it cannot see
+ * FREQUENCY error, which scales both clocks alike; that stays a host preflight).
+ * `terminal_kind` × `status` are orthogonal, so a late SUCCESS and a late
+ * ABANDONMENT are distinct records; `timing` (early / on_time / late) is
+ * DERIVED by the harness against its frozen tolerance, never recorded here.
+ * Every value is a projected number (`evidenceMs` / `spanEvidence`): the record
+ * is persisted and compared as JSON.
+ */
+export interface VectorLegDeadlineRecord {
+  leg: "primary" | "prior" | "deep";
+  over_ms: number;
+  budget_ms: number;
+  mono_elapsed_ms: number;
+  wall_elapsed_ms: number;
+  clock_skew_ms: number;
+  terminal_kind: VectorLegTerminal;
+  /** The invocation's classified execution path (its vectorLegs entry), or null if the leg recorded none. */
+  status: import("../vector-daemon.ts").VecExecStatus | null;
 }
 
 /** Fresh all-null trace for one invocation. */
@@ -457,7 +484,7 @@ export function persistSurfacingTrace(
     `);
     db.prepare(
       `INSERT INTO surfacing_diagnostics (session_id, turn_index, created_at, trace_json) VALUES (?, ?, ?, ?)`
-    ).run(sessionId ?? null, turnIndex ?? null, new Date().toISOString(), JSON.stringify(trace));
+    ).run(sessionId ?? null, turnIndex ?? null, isoNow(), JSON.stringify(trace));
     db.prepare(
       `DELETE FROM surfacing_diagnostics WHERE id NOT IN (SELECT id FROM surfacing_diagnostics ORDER BY id DESC LIMIT ?)`
     ).run(SURFACING_DIAGNOSTICS_KEEP);

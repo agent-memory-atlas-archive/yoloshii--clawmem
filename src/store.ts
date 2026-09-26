@@ -12,8 +12,7 @@
  *   const store = createStore();
  */
 
-import type { LegacyWallDeadline } from "./clock-legacy.ts";
-import type { DurationMs } from "./clock.ts";
+import { monoNow, deadlineAfter, earliest, isExpired, timeoutSignal, type DurationMs, type MonoDeadline, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
@@ -1689,11 +1688,11 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => Promise<SearchResult[]>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }) => Promise<ExpandedQuery[]>;
+  expandQuery: (query: string, model?: string, intent?: string, opts?: { deadline?: MonoDeadline }) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -1890,11 +1889,11 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadline),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }) => expandQuery(query, model, db, intent, opts),
+    expandQuery: (query: string, model?: string, intent?: string, opts?: { deadline?: MonoDeadline }) => expandQuery(query, model, db, intent, opts),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => rerank(query, documents, model, db, intent, options),
 
     // Document retrieval
@@ -1928,7 +1927,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => cleanStaleEmbeddings(db, leaseGuard),
     saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => {
       const marginsJson = JSON.stringify(pairMargins);
-      const now = new Date().toISOString();
+      const now = isoNow();
       db.transaction(() => {
         assertLeaseHeld(db, leaseGuard);
         db.prepare(`DELETE FROM embed_canary WHERE profile_key = ?`).run(profileKey);
@@ -1955,7 +1954,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     setVaultFlag: (flag: string, value: string, leaseGuard?: LeaseGuard) => {
       db.transaction(() => {
         assertLeaseHeld(db, leaseGuard);
-        db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(flag, value, new Date().toISOString());
+        db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(flag, value, isoNow());
       }).immediate();
     },
     getVaultFlag: (flag: string) => {
@@ -2059,7 +2058,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // SPO knowledge graph
     addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => {
       const pred = predicate.toLowerCase().replace(/\s+/g, "_");
-      const now = new Date().toISOString();
+      const now = isoNow();
       const objClause = objectEntityId
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
@@ -2101,7 +2100,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
       const pred = predicate.toLowerCase().replace(/\s+/g, "_");
-      const ended = endedDate || new Date().toISOString().slice(0, 10);
+      const ended = endedDate || isoNow().slice(0, 10);
       const objClause = objectEntityId
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
@@ -2206,7 +2205,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         INSERT OR IGNORE INTO recall_events (doc_id, query_hash, search_score, session_id, usage_id, turn_index, surfaced_at, was_referenced, dedupe_key)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      const now = new Date().toISOString();
+      const now = isoNow();
       let inserted = 0;
       const tx = db.transaction(() => {
         for (const e of events) {
@@ -2262,7 +2261,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           updated_at = excluded.updated_at
       `);
 
-      const now = new Date().toISOString();
+      const now = isoNow();
       const tx = db.transaction(() => {
         for (const row of aggregated) {
           // Diversity: clamped max(uniqueQueries, recallDays) / 5
@@ -2363,7 +2362,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     recordCoActivation: (paths: string[]) => {
       if (paths.length < 2) return;
-      const now = new Date().toISOString();
+      const now = isoNow();
       const stmt = db.prepare(`
         INSERT INTO co_activations (doc_a, doc_b, count, last_seen)
         VALUES (?, ?, 1, ?)
@@ -2411,7 +2410,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
           weight = weight + excluded.weight,
           created_at = excluded.created_at
-      `).run(fromDoc, toDoc, relType, weight, new Date().toISOString());
+      `).run(fromDoc, toDoc, relType, weight, isoNow());
     },
 
     // Engram integration: unified save API for hook-generated memories
@@ -2424,7 +2423,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // Document archival — deactivates documents by ID
     archiveDocuments: (ids: number[]) => {
       if (ids.length === 0) return 0;
-      const now = new Date().toISOString();
+      const now = isoNow();
       const placeholders = ids.map(() => "?").join(",");
       // `result.changes` is NOT the number of documents archived: the `documents_fts`
       // triggers fire on this UPDATE and their shadow-table writes inflate the count
@@ -2706,7 +2705,7 @@ export function getIndexHealth(db: Database): IndexHealthInfo {
   let daysStale: number | null = null;
   if (mostRecent?.latest) {
     const lastUpdate = new Date(mostRecent.latest);
-    daysStale = Math.floor((Date.now() - lastUpdate.getTime()) / (24 * 60 * 60 * 1000));
+    daysStale = Math.floor((epochMs(epochNow()) - lastUpdate.getTime()) / (24 * 60 * 60 * 1000));
   }
 
   return { needsEmbedding, totalDocs, daysStale };
@@ -2729,7 +2728,7 @@ export function getCachedResult(db: Database, cacheKey: string): string | null {
 }
 
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
-  const now = new Date().toISOString();
+  const now = isoNow();
   db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
   if (Math.random() < 0.01) {
     db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
@@ -2982,7 +2981,7 @@ export type SaveMemoryResult = {
 const DEDUP_WINDOW_MINUTES = 30;
 
 export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
-  const now = new Date().toISOString();
+  const now = isoNow();
   const authoredAt = normalizeIsoTimestamp(params.authoredAt);
   const payload = params.semanticPayload || params.body;
   const normHash = hashNormalized(payload);
@@ -4216,19 +4215,20 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
   verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
 }
 
-// Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the wall-clock
-// deadline, then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
+// Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the monotonic
+// deadline (O1), then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
 // collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
 // daemon can run this half on the long-lived watcher — and, under hydrated-v1 (the primary path,
 // codex #28), the Step-2 projection too (projectVecResults above), so the hook does zero synchronous
-// sqlite on its timed path. Client-side hydrateVecResults() survives as the raw-hit COMPAT path (a
-// legacy daemon answering raw hits). In-process searchVec() below composes the two halves, so its
-// public contract is unchanged.
-export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: LegacyWallDeadline): Promise<{ hash_seq: string; distance: number }[]> {
+// sqlite on its timed path. Client-side hydrateVecResults() survives on the raw-hit path (a raw
+// request answered by an attesting daemon — a legacy daemon's raw answer is `skew` since O1 §4) and
+// in the in-process fallback. In-process searchVec() below composes the two halves, so its public
+// contract is unchanged.
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadline?: MonoDeadline): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedResult = await getEmbedding(query, model, true, deadlineMs);
+  const embedResult = await getEmbedding(query, model, true, deadline);
   if (!embedResult) return [];
 
   // W1: read-path embedding-model consistency gate + dimension check via the SHARED guard
@@ -4242,9 +4242,9 @@ export async function searchVecMatch(db: Database, query: string, model: string,
 
   // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
   // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
-  // If the wall-clock budget already elapsed during the async embed above, bail here so a
-  // timed-out vector leg cannot resume and re-block the hook after it fell back to FTS.
-  if (deadlineMs !== undefined && Date.now() >= deadlineMs) return [];
+  // If the budget already elapsed during the async embed above, bail here so a timed-out
+  // vector leg cannot resume and re-block the hook after it fell back to FTS.
+  if (deadline !== undefined && isExpired(deadline)) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4259,9 +4259,12 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
 }
 
-// Step 2 of vector search — the cheap, local half: hydrate raw {hash_seq, distance} hits into
-// SearchResult[] via indexed JOINs, collection/date filtering, and per-doc dedup. Pure primary-key
-// SQLite lookups — safe to run in the short-lived hook process even when Step 1 ran in the daemon.
+// Step 2 of vector search: hydrate raw {hash_seq, distance} hits into SearchResult[] via indexed
+// JOINs, collection/date filtering, and per-doc dedup. Primary-key lookups, but a SYNCHRONOUS sqlite
+// read on the caller's event loop: a race timer cannot interrupt it, and a cold first-touch here is
+// what produced the late-`ok` daemon-required legs (codex t80 P1 — Path A's root defect). The hook's
+// timed path therefore takes DAEMON-SIDE projection (hydrated-v1); this runs client-side only on the
+// raw-hit path and in the in-process fallback, never as the hook's bounded primary route.
 export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; distance: number }[], limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
   if (vecResults.length === 0) return [];
 
@@ -4541,10 +4544,10 @@ export function projectVecResults(
 // In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
 // the daemon-backed hook path (context-surfacing) instead receives DAEMON-SIDE projected results
 // (hydrated-v1: the scan AND a hydrateVecResults-equivalent projection both run in the daemon),
-// falling back to client-side hydrateVecResults only on the raw-hit compat path — so neither the
+// falling back to client-side hydrateVecResults only on the raw-hit path — so neither the
 // blocking MATCH nor, under hydrated-v1, the hydration ever runs on the hook's event loop.
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: LegacyWallDeadline): Promise<SearchResult[]> {
-  const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadline?: MonoDeadline): Promise<SearchResult[]> {
+  const vecResults = await searchVecMatch(db, query, model, limit, deadline);
   return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
 }
 
@@ -4568,7 +4571,8 @@ export interface VecSearchDetailedOpts {
   collections?: string[];
   excludeCollections?: string[];
   dateRange?: { start: string; end: string };
-  deadlineMs?: LegacyWallDeadline;
+  /** O1: monotonic deadline — the escalation loop and the post-embed guard stop at it. */
+  deadline?: MonoDeadline;
   /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
   escalationCap?: number;
   /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
@@ -4730,7 +4734,7 @@ export function searchVecDetailedWithVector(
       classified.allowedDocs >= limit ||
       k >= effectiveCap ||
       raw.length < k || // MATCH returned fewer than requested: table exhausted below k
-      (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs);
+      (opts.deadline !== undefined && isExpired(opts.deadline));
     if (done) break;
     k = Math.min(k * 3, effectiveCap);
   }
@@ -4761,7 +4765,7 @@ export function searchVecDetailedWithVector(
 /**
  * Detailed vector search — embeds the query, then delegates to the precomputed-vector core.
  * The entry for every exclusion-enabled caller; carries the FULL searchVec parameter surface
- * (collections / collectionId / dateRange / deadlineMs) so temporal RRF is never contaminated
+ * (collections / collectionId / dateRange / deadline) so temporal RRF is never contaminated
  * by dropped filters (T6-H2).
  */
 export async function searchVecDetailed(
@@ -4775,9 +4779,9 @@ export async function searchVecDetailed(
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return empty;
 
-  const embedResult = await getEmbedding(query, model, true, opts.deadlineMs);
+  const embedResult = await getEmbedding(query, model, true, opts.deadline);
   if (!embedResult) return empty;
-  if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+  if (opts.deadline !== undefined && isExpired(opts.deadline)) return empty;
 
   return searchVecDetailedWithVector(
     db,
@@ -4791,20 +4795,21 @@ export async function searchVecDetailed(
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: LegacyWallDeadline): Promise<{ embedding: number[]; model: string } | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadline?: MonoDeadline): Promise<{ embedding: number[]; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  // B4: bound the remote embed fetch + its 429 backoff to the caller's wall-clock
-  // deadline. Under the context-surfacing hook's Promise.race the abandoned embed
-  // promise otherwise keeps its fetch + retry sleeps running; AbortSignal.timeout
+  // B4: bound the remote embed fetch + its 429 backoff to the caller's monotonic
+  // deadline (O1). Under the context-surfacing hook's race the abandoned embed
+  // promise otherwise keeps its fetch + retry sleeps running; the timeout signal
   // actually cancels them, so a slow/rate-limited embed can no longer outlive the
-  // hook budget.
+  // hook budget. `timeoutSignal` is null exactly when the deadline has passed —
+  // the embed is skipped entirely rather than started to be aborted.
   let signal: AbortSignal | undefined;
-  if (deadlineMs !== undefined) {
-    const remaining = deadlineMs - Date.now();
-    if (remaining <= 0) return null; // deadline already elapsed — skip the embed entirely
-    signal = AbortSignal.timeout(remaining);
+  if (deadline !== undefined) {
+    const bounded = timeoutSignal(deadline);
+    if (bounded === null) return null; // deadline already elapsed — skip the embed entirely
+    signal = bounded;
   }
   const result = await llm.embed(formattedText, { model, isQuery, signal });
   if (!result?.embedding) return null;
@@ -4995,7 +5000,7 @@ export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, opts?: { deadlineAt?: LegacyWallDeadline }): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, opts?: { deadline?: MonoDeadline }): Promise<ExpandedQuery[]> {
   // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
   const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
@@ -5024,7 +5029,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   // BUILD-3a (codex turn-24 finding 3): a deadline that has already passed
   // gets NO LLM call and NO cache write — the typed fallback only.
-  if (opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+  if (opts?.deadline !== undefined && isExpired(opts.deadline)) {
     return expansionFallback(query)
       .filter(r => r.text !== query)
       .map(r => ({ type: r.type, query: r.text }));
@@ -5032,9 +5037,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 
   const llm = getDefaultLlamaCpp();
   // Note: LlamaCpp uses a hardcoded model; the model parameter is ignored here.
-  // Pass intent to steer expansion when provided. deadlineAt gives the
+  // Pass intent to steer expansion when provided. `deadline` gives the
   // remote fetch a REAL abort and structurally disables local inference.
-  const results = await llm.expandQuery(query, { intent, deadlineAt: opts?.deadlineAt });
+  const results = await llm.expandQuery(query, { intent, deadline: opts?.deadline });
 
   // Defense-in-depth: re-run the shared guard (also covers the local GBNF path and
   // any future provider), then drop entries that just echo the original query.
@@ -5055,7 +5060,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   // lands AT or PAST the deadline is returned but never cached — the caller
   // has already moved on, and in the eval a late write would mutate
   // llm_cache after rep cleanup or the freeze leak audit.
-  if (opts?.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+  if (opts?.deadline !== undefined && isExpired(opts.deadline)) {
     return expanded;
   }
   setCachedResult(db, cacheKey, JSON.stringify(expanded));
@@ -5172,7 +5177,7 @@ export function rerankIdentityState(kind: "remote" | "local", model: string, db?
   if (byFlag.get(rerankRevokedFlag(url))?.value === "revoked") return { namespace: null, token: stamp(`revoked:${url}`) };
   const raw = byFlag.get(rerankProviderFlag(url));
   if (!raw) return { namespace: null, token: stamp(`absent:${url}`) };
-  const age = Date.now() - new Date(raw.updated_at).getTime();
+  const age = epochMs(epochNow()) - new Date(raw.updated_at).getTime();
   const fresh = Number.isFinite(age) && age <= RERANK_PROVIDER_ATTESTATION_TTL_MS;
   const observed = raw.value?.trim();
   if (!fresh || !observed) return { namespace: null, token: stamp(`expired:${url}#${raw.value}`) };
@@ -5217,7 +5222,7 @@ export function readRerankProviderGeneration(db: Database, url: string): number 
 function bumpRerankProviderGeneration(db: Database, url: string): void {
   const next = readRerankProviderGeneration(db, url) + 1;
   db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
-    .run(rerankGenerationFlag(url), String(next), new Date().toISOString());
+    .run(rerankGenerationFlag(url), String(next), isoNow());
 }
 
 /** Raw attestation row (value + updated_at) with no expiry applied — the state token needs to see an EXPIRED attestation, which the read helper hides. */
@@ -5252,7 +5257,7 @@ export function readRerankProviderFingerprint(db: Database, url: string): string
     // `clawmem rerank-health` re-attests. The contract is therefore
     // explicitly "correct after a successful health refresh", enforced
     // rather than documented.
-    const age = Date.now() - new Date(row!.updated_at).getTime();
+    const age = epochMs(epochNow()) - new Date(row!.updated_at).getTime();
     if (!Number.isFinite(age) || age > RERANK_PROVIDER_ATTESTATION_TTL_MS) return null;
     return value;
   } catch {
@@ -5275,7 +5280,7 @@ export function writeRerankProviderFingerprint(db: Database, url: string, finger
   // turn-38).
   const apply = db.transaction(() => {
     db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
-      .run(rerankProviderFlag(url), fingerprint, new Date().toISOString());
+      .run(rerankProviderFlag(url), fingerprint, isoNow());
     // A successful re-attestation is the ONLY thing that clears a tombstone.
     db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(rerankRevokedFlag(url));
     bumpRerankProviderGeneration(db, url);
@@ -5294,7 +5299,7 @@ export function revokeRerankProviderFingerprint(db: Database, url: string): void
   // A TOMBSTONE, not just a deletion: it overrides a declared
   // CLAWMEM_RERANK_PROVIDER_ID as well as the observed fingerprint, and only
   // a successful re-attestation clears it.
-  const now = new Date().toISOString();
+  const now = isoNow();
   const apply = db.transaction(() => {
     db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(rerankProviderFlag(url));
     db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`)
@@ -5362,15 +5367,15 @@ export type RerankProbeOptions = {
   /** Convenience: derive AbortSignal.timeout(timeoutMs) for the remote fetch when no signal is given. */
   timeoutMs?: DurationMs;
   /**
-   * BUILD-3a (C2c/C3): absolute wall-clock deadline (Date.now() epoch ms).
-   * Every remote batch is bounded to the remaining window, batches stop when
-   * the deadline passes, and the untimed local node-llama fallback is
-   * DISABLED — a deadline-carrying caller (the context-surfacing hook) must
-   * never start unbounded CPU inference; unscored docs surface as a
+   * BUILD-3a (C2c/C3), O1: the caller's MONOTONIC deadline. Every remote
+   * batch is bounded to the remaining window (recomputed per batch), batches
+   * stop when the deadline passes, and the untimed local node-llama fallback
+   * is DISABLED — a deadline-carrying caller (the context-surfacing hook)
+   * must never start unbounded CPU inference; unscored docs surface as a
    * RerankCoverageError under requireLiveCoverage and the caller's failure
    * guard arbitrates.
    */
-  deadlineAt?: LegacyWallDeadline;
+  deadline?: MonoDeadline;
   /**
    * Forbid the in-process local fallback for this call (codex turn-32
    * finding 1). The health probe attesting a REMOTE url must fail when that
@@ -5408,16 +5413,16 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const noCache = options?.noCache === true;
-  const deadlineAt = options?.deadlineAt;
-  // Health probes thread a whole-call timeout; the hook threads an absolute
-  // deadline (BUILD-3a). Both become absolute deadlines here — timeoutMs
+  const deadline = options?.deadline;
+  // Health probes thread a whole-call timeout; the hook threads a monotonic
+  // deadline (BUILD-3a, O1). Both become monotonic deadlines here — timeoutMs
   // keeps its original whole-call meaning — and every remote batch is
   // bounded to the remaining window, recomputed per batch so an earlier
   // batch cannot spend a later batch's time.
-  const timeoutDeadlineAt = options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs as LegacyWallDeadline /* O1-DEBT-0005 */ : undefined;
-  const effectiveDeadlineAt = timeoutDeadlineAt !== undefined && deadlineAt !== undefined
-    ? Math.min(timeoutDeadlineAt, deadlineAt) as LegacyWallDeadline /* O1-DEBT-0006 */
-    : (timeoutDeadlineAt ?? deadlineAt);
+  const timeoutDeadline = options?.timeoutMs !== undefined ? deadlineAfter(monoNow(), options.timeoutMs) : undefined;
+  const effectiveDeadline = timeoutDeadline !== undefined && deadline !== undefined
+    ? earliest(timeoutDeadline, deadline)
+    : (timeoutDeadline ?? deadline);
   // Cache namespace for the LOOKUP: a configured rerank URL means the remote
   // service will score (and write) these keys; without one the local fallback
   // does. Remote and local are different scorers and never share a namespace
@@ -5431,8 +5436,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   const lookupProvider = startIdentity?.namespace ?? null;
   const batchSignal = (): AbortSignal | undefined => {
     if (options?.signal) return options.signal;
-    if (effectiveDeadlineAt === undefined) return undefined;
-    return AbortSignal.timeout(Math.max(1, effectiveDeadlineAt - Date.now()));
+    if (effectiveDeadline === undefined) return undefined;
+    // The loop re-checks expiry before each batch; a deadline crossed between that check and
+    // this call yields an already-aborted signal rather than a 1 ms timer.
+    return timeoutSignal(effectiveDeadline) ?? AbortSignal.abort();
   };
 
   // Deduplicate identical chunk texts — same content from different files shares a single score
@@ -5519,7 +5526,7 @@ export async function rerank(query: string, documents: { file: string; text: str
           // BUILD-3a: stop starting batches once the deadline has passed —
           // already-scored docs keep their scores; the rest surface as a
           // coverage error under requireLiveCoverage.
-          if (effectiveDeadlineAt !== undefined && Date.now() >= effectiveDeadlineAt) break;
+          if (effectiveDeadline !== undefined && isExpired(effectiveDeadline)) break;
           const batch = uncachedDocs.slice(i, i + 4);
           const resp = await fetch(`${rerankUrl}/v1/rerank`, {
             method: "POST",
@@ -5596,7 +5603,7 @@ export async function rerank(query: string, documents: { file: string; text: str
     // callers (BUILD-3a: no untimed local fallback — local CPU inference
     // cannot be bounded mid-run; the hook's unscored docs surface as a
     // coverage error and its failure guard arbitrates).
-    if (!scored && deadlineAt === undefined && options?.requireRemote !== true) {
+    if (!scored && deadline === undefined && options?.requireRemote !== true) {
       const remaining = uncachedDocs.filter(d => !cachedResults.has(d.file));
       if (remaining.length > 0) {
         const llm = getDefaultLlamaCpp();
@@ -5978,7 +5985,7 @@ export function getStatus(db: Database): IndexStatus {
       path: col.path,
       pattern: col.pattern,
       documents: stats.active_count,
-      lastUpdated: stats.last_doc_update || new Date().toISOString(),
+      lastUpdated: stats.last_doc_update || isoNow(),
     };
   });
 
@@ -6286,7 +6293,7 @@ function snoozeDocumentFn(db: Database, collection: string, path: string, until:
 
 function incrementAccessCountFn(db: Database, paths: string[]): void {
   if (paths.length === 0) return;
-  const now = new Date().toISOString();
+  const now = isoNow();
   const placeholders = paths.map(() => "?").join(",");
   db.prepare(`
     UPDATE documents SET access_count = access_count + 1, last_accessed_at = ?
@@ -6386,9 +6393,9 @@ export async function syncBeadsIssues(
 
     if (existingDoc) {
       if (existingDoc.hash !== hash) {
-        insertContent(db, hash, docBody, new Date().toISOString());
+        insertContent(db, hash, docBody, isoNow());
         db.prepare(`UPDATE documents SET hash = ?, modified_at = ? WHERE id = ?`)
-          .run(hash, new Date().toISOString(), existingDoc.id);
+          .run(hash, isoNow(), existingDoc.id);
       }
 
       db.prepare(`
@@ -6399,7 +6406,7 @@ export async function syncBeadsIssues(
         issue.status,
         issue.priority,
         issue.assignee || null,
-        new Date().toISOString(),
+        isoNow(),
         issue.id
       );
       synced++;
@@ -6429,7 +6436,7 @@ export async function syncBeadsIssues(
         issue.parent || null,
         issue.created_at,
         issue.closed_at || null,
-        new Date().toISOString()
+        isoNow()
       );
 
       newDocIds.push(newDoc.id);
@@ -6444,7 +6451,7 @@ export async function syncBeadsIssues(
       db.prepare(`
         INSERT OR IGNORE INTO beads_dependencies (source_id, target_id, dep_type, created_at)
         VALUES (?, ?, ?, ?)
-      `).run(dep.issue_id, dep.depends_on_id, dep.type, dep.created_at || new Date().toISOString());
+      `).run(dep.issue_id, dep.depends_on_id, dep.type, dep.created_at || isoNow());
     }
   }
 
@@ -6485,7 +6492,7 @@ export async function syncBeadsIssues(
         targetRow.doc_id,
         relationType,
         JSON.stringify({ origin: 'beads', dep_type: dep.dep_type }),
-        new Date().toISOString()
+        isoNow()
       );
     }
   }
@@ -6547,7 +6554,7 @@ export function buildTemporalBackbone(db: Database): number {
     edges += db.prepare(`
       INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
       VALUES (?, ?, 'temporal', 1.0, ?)
-    `).run(prev.id, curr.id, new Date().toISOString()).changes;
+    `).run(prev.id, curr.id, isoNow()).changes;
   }
 
   return edges;
@@ -6598,7 +6605,7 @@ export async function buildSemanticGraph(
       edges += db.prepare(`
         INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
         VALUES (?, ?, 'semantic', ?, ?)
-      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString()).changes;
+      `).run(doc1.id, sim.target_id, similarity, isoNow()).changes;
     }
   }
 
@@ -7047,7 +7054,7 @@ function getArchiveCandidatesFn(
   db: Database,
   policy: import("./collections.ts").LifecyclePolicy
 ): { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[] {
-  const now = new Date();
+  const now = toDate(epochNow());
   const defaultDays = policy.archive_after_days;
 
   const rows = db.prepare(`

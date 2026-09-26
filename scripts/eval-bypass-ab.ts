@@ -26,6 +26,8 @@
  * Exit codes: 0 verdict produced · 1 fixture/integrity failure · 2 infra abort.
  */
 import { parseArgs } from "util";
+import { isoNow } from "../src/clock.ts";
+import { monoNow, elapsed, evidenceMs } from "../src/clock.ts";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
@@ -174,7 +176,7 @@ if (cmd === "freeze") {
   }
 
   const store = createStore(cacheSnapPath); // writable — the expansion cache IS the freeze medium
-  const asOf = new Date().toISOString();
+  const asOf = isoNow();
   const cases: FrozenCase[] = [];
   let aborts = 0;
 
@@ -194,9 +196,9 @@ if (cmd === "freeze") {
     const key = expandQueryCacheKey(query);
     const capture = async (): Promise<{ digest: string; ms: number } | null> => {
       store.db.prepare(`DELETE FROM llm_cache WHERE hash = ?`).run(key);
-      const t0 = performance.now();
+      const t0 = monoNow();
       const variants = await store.expandQuery(query);
-      const ms = performance.now() - t0;
+      const ms = evidenceMs(elapsed(t0));
       const row = store.db.prepare(`SELECT result FROM llm_cache WHERE hash = ?`).get(key) as { result: string } | null;
       if (!row) return null; // fallback path fired (uncached) — retry once
       if (JSON.stringify(JSON.parse(row.result)) !== JSON.stringify(variants)) return null;
@@ -386,9 +388,9 @@ async function callArm(arm: ArmCtx, c: FrozenCase): Promise<{ rank: number | nul
   if (arm.name === "B") process.env.CLAWMEM_DISABLE_FTS_BYPASS = "true";
   else delete process.env.CLAWMEM_DISABLE_FTS_BYPASS;
   const before = arm.spied.length;
-  const t0 = performance.now();
+  const t0 = monoNow();
   const res = await arm.client.callTool({ name: "query", arguments: { query: c.query, compact: false, limit: 10 } }) as { structuredContent?: { results?: { file: string }[] } };
-  const ms = performance.now() - t0;
+  const ms = evidenceMs(elapsed(t0));
   delete process.env.CLAWMEM_DISABLE_FTS_BYPASS;
   const paths = (res.structuredContent?.results ?? []).map(r => r.file);
   const idx = c.targets ? paths.findIndex(p => c.targets!.some(t => p.includes(t))) : -1;

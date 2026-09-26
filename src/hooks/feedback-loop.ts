@@ -10,6 +10,7 @@
  */
 
 import type { Store } from "../store.ts";
+import { isoNow } from "../clock.ts";
 import { resolveStore } from "../store.ts";
 import { listVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
@@ -197,7 +198,7 @@ function trackUtilitySignals(
   `);
 
   const referencedSet = new Set(referencedPaths);
-  const now = new Date().toISOString();
+  const now = isoNow();
 
   const upsert = store.db.prepare(`
     INSERT INTO utility_signals (path, surfaced_count, referenced_count, last_surfaced, last_referenced)

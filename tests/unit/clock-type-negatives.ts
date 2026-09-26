@@ -17,18 +17,38 @@
  */
 
 import {
+  allotted,
   deadlineAfter,
   deadlineBefore,
+  deadlineTimer,
   duration,
+  earliest,
   elapsed,
+  epochAfter,
+  epochAt,
+  epochDelta,
+  epochMs,
   epochNow,
+  epochOf,
+  epochReached,
+  evidenceMs,
   isExpired,
   monoNow,
   overshoot,
+  raceDeadline,
   remainingForTimeout,
+  scaled,
+  shorter,
+  shorterThan,
+  signalAfter,
   signedDelta,
   sleep,
+  spanEvidence,
+  spanStart,
   timeoutSignal,
+  untilDeadline,
+  untilEpoch,
+  wireBudget,
 } from "../../src/clock.ts";
 import type { DurationMs, EpochMs, MonoDeadline, MonoInstant } from "../../src/clock.ts";
 
@@ -114,6 +134,42 @@ const _aborted: boolean = timeoutSignal(_deadline).aborted;
 // @ts-expect-error
 elapsed(_deadline);
 
+// ─── O1 step 2: the widened algebra keeps the kinds apart ───────────
+
+// A deadline is chosen among deadlines: an epoch is not one.
+// @ts-expect-error
+earliest(epochNow(), _deadline);
+
+// A duration is compared with a duration, never with a bare number.
+// @ts-expect-error
+shorterThan(duration(1), 5);
+
+// The wire takes a remaining WINDOW, never a signed delta (over_ms can never become a budget).
+// @ts-expect-error
+wireBudget(signedDelta(100));
+
+// Epoch arithmetic is epoch arithmetic: a monotonic instant cannot be shifted on the wall clock.
+// @ts-expect-error
+epochAfter(monoNow(), duration(1));
+
+// ...and the wall clock cannot be reached for a monotonic deadline.
+// @ts-expect-error
+epochReached(_deadline);
+
+// A monotonic instant is never evidence (its origin is per-process) and never a calendar value.
+// @ts-expect-error
+evidenceMs(monoNow());
+// @ts-expect-error
+epochMs(duration(5));
+
+// A scaled duration is still a duration, not a deadline.
+// @ts-expect-error
+const _f: MonoDeadline = scaled(duration(10), 2);
+
+// A timer is bounded by a deadline, never by an epoch.
+// @ts-expect-error
+deadlineTimer(epochNow(), () => {});
+
 // ─── what MUST still compile ────────────────────────────────────────
 // If any of these break, the algebra has become unusable rather than safe.
 
@@ -132,6 +188,21 @@ if (!isExpired(work)) {
 void elapsed(start);
 void overshoot(work);
 void epochNow(); // wall-clock SEMANTICS remain available — raw SAMPLING is what is banned
+void allotted(start, work);
+void earliest(work, internal);
+void shorter(duration(1), duration(2));
+void scaled(duration(10), 0.5);
+void epochReached(epochAfter(epochNow(), duration(60_000)));
+void epochDelta(epochNow(), epochOf(new Date()));
+void untilEpoch(epochAt(0));
+void evidenceMs(overshoot(work));
+void epochMs(epochNow());
+void wireBudget(duration(5));
+void spanEvidence(spanStart());
+void deadlineTimer(work, () => {});
+void raceDeadline(Promise.resolve(1), work, () => new Error("x"));
+void untilDeadline(Promise.resolve(1), work);
+void signalAfter(duration(1));
 
 // Keep the unused bindings referenced so `noUnusedLocals` stays irrelevant here.
-void _a; void _b; void _c; void _d; void _e; void _aborted;
+void _a; void _b; void _c; void _d; void _e; void _f; void _aborted;

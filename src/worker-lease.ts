@@ -19,6 +19,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { toDate, epochNow } from "./clock.ts";
 import type { Store } from "./store.ts";
 
 export interface LeaseAcquireResult {
@@ -27,7 +28,7 @@ export interface LeaseAcquireResult {
   expiresAt?: string;
 }
 
-function nowIso(now: Date = new Date()): string {
+function nowIso(now: Date = toDate(epochNow())): string {
   return now.toISOString();
 }
 
@@ -56,7 +57,7 @@ export function acquireWorkerLease(
   store: Store,
   workerName: string,
   ttlMs: number,
-  now: Date = new Date(),
+  now: Date = toDate(epochNow()),
 ): LeaseAcquireResult {
   if (ttlMs <= 0) {
     throw new Error(`acquireWorkerLease: ttlMs must be positive, got ${ttlMs}`);
@@ -129,7 +130,7 @@ export function renewWorkerLease(
   workerName: string,
   token: string,
   ttlMs: number,
-  now: Date = new Date(),
+  now: Date = toDate(epochNow()),
 ): boolean {
   if (ttlMs <= 0) {
     throw new Error(`renewWorkerLease: ttlMs must be positive, got ${ttlMs}`);

@@ -8,6 +8,7 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { isoNow } from "../clock.ts";
 import { join, resolve } from "path";
 import {
   type HookInput,
@@ -228,7 +229,7 @@ export async function precompactExtract(
   }
 
   // Build the handoff document
-  const now = new Date().toISOString();
+  const now = isoNow();
   const sections: string[] = [
     `# Pre-Compaction State`,
     ``,

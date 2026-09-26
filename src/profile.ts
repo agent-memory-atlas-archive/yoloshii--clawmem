@@ -9,6 +9,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { isoNow, toDate, epochNow } from "./clock.ts";
 import { hashContent } from "./indexer.ts";
 import { smartTruncate } from "./hooks.ts";
 import { MAX_LEVENSHTEIN_LENGTH } from "./limits.ts";
@@ -122,7 +123,7 @@ export function buildDynamicProfile(store: Store): string[] {
   }
 
   // Recent progress documents
-  const cutoff = new Date();
+  const cutoff = toDate(epochNow());
   cutoff.setDate(cutoff.getDate() - 7);
   // §51.1 D13: content-currency — cutoff and display on effectiveAt
   const progress = store.getDocumentsByType("progress", 5, { orderBy: "effective" });
@@ -167,7 +168,7 @@ export type ProfileUpdateOutcome = "rebuilt" | "held-forget" | "held-archive" | 
 export function updateProfile(store: Store): ProfileUpdateOutcome {
   const staticFacts = buildStaticProfile(store);
   const dynamicItems = buildDynamicProfile(store);
-  const now = new Date().toISOString();
+  const now = isoNow();
 
   const body = formatProfileDocument(staticFacts, dynamicItems);
   const hash = hashContent(body);

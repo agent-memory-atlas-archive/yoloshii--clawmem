@@ -7,6 +7,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { toDate, epochNow } from "./clock.ts";
 import { dirname, join, resolve } from "path";
 import type { Store, DocumentRow, SessionRecord } from "./store.ts";
 import { listCollections } from "./collections.ts";
@@ -163,7 +164,7 @@ export function generateDirectoryBlock(
 // acceptance requirement and full directory-context orchestration is excessive
 // to pin it.
 export function getDecisionsForDirectory(store: Store, dirPath: string): DocumentRow[] {
-  const cutoff = new Date();
+  const cutoff = toDate(epochNow());
   cutoff.setDate(cutoff.getDate() - DECISION_LOOKBACK_DAYS);
   const cutoffStr = cutoff.toISOString();
 

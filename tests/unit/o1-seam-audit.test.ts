@@ -19,10 +19,25 @@ import { compilerOptionsFrom } from "../../scripts/o1-tsconfig.ts";
  * laundering path three code reviews named, then that the real tree passes and
  * the closure reproduces the falsifier sites.
  *
- * Fixtures copy the real `src/clock.ts` + `src/clock-legacy.ts` into a temp
- * root so the brands under test are the brands that ship. Every `.ts`, `.d.ts`
- * and JS file of the fixture is a program root, exactly as `scopedFiles()` does.
+ * Fixtures copy the real `src/clock.ts` into a temp root so the brands under
+ * test are the brands that ship, and WRITE the retired legacy brand module from
+ * the text below: `src/clock-legacy.ts` left the real tree at the O1 migration
+ * (step 2, delta 4 — zero debt entries), but the audit's C5 value-flow closure
+ * is still exercised here against that brand, exactly as the migration relied
+ * on it. Every `.ts`, `.d.ts` and JS file of the fixture is a program root,
+ * exactly as `scopedFiles()` does.
  */
+
+/** The retired `src/clock-legacy.ts`, verbatim in what matters: a NON-EXPORTED unique symbol keys the brand. */
+const LEGACY_MODULE_TEXT = `/**
+ * LEGACY — the one O1 debt type (RETIRED from the real tree at the migration; fixture copy).
+ * An absolute wall-clock deadline at a seam that had not yet migrated to MonoDeadline.
+ * Constructing one is ALWAYS debt (an erased assertion with an O1-DEBT marker); there is no
+ * constructor, by design. Keyed on a non-exported unique symbol.
+ */
+declare const LEGACY_WALL_DEADLINE: unique symbol;
+export type LegacyWallDeadline = number & { readonly [LEGACY_WALL_DEADLINE]: true };
+`;
 
 const REPO = resolve(import.meta.dir, "../..");
 const SCRIPT = join(REPO, "scripts/o1-seam-audit.ts");
@@ -37,7 +52,7 @@ function fixture(files: Record<string, string>): { root: string; files: string[]
   dirs.push(root);
   mkdirSync(join(root, "src"), { recursive: true });
   copyFileSync(join(REPO, "src/clock.ts"), join(root, "src/clock.ts"));
-  copyFileSync(join(REPO, "src/clock-legacy.ts"), join(root, "src/clock-legacy.ts"));
+  writeFileSync(join(root, "src/clock-legacy.ts"), LEGACY_MODULE_TEXT);
   for (const [rel, body] of Object.entries(files)) {
     mkdirSync(join(root, rel, ".."), { recursive: true });
     writeFileSync(join(root, rel), body);
@@ -715,15 +730,18 @@ describe("ratchet write modes (real tree, temp ratchet)", () => {
     expect(cli(["--init"], tmp).status).toBe(2);
     const r = cli([], tmp); expect(r.stdout).toContain("OK —"); expect(r.status).toBe(0);
   });
-  it("--write REFUSES a marker missing from the baseline, and RETIRES a stale entry", () => {
+  it("--write RETIRES a stale entry (the real tree holds ZERO markers after the O1 migration, so an entry the tree no longer carries is exactly what retirement removes)", () => {
+    // The REFUSAL half (a live marker missing from the baseline) is locked by the C2 fixture tests
+    // above: with no marker left in the real tree it cannot be exercised end-to-end here.
     const dir = mkdtempSync(join(tmpdir(), "o1-seam-cli-")); dirs.push(dir);
     const tmp = join(dir, "r.json");
     const base = JSON.parse(readFileSync(real, "utf8")) as SeamRatchet;
-    writeFileSync(tmp, JSON.stringify({ ...base, entries: base.entries.slice(1) }));
-    expect(cli(["--write"], tmp).status).toBe(2);
-    writeFileSync(tmp, JSON.stringify({ ...base, entries: [...base.entries, { ...base.entries[0]!, id: "O1-DEBT-9999" }] }));
+    expect(base.entries).toHaveLength(0);
+    const stale = { id: "O1-DEBT-9999", kind: "construction" as const, file: "src/store.ts", scope: "gone", brands: ["MonoDeadline"], hash: "00000000", text: "retired" };
+    writeFileSync(tmp, JSON.stringify({ ...base, entries: [stale] }));
+    expect(cli([], tmp).status).toBe(0); // a stale entry is progress, not a finding
     const w = cli(["--write"], tmp); expect(w.stdout).toContain("retired 1 debt"); expect(w.status).toBe(0);
-    expect((JSON.parse(readFileSync(tmp, "utf8")) as SeamRatchet).entries).toHaveLength(base.entries.length);
+    expect((JSON.parse(readFileSync(tmp, "utf8")) as SeamRatchet).entries).toHaveLength(0);
   });
 });
 
@@ -733,40 +751,40 @@ describe("repository state", () => {
   const r = audit(scopedFiles(REPO), REPO, loadRatchet());
   const has = (file: string, owner: string, name: string) => r.closure.some((c) => c.file === file && c.owner === owner && c.name === name);
   it("zero findings against the checked-in ratchet", () => { expect(r.findings).toEqual([]); });
-  it("FALSIFIER: the closure reproduces every site codex named, from the roots alone", () => {
-    expect(has("src/store.ts", "searchVecMatch", "deadlineMs")).toBe(true);
-    expect(has("src/store.ts", "searchVec", "deadlineMs")).toBe(true);
-    expect(has("src/store.ts", "VecSearchDetailedOpts", "deadlineMs")).toBe(true);
+  it("FALSIFIER: the closure reproduces every site codex named, from the roots alone — now on the MIGRATED seams (O1 step 2: `deadline: MonoDeadline`)", () => {
+    expect(has("src/store.ts", "searchVecMatch", "deadline")).toBe(true);
+    expect(has("src/store.ts", "searchVec", "deadline")).toBe(true);
+    expect(has("src/store.ts", "VecSearchDetailedOpts", "deadline")).toBe(true);
     expect(has("src/store.ts", "searchVecDetailed", "opts")).toBe(true);
-    expect(has("src/store.ts", "getEmbedding", "deadlineMs")).toBe(true);          // PRIVATE
+    expect(has("src/store.ts", "getEmbedding", "deadline")).toBe(true);          // PRIVATE
     expect(has("src/store.ts", "expandQuery", "opts")).toBe(true);
-    expect(has("src/store.ts", "RerankProbeOptions", "deadlineAt")).toBe(true);
+    expect(has("src/store.ts", "RerankProbeOptions", "deadline")).toBe(true);
     expect(has("src/llm.ts", "LlamaCpp.expandQuery", "options")).toBe(true);
-    expect(has("src/vector-daemon.ts", "VecReq", "deadlineMs")).toBe(true);        // NON-EXPORTED type
-    expect(has("src/vector-daemon.ts", "startVectorDaemon", "deadlineMs")).toBe(true); // INTERNAL callback
-    expect(has("src/vector-daemon.ts", "searchVecBounded", "deadlineMs")).toBe(true);
-    expect(has("src/vector-daemon.ts", "searchVecDaemonRequired", "deadlineMs")).toBe(true);
-    expect(has("src/eval/vec-daemon-child.ts", "childMain", "deadlineMs")).toBe(true); // no sweep listed it
+    expect(has("src/vector-daemon.ts", "startVectorDaemon", "deadline")).toBe(true); // INTERNAL callback
+    expect(has("src/vector-daemon.ts", "daemonVecMatch", "deadline")).toBe(true);
+    expect(has("src/vector-daemon.ts", "searchVecBounded", "deadline")).toBe(true);
+    expect(has("src/vector-daemon.ts", "searchVecDaemonRequired", "deadline")).toBe(true);
+    expect(has("src/eval/vec-daemon-child.ts", "childMain", "deadline")).toBe(true); // no sweep listed it
+    // The WIRE carries a plain integer (`remainingBudgetMs`), constructed daemon-side only after
+    // validation: the request type is NOT a branded seam any more (the legacy `deadlineMs` seam is gone).
+    expect(r.closure.some((c) => c.file === "src/vector-daemon.ts" && c.owner === "VecReq")).toBe(false);
   });
-  it("ROUND 2, finding 7: the Stop-hook deadline seam codex named is inside the closure", () => {
-    expect(has("src/causal-writer.ts", "runCausalStep", "deadlineAt")).toBe(true);
-    expect(has("src/hooks/decision-extractor.ts", "detectContradictions", "deadlineAt")).toBe(true);
-    expect(has("src/hooks/decision-extractor.ts", "checkMergePolicy", "deadlineMs")).toBe(true);
-    expect(has("src/hooks/decision-extractor.ts", "decisionExtractor", "deadlineAt")).toBe(true);
+  it("ROUND 2, finding 7: the Stop-hook deadline seam codex named is inside the closure (migrated: `deadline`)", () => {
+    expect(has("src/causal-writer.ts", "runCausalStep", "deadline")).toBe(true);
+    expect(has("src/hooks/decision-extractor.ts", "detectContradictions", "deadline")).toBe(true);
+    expect(has("src/hooks/decision-extractor.ts", "checkMergePolicy", "deadline")).toBe(true);
+    expect(has("src/hooks/decision-extractor.ts", "decisionExtractor", "deadline")).toBe(true);
   });
-  it("epoch seams are LegacyWallDeadline and the relative seam is DurationMs — never crossed", () => {
+  it("every deadline seam is MonoDeadline and the relative seam is DurationMs — the legacy brand is gone from the closure", () => {
     const at = (owner: string, name: string) => r.closure.find((c) => c.owner === owner && c.name === name)?.brands ?? [];
-    expect(at("VecReq", "deadlineMs")).toEqual(["LegacyWallDeadline"]);
-    expect(at("RerankProbeOptions", "deadlineAt")).toEqual(["LegacyWallDeadline"]);
+    expect(at("RerankProbeOptions", "deadline")).toEqual(["MonoDeadline"]);
     expect(at("RerankProbeOptions", "timeoutMs")).toEqual(["DurationMs"]);
+    expect(at("searchVecMatch", "deadline")).toEqual(["MonoDeadline"]);
+    expect(r.closure.every((c) => !c.brands.includes("LegacyWallDeadline"))).toBe(true);
   });
-  it("exactly the thirteen first-commit debt entries — twelve constructions, ONE erasure (the legacy wire) — and three baselined diagnostics, none in a branded file", () => {
-    expect(r.entries.map((e) => e.id)).toEqual(["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0010", "0011", "0012", "0013", "0014", "0015"].map((n) => `O1-DEBT-${n}`));
-    expect(r.entries.filter((e) => e.kind === "erasure").map((e) => [e.id, e.file, e.text])).toEqual([["O1-DEBT-0011", "src/vector-daemon.ts", "req"]]);
-    expect(r.entries.every((e) => /^[0-9a-f]{8}$/.test(e.hash))).toBe(true);
-    const branded = new Set(r.closure.map((c) => c.file));
+  it("ZERO debt entries after the migration (activation precondition, O1 §6 step 4) and the three baselined diagnostics", () => {
+    expect(r.entries).toEqual([]);
     expect(r.diagnostics).toHaveLength(3);
-    expect(r.diagnostics.filter((d) => branded.has(d.file))).toHaveLength(0);
     expect(r.diagnostics.find((d) => d.file === "src/consolidation.ts")?.context).toBe("for(const doc of docs)>try");
   });
 });

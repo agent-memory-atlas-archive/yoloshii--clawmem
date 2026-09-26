@@ -9,6 +9,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "crypto";
 import type { LLM } from "./llm.ts";
 
@@ -118,7 +119,7 @@ export function extractTemporalConstraint(query: string): { start: string; end: 
   for (const [pattern, extractor] of TEMPORAL_RELATIVE) {
     const match = q.match(pattern);
     if (match) {
-      const result = extractor(new Date(), match);
+      const result = extractor(toDate(epochNow()), match);
       if (result.start && result.end) {
         return {
           start: localDateToUtcStart(result.start),
@@ -139,7 +140,7 @@ function classifyIntentHeuristic(query: string): IntentResult {
   // Extract temporal info (local date strings for intent scoring; UTC conversion at query time)
   let temporal_start: string | undefined;
   let temporal_end: string | undefined;
-  const now = new Date();
+  const now = toDate(epochNow());
   for (const [pattern, extractor] of TEMPORAL_RELATIVE) {
     const match = q.match(pattern);
     if (match) {
@@ -246,7 +247,7 @@ function cacheIntent(db: Database, queryHash: string, query: string, result: Int
     result.confidence,
     result.temporal_start || null,
     result.temporal_end || null,
-    new Date().toISOString()
+    isoNow()
   );
 }
 

@@ -11,6 +11,7 @@
  */
 
 import type { Server } from "bun";
+import { isoNow, toDate, epochNow, epochAfter, duration } from "./clock.ts";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
 import { enrichResults } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
@@ -487,7 +488,7 @@ async function handleSnooze(req: Request, url: URL, store: Store): Promise<Respo
   ).get(resolved.hash) as { id: number; collection: string; path: string } | undefined;
   if (!doc) return jsonError(`Document not found: ${docid}`, 404);
 
-  const until = body?.unsnooze ? null : (body?.until ?? new Date(Date.now() + 30 * 86400000).toISOString());
+  const until = body?.unsnooze ? null : (body?.until ?? toDate(epochAfter(epochNow(), duration(30 * 86400000))).toISOString());
   store.snoozeDocument(doc.collection, doc.path, until);
   return jsonResponse({ docid, snoozed: !body?.unsnooze, until });
 }
@@ -566,7 +567,7 @@ function handleExport(_req: Request, _url: URL, store: Store): Response {
 
   return jsonResponse({
     version: "1.0.0",
-    exported_at: new Date().toISOString(),
+    exported_at: isoNow(),
     count: docs.length,
     documents: docs,
   });

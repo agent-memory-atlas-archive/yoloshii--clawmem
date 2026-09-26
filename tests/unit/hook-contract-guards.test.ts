@@ -10,6 +10,7 @@
  * Each test asserts the CORRECT behavior, not the behavior that shipped.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { monoNow, deadlineAfter, duration } from "../../src/clock.ts";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -87,7 +88,7 @@ const causalStep = (llm: any, observations: Array<{ docId: number; facts: string
     sessionId: "guards-test",
     mode: "on",
     newObservations: observations,
-    deadlineAt: Date.now() + 25_000,
+    deadline: deadlineAfter(monoNow(), duration(25_000)),
   });
 
 const sightingRows = () =>

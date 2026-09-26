@@ -9,8 +9,10 @@
  * watcher process: the hook sends the query + presentation inputs over a per-vault unix socket and
  * races the reply against a REAL setTimeout (its own event loop stays free); the daemon answers with
  * fully projected results, so the hook performs ZERO synchronous sqlite inside its vector deadline.
- * Client-side hydration survives only as the raw-hit COMPATIBILITY path (a legacy daemon answering
- * raw hits to a hydrated request, or a request that never asked for hydration).
+ * Client-side hydration survives only on the raw-hit path: a request that never asked for hydration,
+ * answered by a current daemon that attested the budget it enforced. A legacy daemon's raw answer to
+ * a hydrated request carries no deadline attestation and is classified `skew` (FTS) — O1 §4
+ * superseded the t84 raw-hit negotiation.
  *
  * The daemon is a strict OPTIMIZATION LAYER, never a dependency:
  *   - daemon absent/refused  → the hook uses the in-process searchVec path UNCHANGED (today's behavior;
@@ -27,8 +29,8 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import type { Socket } from "bun";
 import { searchVecMatch, hydrateVecResults, projectVecResults, HydratedBodyOversizedError, VecReadModelMismatchError, type Store, type SearchResult, type ProjectedVecResult } from "./store.ts";
-import type { LegacyWallDeadline } from "./clock-legacy.ts";
-import { HYDRATED_PROTOCOL, HYDRATED_MAX_RESULTS, HYDRATED_MAX_ENTRY_BYTES, HYDRATED_MAX_FRAME_BYTES, HYDRATED_MAX_SOURCE_BODY_BYTES, HYDRATED_SNIPPET_LENS, HYDRATED_RERANK_TEXT_LEN, HYDRATED_GATE_TEXT_LEN } from "./vector-protocol.ts";
+import { monoNow, deadlineAfter, duration, isExpired, remainingForTimeout, wireBudget, deadlineTimer, elapsed, evidenceMs, type MonoDeadline, type MonoInstant } from "./clock.ts";
+import { HYDRATED_PROTOCOL, HYDRATED_MAX_RESULTS, HYDRATED_MAX_ENTRY_BYTES, HYDRATED_MAX_FRAME_BYTES, HYDRATED_MAX_SOURCE_BODY_BYTES, HYDRATED_SNIPPET_LENS, HYDRATED_RERANK_TEXT_LEN, HYDRATED_GATE_TEXT_LEN, DEADLINE_PROTOCOL, MAX_LEG_BUDGET_MS } from "./vector-protocol.ts";
 
 // Newline-delimited JSON, one request/response per connection. A query string and a list of
 // {hash_seq, distance} are both small; anything over this cap is a protocol violation, so both sides
@@ -56,17 +58,38 @@ function decodeLineStrict(bytes: Uint8Array): string | null {
 // daemon-absent in-process fallback (the old slow path), vs daemon busy/error → FTS. Off by default.
 const VEC_TIMING = process.env.CLAWMEM_VEC_TIMING === "1" || process.env.CLAWMEM_VEC_TIMING === "true";
 
+let daemonSkewWarned = false;
+/** O1 §4 (new client / old daemon, production hook): the vector leg degrades to FTS and a health
+ * warning names the socket — once per process. Surfacing never crashes. */
+function warnOnceOnDaemonSkew(dbPath: string, missing: string): void {
+  if (daemonSkewWarned) return;
+  daemonSkewWarned = true;
+  console.error(`[clawmem] vector daemon on ${vecDaemonSocketPath(dbPath)} does not implement ${missing} (a watcher on an older build) — vector legs degrade to FTS until 'clawmem watch' is restarted on this build`);
+}
+
 type VecHit = { hash_seq: string; distance: number };
 type VecReq = {
-  query: string; model: string; limit: number; deadlineMs?: LegacyWallDeadline;
+  query: string; model: string; limit: number;
+  /** O1 (deadline-rel-v1): whole milliseconds still available to the leg, filled in by
+   * `daemonVecMatch` IMMEDIATELY before the socket write (never earlier — connect latency has
+   * already been spent). Integer in [1, MAX_LEG_BUDGET_MS] or the daemon refuses the request as
+   * skew (`bad_request`). REQUIRED on a hydrated request — a hydrated-v1 request without it is
+   * `bad_request`; a raw request may omit it for compatibility and is then answered WITHOUT the
+   * `deadlineProtocol` attestation: the daemon attests only a budget it enforced (codex migration
+   * r1 P2). The daemon's ADVISORY deadline is anchored at FRAME RECEIPT — the socket event that
+   * delivered the terminating newline, sampled before decode and validation (codex migration r1
+   * P3) — so it trails the client's authoritative timer by one-way transit only. The pre-O1
+   * absolute wall-clock `deadlineMs` is REJECTED by field presence (`version_skew`) — never decoded. */
+  remainingBudgetMs?: number;
   // hydrated-v1 (codex #28 t83–t88, projection-complete daemon hydration). A request carrying
   // `responseProtocol` asks the daemon to hydrate + project server-side and answer with the
   // multi-line hydrated response (header + n entry lines + end line). The projection params are
   // an ATTESTATION of the exact protocol constants — the daemon validates them EXACTLY and
   // refuses anything else as `bad_request` (t87 F1), so a version-skewed peer fails loudly
   // instead of computing a divergent projection. An old daemon ignores the unknown fields and
-  // answers raw hits — the client detects that shape and falls back to client-side hydration
-  // (the "raw-hit" path of the t84 negotiation matrix).
+  // answers raw hits WITHOUT the deadline attestation — the client classifies that leg `skew`
+  // (FTS): O1 §4 superseded the t84 raw-hit negotiation, because such a daemon ran under no
+  // deadline of its own.
   responseProtocol?: string;
   /** The RAW CURRENT PROMPT — snippet construction input on EVERY leg (t87 F4: the prior leg
    * searches with joined priors and deep legs with expansion variants, but buildContext always
@@ -82,7 +105,11 @@ type VecReq = {
   dateRange?: { start: string; end: string };
 };
 type VecResp =
-  | { results: VecHit[] }
+  // `deadlineProtocol` (O1 §4): the daemon's per-response attestation that it implemented the
+  // relative budget the request carried. A response WITHOUT it came from a pre-O1 daemon that
+  // silently ignored the field, or answers a raw request that carried no budget (nothing was
+  // enforced, so nothing is attested) — an O1 client classifies the leg `skew` (FTS), never `ok`.
+  | { results: VecHit[]; deadlineProtocol?: string }
   | { error: string; storedModels?: string[]; activeModel?: string }
   // Readiness/identity probe answer (eval daemon child, codex t76 constraint 3): the exact DB path
   // this daemon serves and the pid that owns the socket — a parent verifies both before trusting.
@@ -91,19 +118,27 @@ type VecResp =
   // makes a daemon-required run authoritative; old clients ignore the extra field).
   | { pong: true; db: string; pid: number; protocols?: string[] }
   // Hydrated response lines (each is its own newline-delimited frame):
-  | { protocol: typeof HYDRATED_PROTOCOL; count: number }
+  | { protocol: typeof HYDRATED_PROTOCOL; count: number; deadlineProtocol?: string }
   | { entry: ProjectedVecResult }
   | { end: true };
 
 /** Classified outcome of one daemon-routed vector leg — recorded per leg in the surfacing trace.
  * `oversized` (t84/t87): the daemon refused hydrated projection on a size cap (source-body ceiling,
  * entry cap, or frame cap) — the hook falls back to FTS with the vector candidates LOST for the
- * turn; traced distinctly from generic `error` so the degradation is attributable. */
-export type VecExecStatus = "ok" | "busy" | "error" | "absent" | "model_mismatch" | "oversized";
+ * turn; traced distinctly from generic `error` so the degradation is attributable.
+ * `skew` (O1 §4): the daemon answered WITHOUT attesting `deadline-rel-v1` — a pre-O1 watcher that
+ * ignored the relative budget and ran with no deadline of its own; the leg degrades to FTS (the
+ * client's timer still bounded it) and a once-per-process health warning names the socket.
+ * `deadline` (codex migration r1 S1): the CLIENT's authoritative deadline ended the leg — its timer
+ * fired, the window closed before a connection or before a whole transmissible millisecond, or a
+ * monotonic check around a response-line parse found it crossed. Distinct from `error` (a daemon
+ * that misbehaved): the surfacing trace records it with terminal kind `abandonment`. */
+export type VecExecStatus = "ok" | "busy" | "error" | "absent" | "model_mismatch" | "oversized" | "skew" | "deadline";
 
 /** Which response protocol actually served an `ok` leg (run-identity input, t84 CR-5/t85):
- * "hydrated-v1" = daemon-side projection; "raw-hit" = raw VecHit list + client-side hydration
- * (legacy daemon, or a request that never asked for hydration). */
+ * "hydrated-v1" = daemon-side projection; "raw-hit" = raw VecHit list + client-side hydration (a
+ * request that never asked for hydration, answered by an attesting daemon — a legacy daemon's raw
+ * answer is `skew`, never an ok leg, since O1 §4). */
 export type VecResponseProtocol = typeof HYDRATED_PROTOCOL | "raw-hit";
 
 /**
@@ -152,8 +187,8 @@ export function testSyncScanDelay(): void {
   if (!raw) return;
   const ms = Number(raw);
   if (!Number.isFinite(ms) || ms <= 0) return;
-  const until = Date.now() + ms;
-  while (Date.now() < until) { /* synchronous — the caller's race timer cannot fire, by design */ }
+  const until = deadlineAfter(monoNow(), duration(ms));
+  while (!isExpired(until)) { /* synchronous — the caller's race timer cannot fire, by design */ }
 }
 
 /**
@@ -169,8 +204,8 @@ export function testSyncHydrateDelay(): void {
   if (!raw) return;
   const ms = Number(raw);
   if (!Number.isFinite(ms) || ms <= 0) return;
-  const until = Date.now() + ms;
-  while (Date.now() < until) { /* synchronous — models a cold hydration first-touch (daemon-side projection under hydrated-v1; client-side hydrate on the raw-hit compat path) */ }
+  const until = deadlineAfter(monoNow(), duration(ms));
+  while (!isExpired(until)) { /* synchronous — models a cold hydration first-touch (daemon-side projection under hydrated-v1; client-side hydrate on the raw-hit compat path) */ }
 }
 
 /**
@@ -186,8 +221,24 @@ export function testSyncEntryDecodeDelay(): void {
   if (!raw) return;
   const ms = Number(raw);
   if (!Number.isFinite(ms) || ms <= 0) return;
-  const until = Date.now() + ms;
-  while (Date.now() < until) { /* synchronous — models a pathologically slow single-line decode */ }
+  const until = deadlineAfter(monoNow(), duration(ms));
+  while (!isExpired(until)) { /* synchronous — models a pathologically slow single-line decode */ }
+}
+
+/**
+ * TEST-ONLY seam (CLAWMEM_TEST_VEC_REQUEST_DECODE_SYNC_DELAY_MS): a SYNCHRONOUS busy-wait at the
+ * start of the DAEMON's request handling, before the request line is decoded and validated —
+ * server-side decode/validation time made deterministic, so the codex migration r1 P3 lock can
+ * prove the advisory deadline is anchored at frame RECEIPT (the delay is spent inside the budget)
+ * rather than after validation (where it would be granted on top of it). A no-op unless set.
+ */
+export function testSyncRequestDecodeDelay(): void {
+  const raw = process.env.CLAWMEM_TEST_VEC_REQUEST_DECODE_SYNC_DELAY_MS;
+  if (!raw) return;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  const until = deadlineAfter(monoNow(), duration(ms));
+  while (!isExpired(until)) { /* synchronous — models a slow server-side decode/validation */ }
 }
 
 /**
@@ -291,8 +342,8 @@ export async function startVectorDaemon(
   log: (msg: string) => void = () => {},
   // The Step-1 scan is injectable so tests can exercise the socket/single-flight/framing logic without
   // a live embedding server. Production omits it → the real searchVecMatch on the watcher's warm store.
-  scan: (query: string, model: string, limit: number, deadlineMs?: LegacyWallDeadline) => Promise<VecHit[]> =
-    (query, model, limit, deadlineMs) => searchVecMatch(store.db, query, model, limit, deadlineMs),
+  scan: (query: string, model: string, limit: number, deadline?: MonoDeadline) => Promise<VecHit[]> =
+    (query, model, limit, deadline) => searchVecMatch(store.db, query, model, limit, deadline),
 ): Promise<VectorDaemonHandle | null> {
   const sockPath = vecDaemonSocketPath(store.dbPath);
   try {
@@ -330,11 +381,13 @@ export async function startVectorDaemon(
    * (UTF-8 via TextEncoder) BEFORE anything is written: an entry over HYDRATED_MAX_ENTRY_BYTES
    * or a cumulative total over HYDRATED_MAX_FRAME_BYTES aborts to a single `oversized` frame —
    * never a partial response. Per-entry bounding is what makes the client's per-line parse a
-   * bounded synchronous slice (t87 F2).
+   * bounded synchronous slice (t87 F2). The header's `deadlineProtocol` attestation is TRUE by
+   * construction: a hydrated request without a relative budget is refused before any scan (codex
+   * migration r1 P2), so every hydrated answer ran under an enforced advisory deadline.
    */
   const respondHydrated = (socket: Socket<DaemonSocketData>, results: ProjectedVecResult[]) => {
     const enc = new TextEncoder();
-    const header = JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: results.length });
+    const header = JSON.stringify({ protocol: HYDRATED_PROTOCOL, count: results.length, deadlineProtocol: DEADLINE_PROTOCOL });
     const endLine = JSON.stringify({ end: true });
     let total = enc.encode(header).length + 1 + enc.encode(endLine).length + 1;
     const entryLines: string[] = [];
@@ -354,7 +407,8 @@ export async function startVectorDaemon(
     } catch { /* peer already gone */ }
   };
 
-  const handleRequest = async (socket: Socket<DaemonSocketData>, line: string) => {
+  const handleRequest = async (socket: Socket<DaemonSocketData>, line: string, receivedAt: MonoInstant) => {
+    testSyncRequestDecodeDelay(); // TEST-ONLY: server-side decode/validation time, spent inside the window (P3 lock)
     let req: VecReq;
     try {
       const parsed = JSON.parse(line) as Record<string, unknown> | null;
@@ -365,21 +419,51 @@ export async function startVectorDaemon(
         respond(socket, { pong: true, db: store.dbPath, pid: process.pid, protocols: [HYDRATED_PROTOCOL] });
         return;
       }
-      req = parsed as VecReq /* O1-DEBT-0007 */;
-      // t90 S1: deadlineMs is a CONTROL field — a string/NaN/Infinity would bypass both
-      // expiry comparisons and defeat the daemon's deadline contract; validate it on EVERY
-      // request (raw and hydrated) before anything else can consult it.
+      // O1 §4 version skew, detected by FIELD PRESENCE before anything is decoded: a pre-O1
+      // client's absolute wall-clock `deadlineMs` is never turned into a deadline of any kind. The
+      // old client maps the unknown error to its generic FTS fallback and reconnects on the new
+      // contract after its own restart (zero-debt activation needs no compatibility window).
+      if (parsed && typeof parsed === "object" && "deadlineMs" in parsed) {
+        respond(socket, { error: "version_skew" });
+        return;
+      }
+      req = parsed as VecReq;
+      // t90 S1 (O1): remainingBudgetMs is a CONTROL field — a string/NaN/Infinity would bypass the
+      // advisory deadline and defeat the daemon's deadline contract; validate its TYPE on EVERY
+      // request (raw and hydrated) before anything else can consult it. Its RANGE is the contract
+      // check below (`bad_request` — skew, never clamp).
       if (!req || typeof req.query !== "string" || typeof req.model !== "string" || typeof req.limit !== "number" || !Number.isFinite(req.limit)
-        || (req.deadlineMs !== undefined && !(typeof req.deadlineMs === "number" && Number.isFinite(req.deadlineMs)))) {
+        || (req.remainingBudgetMs !== undefined && !(typeof req.remainingBudgetMs === "number" && Number.isFinite(req.remainingBudgetMs)))) {
         throw new Error("bad request shape");
       }
     } catch {
       respond(socket, { error: "malformed" });
       return;
     }
+    // O1 §2 budget validation — the t89 P3 refusal convention: a non-integer or out-of-range
+    // remaining budget is version/config skew, refused BEFORE the scan, never clamped.
+    if (req.remainingBudgetMs !== undefined && (!Number.isInteger(req.remainingBudgetMs) || req.remainingBudgetMs < 1 || req.remainingBudgetMs > MAX_LEG_BUDGET_MS)) {
+      respond(socket, { error: "bad_request" });
+      return;
+    }
+    // The daemon's ADVISORY deadline (O1 §2): monotonic, anchored at FRAME RECEIPT (codex migration
+    // r1 P3) — the instant the socket event delivering the terminating newline began, sampled
+    // before the decode and validation above — so it trails the client's authoritative timer by
+    // one-way transit only (documented, not corrected); server-side decode/validation time is spent
+    // INSIDE the window, never granted on top of it. Re-checked immediately BEFORE and AFTER each
+    // synchronous phase; work already inside the MATCH or the projection is uninterruptible
+    // (check-before / check-after, never cancellation).
+    const advisoryDeadline = req.remainingBudgetMs !== undefined ? deadlineAfter(receivedAt, duration(req.remainingBudgetMs)) : undefined;
+    const hydrated = req.responseProtocol !== undefined;
+    // Codex migration r1 P2: hydrated-v1 is served ONLY under an enforced relative budget — a
+    // hydrated request without `remainingBudgetMs` is contract skew, refused before any scan, so
+    // every hydrated answer's `deadlineProtocol` attestation is true.
+    if (hydrated && advisoryDeadline === undefined) {
+      respond(socket, { error: "bad_request" });
+      return;
+    }
     // hydrated-v1 exact-constant validation (t87 F1): the request's projection params must equal
     // the protocol constants EXACTLY — never compute "what was asked" for arbitrary integers.
-    const hydrated = req.responseProtocol !== undefined;
     if (hydrated && (
       req.responseProtocol !== HYDRATED_PROTOCOL
       || typeof req.presentationQuery !== "string"
@@ -400,8 +484,8 @@ export async function startVectorDaemon(
       respond(socket, { error: "bad_request" });
       return;
     }
-    // Deadline-on-receipt: drop already-expired requests without scanning (the pile-up guard).
-    if (req.deadlineMs !== undefined && Date.now() >= req.deadlineMs) {
+    // Deadline-before-scan: drop an already-expired request without scanning (the pile-up guard).
+    if (advisoryDeadline !== undefined && isExpired(advisoryDeadline)) {
       respond(socket, { error: "expired" });
       return;
     }
@@ -414,11 +498,11 @@ export async function startVectorDaemon(
     const safeLimit = hydrated ? req.limit : Math.min(Math.max(1, Math.trunc(req.limit)), MAX_VEC_LIMIT);
     scanInFlight = true;
     try {
-      const results = await scan(req.query, req.model, safeLimit, req.deadlineMs);
-      // t89 P4: a scan that finished past the client's absolute deadline must not proceed into
-      // projection — the hook already fell back to FTS; answering `expired` releases single-flight
-      // for the next request without touching a single body.
-      if (req.deadlineMs !== undefined && Date.now() >= req.deadlineMs) {
+      const results = await scan(req.query, req.model, safeLimit, advisoryDeadline);
+      // t89 P4: a scan that finished past the advisory deadline must not proceed into projection —
+      // the hook has already fallen back to FTS; answering `expired` releases single-flight for the
+      // next request without touching a single body.
+      if (advisoryDeadline !== undefined && isExpired(advisoryDeadline)) {
         respond(socket, { error: "expired" });
         return;
       }
@@ -441,7 +525,10 @@ export async function startVectorDaemon(
         });
         respondHydrated(socket, projected);
       } else {
-        respond(socket, { results });
+        // Codex migration r1 P2: attest ONLY a budget this daemon enforced. A raw request without
+        // `remainingBudgetMs` (a compatibility caller) ran under no deadline, so its answer carries
+        // no attestation — an O1 client would (correctly) classify it `skew`.
+        respond(socket, advisoryDeadline !== undefined ? { results, deadlineProtocol: DEADLINE_PROTOCOL } : { results });
       }
     } catch (e) {
       // Preserve the v0.18 read-model-mismatch "warn loudly once" contract across the wire: return a
@@ -468,6 +555,10 @@ export async function startVectorDaemon(
       socket: {
         open(socket) { socket.data = { pending: new Uint8Array(0), total: 0 }; },
         data(socket, chunk) {
+          // Codex migration r1 P3: the receipt instant, sampled FIRST — before byte accounting,
+          // decode and validation — and the advisory deadline's anchor if this chunk completes
+          // the frame.
+          const receivedAt = monoNow();
           // Byte-accurate framing (t87 F3): accumulate RAW BYTES, cap on byte count, locate 0x0A
           // at the byte level, decode the complete line strictly. chunk.toString()+.length was
           // UTF-16 units and could split a code point across chunks.
@@ -482,7 +573,7 @@ export async function startVectorDaemon(
           const line = decodeLineStrict(merged.subarray(0, nl));
           socket.data.pending = new Uint8Array(0); // one request per connection
           if (line === null) { respond(socket, { error: "bad_request" }); return; } // invalid UTF-8 — fail closed
-          void handleRequest(socket, line);
+          void handleRequest(socket, line, receivedAt);
         },
         error(_socket, err) { log(`[vec-daemon] socket error: ${err.message}`); },
       },
@@ -508,23 +599,29 @@ export async function startVectorDaemon(
 // ─────────────────────────────────────────────────────────────────────────────
 
 type DaemonOutcome =
-  | { status: "ok"; results: VecHit[] }                      // raw hits (legacy daemon or raw request) → client hydrates ("raw-hit" path)
+  | { status: "ok"; results: VecHit[] }                      // attested raw hits for a raw request → client hydrates ("raw-hit" path)
   | { status: "ok-hydrated"; results: ProjectedVecResult[] } // daemon-side projection (hydrated-v1) → zero client-side sqlite on the timed path
   | { status: "oversized" }                                  // daemon refused on a size cap → FTS with vector-candidate LOSS (traced distinctly)
   | { status: "busy" }    // daemon busy/expired → hook falls to FTS (do NOT re-run in-process)
   | { status: "error" }   // daemon present but timed out/misbehaving → fall to FTS
+  | { status: "skew"; missing: string } // O1 §4: the answer lacks a protocol the request REQUIRES — no deadline-rel-v1 attestation (pre-O1 watcher), or raw hits to a hydrated request (codex migration r2 #1) → FTS + health warning naming it
+  | { status: "deadline" } // codex migration r1 S1: the CLIENT's own deadline ended the leg (timer, pre-connect expiry, sub-ms remainder, parse-boundary check) → FTS; traced as abandonment
   | { status: "absent" }  // daemon not running → hook uses the in-process path
   | { status: "model_mismatch"; storedModels: string[]; activeModel: string }; // typed → hook warns once
 
 /**
- * Send one Step-1 request to the daemon and classify the outcome. Self-bounds to `ipcTimeoutMs`
- * (the caller passes the remaining wall-clock budget) so the client cleans up its own socket well
- * before the hook's outer timer fires. Every failure mode resolves — this promise never rejects.
+ * Send one Step-1 request to the daemon and classify the outcome. Self-bounds to `deadline` — the
+ * CLIENT's authoritative monotonic timer (O1 §2): the request carries the remaining budget sampled
+ * immediately before the write, the daemon's own deadline is advisory, and IPC transit is inside
+ * the observable leg budget (which is what the gate has always measured). Every failure mode
+ * resolves — this promise never rejects. A leg ended by that client deadline resolves `deadline`,
+ * never `error` (codex migration r1 S1): the surfacing trace must tell an abandonment at the
+ * deadline from a daemon that misbehaved.
  */
-export async function daemonVecMatch(dbPath: string, req: VecReq, ipcTimeoutMs: number): Promise<DaemonOutcome> {
+export async function daemonVecMatch(dbPath: string, req: VecReq, deadline: MonoDeadline): Promise<DaemonOutcome> {
   const sockPath = vecDaemonSocketPath(dbPath);
   if (!existsSync(sockPath)) return { status: "absent" };
-  if (ipcTimeoutMs <= 0) return { status: "error" }; // no budget left — don't even connect
+  if (remainingForTimeout(deadline) === null) return { status: "deadline" }; // no budget left — don't even connect
   const hydratedReq = req.responseProtocol !== undefined;
   // Byte caps (t86/t87): a hydrated response may total up to HYDRATED_MAX_FRAME_BYTES with each
   // line ≤ HYDRATED_MAX_ENTRY_BYTES (the per-parse-slice bound); raw/legacy responses keep the
@@ -533,7 +630,6 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, ipcTimeoutMs: 
   // safe in hydrated mode.
   const frameCap = hydratedReq ? HYDRATED_MAX_FRAME_BYTES : MAX_FRAME_BYTES;
   const lineCap = hydratedReq ? HYDRATED_MAX_ENTRY_BYTES : MAX_FRAME_BYTES;
-  const deadlineAbs = req.deadlineMs;
 
   return await new Promise<DaemonOutcome>((resolve) => {
     let settled = false;
@@ -551,14 +647,16 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, ipcTimeoutMs: 
     const entries: ProjectedVecResult[] = [];
     let pumping = false;
 
+    let cancelTimer: () => void = () => {};
     const finish = (o: DaemonOutcome) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cancelTimer();
       try { sock?.end(); } catch { /* ignore */ }
       resolve(o);
     };
-    const timer = setTimeout(() => finish({ status: "error" }), ipcTimeoutMs);
+    // The authoritative leg timer: the client decides the leg outcome (O1 §2).
+    cancelTimer = deadlineTimer(deadline, () => finish({ status: "deadline" }));
 
     const mapError = (resp: { error: string; storedModels?: string[]; activeModel?: string }): DaemonOutcome =>
       resp.error === "busy" || resp.error === "expired" ? { status: "busy" }
@@ -568,32 +666,44 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, ipcTimeoutMs: 
 
     // Incremental YIELDING decode (t86 CR-3 / t87 F2 / t88): one bounded line (≤ lineCap, enforced
     // pre-parse) per synchronous slice; an awaited macrotask between entries so the deadline timer
-    // gets a scheduling slot; and an ABSOLUTE deadline check BEFORE and AFTER every parse — a
-    // decode completing past `deadlineAbs` is never classified ok, and entries after a deadline
+    // gets a scheduling slot; and a MONOTONIC deadline check BEFORE and AFTER every parse — a
+    // decode completing past `deadline` is never classified ok, and entries after a deadline
     // crossing are never parsed (decode cancelled mid-stream).
     const pump = async (): Promise<void> => {
       if (pumping || settled) return;
       pumping = true;
       try {
         while (lineQueue.length > 0 && !settled) {
-          if (deadlineAbs !== undefined && Date.now() >= deadlineAbs) { finish({ status: "error" }); return; }
+          if (isExpired(deadline)) { finish({ status: "deadline" }); return; }
           const lineBytes = lineQueue.shift()!;
           testSyncEntryDecodeDelay(); // t88 lock (b): a sync intra-entry stall — caught by the check below, never a late ok
           let obj: VecResp;
           try {
             obj = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(lineBytes)) as VecResp;
           } catch { finish({ status: "error" }); return; } // invalid UTF-8 or malformed JSON — fail closed (t87 CR-6)
-          if (deadlineAbs !== undefined && Date.now() >= deadlineAbs) { finish({ status: "error" }); return; }
+          if (isExpired(deadline)) { finish({ status: "deadline" }); return; }
           if (process.env.CLAWMEM_TEST_VEC_PARSE_TRACE === "1") console.error(`[vec-parse] line mode=${mode} n=${entries.length}`);
           if (mode === "unknown") {
             if (obj && typeof obj === "object" && "protocol" in obj && obj.protocol === HYDRATED_PROTOCOL) {
+              // O1 §4: a header without the deadline attestation is a pre-O1 daemon — it ran the
+              // scan with NO deadline of its own. The leg is `skew` (FTS), never ok.
+              if (obj.deadlineProtocol !== DEADLINE_PROTOCOL) { finish({ status: "skew", missing: DEADLINE_PROTOCOL }); return; }
               mode = "hydrated";
               expected = obj.count;
               // t89 S1: integer counts only — a fractional/NaN count is a malformed peer.
               if (!Number.isInteger(expected) || expected < 0 || expected > HYDRATED_MAX_RESULTS) { finish({ status: "error" }); return; }
             } else if (obj && "results" in obj) {
-              // A raw-hit answer — a raw request, or a LEGACY daemon ignoring the hydrated ask
-              // (the negotiation matrix's raw-hit path): the caller hydrates client-side.
+              // A raw-hit answer — a raw request answered by a current daemon (the caller hydrates
+              // client-side). O1 §4: a LEGACY daemon ignoring the hydrated ask also answers raw
+              // hits, but WITHOUT the deadline attestation — since it ran under no deadline, the
+              // t84 raw-hit compatibility path is now `skew` (FTS); a legacy daemon is restarted,
+              // not negotiated with.
+              if (obj.deadlineProtocol !== DEADLINE_PROTOCOL) { finish({ status: "skew", missing: DEADLINE_PROTOCOL }); return; }
+              // Codex migration r2 #1: a deadline attestation does not establish PROJECTION capability. Raw hits
+              // answering a HYDRATED request would be hydrated synchronously on the hook's event loop (the
+              // pre-v0.38 blocking shape hydrated-v1 exists to remove) — refused as capability skew before any
+              // client-side hydration, never `ok`.
+              if (hydratedReq) { finish({ status: "skew", missing: HYDRATED_PROTOCOL }); return; }
               // t89 S1: validate every hit; a malformed/mixed list degrades to FTS, never ok.
               if (!Array.isArray(obj.results) || !obj.results.every(isValidVecHit)) { finish({ status: "error" }); return; }
               finish({ status: "ok", results: obj.results }); return;
@@ -626,7 +736,13 @@ export async function daemonVecMatch(dbPath: string, req: VecReq, ipcTimeoutMs: 
         open(socket) {
           opened = true;
           sock = socket;
-          try { socket.write(JSON.stringify(req /* O1-DEBT-0011 */) + "\n"); }
+          // The remaining budget is sampled IMMEDIATELY before the write, never earlier (O1 §2):
+          // connect latency has already been spent. A sub-millisecond remainder takes the fallback
+          // LOCALLY — the client never transmits a request the daemon must reject.
+          const left = remainingForTimeout(deadline);
+          const budget = left === null ? null : wireBudget(left);
+          if (budget === null) { finish({ status: "deadline" }); return; }
+          try { socket.write(JSON.stringify({ ...req, remainingBudgetMs: budget }) + "\n"); }
           catch { finish({ status: "error" }); }
         },
         data(_socket, chunk) {
@@ -745,7 +861,7 @@ export async function daemonPing(dbPath: string, timeoutMs: number): Promise<Dae
 /** Operational liveness/ownership state of a vault's vector daemon (codex t77 F5). */
 export type VectorDaemonHealth =
   | { status: "live"; socket: string; db: string; pid: number; protocols: string[] }
-  /** Attested (exact DB + pid) but WITHOUT the hydrated-v1 capability — a daemon serving the raw-hit execution (t84/t89 P1): live, NOT Path-A authoritative. */
+  /** Attested (exact DB + pid) but WITHOUT hydrated-v1 (t84/t89 P1): live, NOT Path-A authoritative — the v0.38 hook classifies its answers `skew` and falls back to FTS. */
   | { status: "live-raw"; socket: string; db: string; pid: number; protocols: string[] }
   /** A live clawmem daemon predating the ping protocol (pre-v0.38 watcher): serves this vault's path-keyed socket, cannot attest DB/pid — liveness is established, attestation is not. */
   | { status: "live-legacy"; socket: string }
@@ -759,13 +875,15 @@ export type VectorDaemonHealth =
  * "unresponsive" = a listener that did not answer within `timeoutMs`;
  * "foreign-db" = a listener serving a different DB path; "live" = the
  * watcher's daemon serving exactly `dbPath` AND attesting the hydrated-v1
- * capability; "live-raw" = attested DB/pid but WITHOUT hydrated-v1 (a daemon
- * serving the raw-hit execution); "live-legacy" = a pre-v0.38 daemon
- * (answers the frame protocol, has no ping) on this vault's path-keyed
- * socket — live, unattested. ONLY "live" makes the context-surfacing hook's
- * vector deadline authoritative on this host (t89 P1): the deadline contract
- * is certified for daemon-side projection, and live-raw/live-legacy daemons
- * execute the client-side-hydration timing instead.
+ * capability; "live-raw" = attested DB/pid but WITHOUT hydrated-v1 (no
+ * daemon-side projection); "live-legacy" = a pre-v0.38 daemon (answers the
+ * frame protocol, has no ping) on this vault's path-keyed socket — live,
+ * unattested. ONLY "live" makes the context-surfacing hook's vector deadline
+ * authoritative on this host (t89 P1): against a live-raw or live-legacy
+ * daemon the v0.38 hook classifies every vector answer `skew` and falls back
+ * to FTS — it never hydrates raw hits client-side (codex migration r2 #1).
+ * The O1 relative budget is attested per ANSWER (an unattested answer is
+ * `skew`); the pong does not advertise deadline-rel-v1 until O1 activation.
  */
 export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Promise<VectorDaemonHealth> {
   const socket = vecDaemonSocketPath(dbPath);
@@ -775,8 +893,8 @@ export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Prom
   if (pong.status !== "ok") return pong.status === "absent" ? { status: "stale", socket } : { status: "unresponsive", socket };
   if (pong.db !== dbPath) return { status: "foreign-db", socket, db: pong.db, pid: pong.pid };
   // t89 P1: `live` is reserved for the Path-A-authoritative daemon — exact DB/pid AND the
-  // hydrated-v1 capability. An attested daemon without it serves the raw-hit execution
-  // (client-side hydration timing): live, but NOT what the deadline contract certifies.
+  // hydrated-v1 capability. An attested daemon without it cannot answer the hook's hydrated
+  // requests (its raw hits are `skew` → FTS): live, but NOT what the deadline contract certifies.
   return pong.protocols.includes(HYDRATED_PROTOCOL)
     ? { status: "live", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols }
     : { status: "live-raw", socket, db: pong.db, pid: pong.pid, protocols: pong.protocols };
@@ -786,10 +904,10 @@ export async function vectorDaemonHealth(dbPath: string, timeoutMs = 2000): Prom
  * Bounded vector search for the hook path. Tries the daemon (hydrated-v1: scan + hydration +
  * projection ALL daemon-side) and degrades cleanly per the design contract:
  *   - ok-hydrated      → return the daemon's projected results (zero client-side sqlite)
- *   - ok (raw-hit)     → a legacy daemon answered raw hits — hydrate client-side (compat path)
+ *   - ok (raw-hit)     → an attesting daemon answered a raw (non-hydrated) request — hydrate client-side
  *   - absent/refused   → in-process searchVec (today's self-bounded behavior; daemon not deployed)
  *   - model_mismatch   → throw VecReadModelMismatchError (mirrors in-process; the leg warns once → FTS)
- *   - busy/error/timeout → return [] so the caller falls back to FTS
+ *   - busy/error/deadline/oversized/skew → return [] so the caller falls back to FTS
  *
  * Used by BOTH the primary and deep-escalation vector legs in context-surfacing, so every hook vector
  * call is bounded — not just the first.
@@ -802,25 +920,27 @@ export async function searchVecBounded(
   collectionId?: number,
   collections?: string[],
   dateRange?: { start: string; end: string },
-  deadlineMs?: LegacyWallDeadline,
+  deadline?: MonoDeadline,
   /** Optional per-leg outcome recorder (the surfacing trace's vectorLegs) — called before any
    * fallback runs. `protocol` names which response protocol served an ok leg (t84 CR-5):
    * "hydrated-v1" = daemon-side projection; "raw-hit" = raw hits + client-side hydration. */
   onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol) => void,
   /** Hydrated-v1 request inputs (t87 F4): the RAW CURRENT PROMPT (snippet construction on every
-   * leg) + the resolved session topic. Present → the leg requests daemon-side projection; a
-   * legacy daemon still answers raw hits and the client hydrates (raw-hit path). Absent → the
-   * legacy raw request, byte-identical to pre-v0.38 behavior. */
+   * leg) + the resolved session topic. Present → the leg requests daemon-side projection (a legacy
+   * daemon's unattested raw answer is `skew` → FTS, since O1 §4). Absent → a raw request, answered
+   * with raw hits the client hydrates (the raw-hit path). */
   hydration?: { presentationQuery: string; intent?: string },
 ): Promise<(SearchResult | ProjectedVecResult)[]> {
-  const startedAt = VEC_TIMING ? Date.now() : 0;
-  const ipcTimeoutMs = deadlineMs !== undefined ? deadlineMs - Date.now() : DEFAULT_IPC_TIMEOUT_MS;
+  const startedAt = monoNow();
+  // The leg's authoritative deadline: the caller's, else the IPC default from now (O1 §2).
+  const legDeadline = deadline ?? deadlineAfter(startedAt, duration(DEFAULT_IPC_TIMEOUT_MS));
   const req: VecReq = hydration
-    ? { query, model, limit, deadlineMs, responseProtocol: HYDRATED_PROTOCOL, presentationQuery: hydration.presentationQuery, intent: hydration.intent, snippetLens: [...HYDRATED_SNIPPET_LENS], rerankTextLen: HYDRATED_RERANK_TEXT_LEN, gateTextLen: HYDRATED_GATE_TEXT_LEN, collectionId, collections, dateRange }
-    : { query, model, limit, deadlineMs };
-  const outcome = await daemonVecMatch(store.dbPath, req, ipcTimeoutMs);
+    ? { query, model, limit, responseProtocol: HYDRATED_PROTOCOL, presentationQuery: hydration.presentationQuery, intent: hydration.intent, snippetLens: [...HYDRATED_SNIPPET_LENS], rerankTextLen: HYDRATED_RERANK_TEXT_LEN, gateTextLen: HYDRATED_GATE_TEXT_LEN, collectionId, collections, dateRange }
+    : { query, model, limit };
+  const outcome = await daemonVecMatch(store.dbPath, req, legDeadline);
   const traceStatus: VecExecStatus = outcome.status === "ok-hydrated" ? "ok" : outcome.status;
   const protocol: VecResponseProtocol | undefined = outcome.status === "ok-hydrated" ? HYDRATED_PROTOCOL : outcome.status === "ok" ? "raw-hit" : undefined;
+  if (outcome.status === "skew") warnOnceOnDaemonSkew(store.dbPath, outcome.missing);
   if (onOutcome) { try { onOutcome(traceStatus, protocol); } catch { /* recorder must never break the leg */ } }
   let results: (SearchResult | ProjectedVecResult)[];
   switch (outcome.status) {
@@ -830,7 +950,7 @@ export async function searchVecBounded(
       results = outcome.results;
       break;
     case "ok":
-      // Raw-hit path (legacy daemon, or no hydration requested): the daemon bounded the SCAN;
+      // Raw-hit path (a raw request — no hydration asked — answered by an attesting daemon): the daemon bounded the SCAN;
       // hydration is a SYNCHRONOUS client-side sqlite read the caller's race timer cannot
       // interrupt (codex t80 P1). The seam models a cold hydrate.
       testSyncHydrateDelay();
@@ -840,18 +960,18 @@ export async function searchVecBounded(
       // In-process path: the synchronous MATCH runs on THIS event loop (the caller's race timer
       // cannot fire during it). The test seam models that scan's duration deterministically.
       testSyncScanDelay();
-      results = await store.searchVec(query, model, limit, collectionId, collections, dateRange, deadlineMs);
+      results = await store.searchVec(query, model, limit, collectionId, collections, dateRange, deadline);
       break;
     case "model_mismatch":
       // Mirror the in-process path: throw the typed error so the leg's catch fires
       // warnOnceOnVectorModelMismatch (a persistent config error, warned loudly once), then FTS.
       throw new VecReadModelMismatchError(outcome.storedModels, outcome.activeModel);
-    default: // "busy" | "error" | "oversized" → let the caller's FTS fallback take over
+    default: // "busy" | "error" | "oversized" | "skew" | "deadline" → let the caller's FTS fallback take over
       results = [];
       break;
   }
   if (VEC_TIMING) {
-    console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : ""} elapsedMs=${Date.now() - startedAt} results=${results.length}`);
+    console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : ""} elapsedMs=${evidenceMs(elapsed(startedAt))} results=${results.length}`);
   }
   return results;
 }
@@ -877,21 +997,23 @@ export async function searchVecDaemonRequired(
   collectionId?: number,
   collections?: string[],
   dateRange?: { start: string; end: string },
-  deadlineMs?: LegacyWallDeadline,
+  deadline?: MonoDeadline,
   /** Optional per-leg outcome recorder (the surfacing trace's vectorLegs). `protocol` names which
    * response protocol served an ok leg (t84 CR-5). */
   onOutcome?: (status: VecExecStatus, protocol?: VecResponseProtocol) => void,
   /** Hydrated-v1 request inputs (t87 F4) — see searchVecBounded. */
   hydration?: { presentationQuery: string; intent?: string },
 ): Promise<(SearchResult | ProjectedVecResult)[]> {
-  const startedAt = VEC_TIMING ? Date.now() : 0;
-  const ipcTimeoutMs = deadlineMs !== undefined ? deadlineMs - Date.now() : DEFAULT_IPC_TIMEOUT_MS;
+  const startedAt = monoNow();
+  // The leg's authoritative deadline: the caller's, else the IPC default from now (O1 §2).
+  const legDeadline = deadline ?? deadlineAfter(startedAt, duration(DEFAULT_IPC_TIMEOUT_MS));
   const req: VecReq = hydration
-    ? { query, model, limit, deadlineMs, responseProtocol: HYDRATED_PROTOCOL, presentationQuery: hydration.presentationQuery, intent: hydration.intent, snippetLens: [...HYDRATED_SNIPPET_LENS], rerankTextLen: HYDRATED_RERANK_TEXT_LEN, gateTextLen: HYDRATED_GATE_TEXT_LEN, collectionId, collections, dateRange }
-    : { query, model, limit, deadlineMs };
-  const outcome = await daemonVecMatch(store.dbPath, req, ipcTimeoutMs);
+    ? { query, model, limit, responseProtocol: HYDRATED_PROTOCOL, presentationQuery: hydration.presentationQuery, intent: hydration.intent, snippetLens: [...HYDRATED_SNIPPET_LENS], rerankTextLen: HYDRATED_RERANK_TEXT_LEN, gateTextLen: HYDRATED_GATE_TEXT_LEN, collectionId, collections, dateRange }
+    : { query, model, limit };
+  const outcome = await daemonVecMatch(store.dbPath, req, legDeadline);
   const traceStatus: VecExecStatus = outcome.status === "ok-hydrated" ? "ok" : outcome.status;
   const protocol: VecResponseProtocol | undefined = outcome.status === "ok-hydrated" ? HYDRATED_PROTOCOL : outcome.status === "ok" ? "raw-hit" : undefined;
+  if (outcome.status === "skew") warnOnceOnDaemonSkew(store.dbPath, outcome.missing);
   if (onOutcome) { try { onOutcome(traceStatus, protocol); } catch { /* recorder must never break the leg */ } }
   let results: (SearchResult | ProjectedVecResult)[] = [];
   if (outcome.status === "ok-hydrated") {
@@ -906,7 +1028,7 @@ export async function searchVecDaemonRequired(
     throw new VecReadModelMismatchError(outcome.storedModels, outcome.activeModel);
   }
   if (VEC_TIMING) {
-    console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : ""} (daemon-required) elapsedMs=${Date.now() - startedAt} results=${results.length}`);
+    console.error(`[vec-timing] path=${traceStatus}${protocol ? ` protocol=${protocol}` : ""} (daemon-required) elapsedMs=${evidenceMs(elapsed(startedAt))} results=${results.length}`);
   }
   return results;
 }
