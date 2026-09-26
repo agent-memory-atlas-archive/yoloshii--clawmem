@@ -108,6 +108,7 @@ import {
   printSetupOpenClawHelp,
   swapDirIntoPlace,
   moveTargetAside,
+  resolveRecordableClawmemBin,
 } from "./openclaw-paths.ts";
 
 enableProductionMode();
@@ -2801,7 +2802,7 @@ async function verifyOpenClawPluginOwnership(params: {
   binPath: string;
 }): Promise<{ verified: boolean }> {
   const { statSync } = await import("fs");
-  const { canExecuteAs } = await import("./openclaw-paths.ts");
+  const { canExecuteAs, canReadAs } = await import("./openclaw-paths.ts");
   let identity: UnixIdentity;
   let label: string;
   if (params.gatewayUser) {
@@ -2836,13 +2837,22 @@ async function verifyOpenClawPluginOwnership(params: {
     console.log(`  fix: ${c.cyan}sudo chown -R ${params.gatewayUser ?? "<gateway-user>"} ${params.root}${c.reset}`);
     return { verified: false };
   }
+  // Read + traverse for the same identity: OpenClaw reads the root, the
+  // manifest, package.json and the entry as that user, so owner-or-root and
+  // not world-writable is not enough (a 0750 home above the install passes both).
+  const mustRead = [params.root, params.entry, pathResolve(params.root, "openclaw.plugin.json"), pathResolve(params.root, "package.json")];
+  const unreadable = mustRead.filter((p) => existsSync(p) && !canReadAs(p, identity.uid, identity.gids));
+  if (unreadable.length > 0) {
+    for (const p of unreadable) console.log(`${c.red}${label} cannot traverse to or read ${p} (check its r bits and the x bits on every parent directory).${c.reset}`);
+    return { verified: false };
+  }
   // Execute + traverse for the identity that will actually spawn the binary,
   // computed from mode bits and group membership, not from this process.
   if (!canExecuteAs(params.binPath, identity.uid, identity.gids)) {
     console.log(`${c.red}${label} cannot traverse to or execute ${params.binPath} (check the x bits on the binary and every parent directory).${c.reset}`);
     return { verified: false };
   }
-  console.log(`${c.green}✓ plugin files at ${params.root} are owned by ${label} or root, not world-writable, and ${params.binPath} is executable for that identity${c.reset}`);
+  console.log(`${c.green}✓ plugin files at ${params.root} are owned by ${label} or root, not world-writable and readable by that identity, and ${params.binPath} is executable for it${c.reset}`);
   if (!params.gatewayUser) {
     console.log(`${c.dim}  If the gateway runs as a different user (system service), re-run with --gateway-user <name> to verify for that user.${c.reset}`);
   }
@@ -2990,7 +3000,12 @@ async function cmdSetupOpenClaw(args: string[]) {
   // Path 3 = direct-copy fallback honoring OPENCLAW_STATE_DIR.
   const acceptCapabilitiesFlag = args.includes("--accept-capabilities") || args.includes("--yes") || args.includes("-y");
   const keepStage = process.env.CLAWMEM_KEEP_STAGE === "1"; // test seam: leave the staged copy on disk
-  const binPath = findClawmemBinary();
+  // clawmemBin is recorded as an absolute, regular, executable path or not at
+  // all: a search-path guess or a non-executable file would pass setup and fail
+  // at the first hook (codex v0.39 turn 8).
+  const bin = resolveRecordableClawmemBin(findClawmemBinary(), (n) => Bun.which(n));
+  if (!bin.ok) die(`Cannot record clawmemBin: ${bin.reason}. Run setup from an install whose bin/clawmem is executable, or put an executable clawmem on PATH.`);
+  const binPath = bin.path;
   let delegated = false;
   let ownershipVerified = false;
   if (hasOpenClawCli) {

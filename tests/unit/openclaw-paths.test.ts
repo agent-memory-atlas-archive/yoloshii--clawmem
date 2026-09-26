@@ -23,7 +23,7 @@ import {
   resolveHomeForOpenClaw,
   trim,
 } from "../../src/openclaw-paths.ts";
-import { canExecuteAs, moveTargetAside, resolveOpenClawProfile, swapDirIntoPlace } from "../../src/openclaw-paths.ts";
+import { canExecuteAs, canReadAs, moveTargetAside, resolveOpenClawProfile, resolveRecordableClawmemBin, swapDirIntoPlace } from "../../src/openclaw-paths.ts";
 
 const STATIC_HOME = "/home/test-user";
 const staticHomedir = () => STATIC_HOME;
@@ -467,5 +467,86 @@ describe("resolveOpenClawProfile — one grammar for --profile and .openclaw-<pr
     const home = () => "/home/u";
     expect(() => resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "x/../victim" }, homedir: home })).toThrow("not a valid OpenClaw profile name");
     expect(() => resolveExtensionsDirNoOpenClaw({ env: { OPENCLAW_PROFILE: "x/../victim", OPENCLAW_STATE_DIR: "/x" }, homedir: home })).toThrow("not a valid OpenClaw profile name");
+  });
+});
+
+describe("canReadAs — the gateway identity can traverse to and read the installed plugin", () => {
+  // /home(755 root) /home/inst(750 uid 1000) .../clawmem(755) .../dist(755) .../index.js(644)
+  const tree: Record<string, { uid: number; gid: number; mode: number }> = {
+    "/": { uid: 0, gid: 0, mode: 0o40755 },
+    "/home": { uid: 0, gid: 0, mode: 0o40755 },
+    "/home/inst": { uid: 1000, gid: 1000, mode: 0o40750 },
+    "/home/inst/ext": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/home/inst/ext/clawmem": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/home/inst/ext/clawmem/dist": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/home/inst/ext/clawmem/dist/index.js": { uid: 1000, gid: 1000, mode: 0o100644 },
+  };
+  const fsx = { statSync: (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; } };
+  const entry = "/home/inst/ext/clawmem/dist/index.js";
+  test("the installer can read the entry; a gateway user outside the home's group cannot traverse to it", () => {
+    expect(canReadAs(entry, 1000, [1000], fsx)).toBe(true);
+    expect(canReadAs(entry, 2000, [2000], fsx)).toBe(false);
+    expect(canReadAs("/home/inst/ext/clawmem", 2000, [2000], fsx)).toBe(false);
+  });
+  test("membership in the home's group grants the traverse; root always reads an existing path", () => {
+    expect(canReadAs(entry, 2000, [1000], fsx)).toBe(true);
+    expect(canReadAs(entry, 0, [], fsx)).toBe(true);
+    expect(canReadAs("/home/inst/ext/clawmem/missing.json", 0, [], fsx)).toBe(false);
+  });
+  test("an owner-only file is unreadable to others even when every ancestor is open", () => {
+    tree["/home/inst"] = { uid: 1000, gid: 1000, mode: 0o40755 };
+    tree[entry] = { uid: 1000, gid: 1000, mode: 0o100600 };
+    expect(canReadAs(entry, 2000, [2000], fsx)).toBe(false);
+    expect(canReadAs(entry, 1000, [1000], fsx)).toBe(true);
+    tree[entry] = { uid: 1000, gid: 1000, mode: 0o100644 };
+    expect(canReadAs(entry, 2000, [2000], fsx)).toBe(true);
+    tree["/home/inst"] = { uid: 1000, gid: 1000, mode: 0o40750 };
+  });
+  test("a directory target must be searchable as well as readable", () => {
+    tree["/home/inst/ext/clawmem"] = { uid: 1000, gid: 1000, mode: 0o40754 };
+    tree["/home/inst"] = { uid: 1000, gid: 1000, mode: 0o40755 };
+    expect(canReadAs("/home/inst/ext/clawmem", 2000, [2000], fsx)).toBe(false);
+    tree["/home/inst/ext/clawmem"] = { uid: 1000, gid: 1000, mode: 0o40755 };
+    expect(canReadAs("/home/inst/ext/clawmem", 2000, [2000], fsx)).toBe(true);
+    tree["/home/inst"] = { uid: 1000, gid: 1000, mode: 0o40750 };
+  });
+});
+
+describe("resolveRecordableClawmemBin — setup records only an absolute, regular, executable binary", () => {
+  test("a bare name resolves through PATH; an unresolvable name is refused", async () => {
+    const { chmodSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(pathResolve(tmpdir(), "clawmem-recordable-"));
+    try {
+      const exe = pathResolve(dir, "clawmem");
+      writeFileSync(exe, "#!/bin/sh\n");
+      chmodSync(exe, 0o755);
+      expect(resolveRecordableClawmemBin("clawmem", () => exe)).toEqual({ ok: true, path: exe });
+      const none = resolveRecordableClawmemBin("clawmem", () => null);
+      expect(none.ok).toBe(false);
+      if (!none.ok) expect(none.reason).toContain("on PATH");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("a non-executable file and a directory are refused; an executable absolute path passes", async () => {
+    const { chmodSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(pathResolve(tmpdir(), "clawmem-recordable-"));
+    try {
+      const plain = pathResolve(dir, "plain");
+      writeFileSync(plain, "#!/bin/sh\n");
+      chmodSync(plain, 0o644);
+      const noexec = resolveRecordableClawmemBin(plain, () => null);
+      expect(noexec.ok).toBe(false);
+      if (!noexec.ok) expect(noexec.reason).toContain("not executable");
+      const asDir = resolveRecordableClawmemBin(dir, () => null);
+      expect(asDir.ok).toBe(false);
+      if (!asDir.ok) expect(asDir.reason).toContain("not a regular file");
+      chmodSync(plain, 0o755);
+      expect(resolveRecordableClawmemBin(plain, () => null)).toEqual({ ok: true, path: plain });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

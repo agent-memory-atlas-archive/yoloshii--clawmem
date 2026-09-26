@@ -1031,3 +1031,35 @@ describe("Shipping Condition 2 — setup-time migration text is present", () => 
     expect(content).toContain("function readOpenClawConfigValue");
   });
 });
+
+describe("clawmemBin must be executable, and setup verifies read access (codex v0.39 turn 8)", () => {
+  test("resolveClawMemBin throws for a configured regular file without an execute bit", async () => {
+    const { chmodSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "clawmem-noexec-"));
+    try {
+      const f = join(dir, "clawmem");
+      writeFileSync(f, "#!/bin/sh\n");
+      chmodSync(f, 0o644);
+      expect(() => resolveClawMemBin(f)).toThrow(/configured clawmemBin is not executable/);
+      chmodSync(f, 0o755);
+      expect(resolveClawMemBin(f)).toBe(f);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("setup checks read + traverse for the gateway identity and records only a verified binary", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../../src/clawmem.ts", import.meta.url), "utf8");
+    const verify = src.slice(src.indexOf("async function verifyOpenClawPluginOwnership"), src.indexOf("async function cmdSetupOpenClaw"));
+    expect(verify).toContain("canReadAs(p, identity.uid, identity.gids)");
+    expect(verify).toContain('"openclaw.plugin.json"');
+    expect(verify).toContain('"package.json"');
+    const setup = src.slice(src.indexOf("async function cmdSetupOpenClaw"));
+    expect(setup).toContain("resolveRecordableClawmemBin(findClawmemBinary()");
+    const install = setup.indexOf("// Path 1: delegate to OpenClaw");
+    expect(install).toBeGreaterThan(0);
+    expect(setup.indexOf("resolveRecordableClawmemBin(")).toBeLessThan(install);
+  });
+});

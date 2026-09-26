@@ -101,7 +101,7 @@ Two things around the install changed with it.
 
 OpenClaw asks for consent to a plugin's declared capabilities on every local install, link or copy. Setup prints what ClawMem declares (the five tools, conversation access, the memory slot, the REST service) and passes `--accept-capabilities` to OpenClaw only after you answer yes, or when you ran `clawmem setup openclaw --accept-capabilities`. Without either, a non-interactive run stops and prints the line to re-run.
 
-OpenClaw refuses a plugin whose directory or entry file is owned by anyone but its own runtime user or root, or is world-writable. A gateway that runs as a service user cannot load a copy the installing shell user owns. Pass `--gateway-user <name>` so setup verifies the installed files for that user; on a mismatch it prints the `chown` and exits non-zero rather than claiming success. Link mode applies the same rule to the checkout itself.
+OpenClaw refuses a plugin whose directory or entry file is owned by anyone but its own runtime user or root, or is world-writable. A gateway that runs as a service user cannot load a copy the installing shell user owns. Pass `--gateway-user <name>` so setup verifies the installed files for that user; it also checks that the user can read them and traverse every parent directory, and can run the `clawmem` binary. On a mismatch it prints what to fix and exits non-zero rather than claiming success. Link mode applies the same rule to the checkout itself.
 
 Setup also pins the memory slot (`plugins.slots.memory: clawmem`; since the September 2026 main branch an unselected memory plugin still loads but loses its memory runtime) and records the absolute `clawmemBin`, so the plugin runs the binary from this checkout and not a search-path guess.
 

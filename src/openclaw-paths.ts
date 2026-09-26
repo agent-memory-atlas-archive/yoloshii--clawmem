@@ -17,7 +17,7 @@
  */
 
 import { homedir as defaultHomedir } from "node:os";
-import { dirname, resolve as pathResolve } from "node:path";
+import { dirname, isAbsolute, resolve as pathResolve } from "node:path";
 
 // =============================================================================
 // Types
@@ -266,6 +266,67 @@ export function canExecuteAs(
   return true;
 }
 
+/**
+ * Can `uid` (member of `gids`) traverse every ancestor of `path` and read
+ * `path` itself (a directory must also be searchable), judged from mode bits
+ * and ownership the way the kernel does for a non-root user? Root always can
+ * once the path exists. The companion of canExecuteAs: OpenClaw reads the
+ * plugin's root, manifest, package.json and entry as the gateway's runtime
+ * user, and a 0750 home directory above the install is the usual miss.
+ */
+export function canReadAs(
+  path: string,
+  uid: number,
+  gids: readonly number[],
+  fsModule: { statSync: (p: string) => { uid: number; gid: number; mode: number } } = fs,
+): boolean {
+  const abs = pathResolve(path);
+  if (uid === 0) {
+    try { fsModule.statSync(abs); return true; } catch { return false; }
+  }
+  const parts = abs.split("/").filter(Boolean);
+  const chain: string[] = ["/"];
+  for (let i = 0; i < parts.length; i++) chain.push("/" + parts.slice(0, i + 1).join("/"));
+  const gidSet = new Set(gids);
+  for (let i = 0; i < chain.length; i++) {
+    let st;
+    try { st = fsModule.statSync(chain[i]!); } catch { return false; }
+    const shift = st.uid === uid ? 6 : gidSet.has(st.gid) ? 3 : 0; // owner / group / other class
+    const bits = (st.mode >> shift) & 0o7;
+    if (i < chain.length - 1) {
+      if ((bits & 0o1) === 0) return false; // every ancestor must be traversable
+      continue;
+    }
+    if ((bits & 0o4) === 0) return false; // the target must be readable
+    if ((st.mode & 0o170000) === 0o040000 && (bits & 0o1) === 0) return false; // and a directory searchable
+  }
+  return true;
+}
+
+/**
+ * The binary `clawmem setup openclaw` may record as `clawmemBin`: an absolute
+ * path to a regular file the current user can execute. A bare name is resolved
+ * through PATH first (`which`); anything else is refused with the reason, so
+ * setup never writes a search-path guess or a non-executable file into the
+ * plugin config.
+ */
+export function resolveRecordableClawmemBin(
+  found: string,
+  which: (name: string) => string | null,
+  fsModule: {
+    statSync: (p: string) => { mode: number };
+    accessSync: (p: string, mode?: number) => void;
+  } = fs,
+): { ok: true; path: string } | { ok: false; reason: string } {
+  const abs = isAbsolute(found) ? found : which(found);
+  if (!abs) return { ok: false, reason: `no ${found} executable on PATH` };
+  let st;
+  try { st = fsModule.statSync(abs); } catch { return { ok: false, reason: `${abs} does not exist` }; }
+  if (!isRegularFileMode(st.mode)) return { ok: false, reason: `${abs} is not a regular file` };
+  try { fsModule.accessSync(abs, fs.constants.X_OK); } catch { return { ok: false, reason: `${abs} is not executable by the current user` }; }
+  return { ok: true, path: pathResolve(abs) };
+}
+
 /** S_IFMT test on a stat mode: true for a regular file. */
 function isRegularFileMode(mode: number): boolean {
   return (mode & 0o170000) === 0o100000;
@@ -419,8 +480,9 @@ export function printSetupOpenClawHelp(): void {
     "                The user the OpenClaw gateway runs as (system-service",
     "                installs). Setup verifies the installed plugin files are",
     "                owned by that user or root and not world-writable — OpenClaw",
-    "                refuses to load them otherwise — and exits non-zero when they",
-    "                are not, printing the chown to run.",
+    "                refuses to load them otherwise — that the user can read them",
+    "                and traverse every parent directory, and that it can run the",
+    "                clawmem binary; it exits non-zero when any check fails.",
     "  --remove      Uninstall ClawMem from the OpenClaw extensions dir.",
     "                Tries `openclaw plugins uninstall clawmem --force` first;",
     "                falls back to manual cleanup at the resolved extensions",

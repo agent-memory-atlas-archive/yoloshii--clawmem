@@ -6,7 +6,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -116,15 +116,26 @@ export function resolveClawMemBin(configured?: string): string {
     // binary either: execFile would fail on it at the first hook.
     if (!existsSync(configured)) throw new Error(`clawmem: configured clawmemBin does not exist: ${configured}`);
     if (!isRegularFile(configured)) throw new Error(`clawmem: configured clawmemBin is not a regular file: ${configured}`);
+    if (!isExecutable(configured)) throw new Error(`clawmem: configured clawmemBin is not executable: ${configured}`);
     return configured;
   }
 
   for (const p of SEARCH_PATHS) {
-    if (isRegularFile(p)) return p;
+    if (isRegularFile(p) && isExecutable(p)) return p;
   }
 
   // Fallback: assume it's on PATH
   return "clawmem";
+}
+
+/** access(2) X_OK for this process: false for a file without an execute bit this user can use. */
+function isExecutable(p: string): boolean {
+  try {
+    accessSync(p, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Follows symlinks; false for a missing path or anything but a regular file. */
