@@ -248,7 +248,10 @@ describe("hydrated projection — cross-topology equivalence (codex #28 t83–t8
     const priorDl = (b.trace.vectorLegDeadlines ?? []).filter(d => d.leg === "prior");
     expect(priorDl.length).toBe(1);
     expect(priorDl[0]!.budget_ms).toBeGreaterThan(300);
-    expect(priorDl[0]!.budget_ms).toBeLessThanOrEqual(400);
+    // + float noise: budget_ms = (started + 400) − started on performance.now() instants, and the
+    // addition rounds — observed 400.0000000000582 (half an ulp at ~5.4e5 ms uptime). 1e-6 still
+    // tells 400 from 900.
+    expect(priorDl[0]!.budget_ms).toBeLessThanOrEqual(400 + 1e-6);
     expect(priorDl[0]!.over_ms).toBeLessThanOrEqual(150);
   }, 30_000);
 

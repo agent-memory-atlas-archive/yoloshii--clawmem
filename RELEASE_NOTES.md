@@ -4,6 +4,56 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.38.1 — the watcher now logs the version skew it refuses
+
+v0.38.0's vector wire refuses mixed builds in both directions, but only one direction was
+visible. A v0.38 hook talking to an older watcher prints a once-per-process warning naming the
+socket. A pre-v0.38 hook talking to a v0.38 watcher is refused as `version_skew`, and that old
+hook maps the error to its generic FTS fallback — silent by default; even its opt-in
+`CLAWMEM_VEC_TIMING` trace shows only `path=error`. The watcher said nothing either. A hook and a watcher running from different installs therefore lost every vector leg
+with no trace on either side — surfacing kept working on keyword matches, so it read as weaker
+recall rather than as a fault.
+
+The watcher's vector daemon now logs the first refusal:
+
+```
+[vec-daemon] refused a request from a pre-v0.38 client on <socket> (absolute deadlineMs → version_skew) — its vector legs degrade to FTS until it runs this build (usually the hook, from another install); further refusals are not logged
+```
+
+It logs once per daemon (the watcher hosts one per run), never per request: an old hook sends a
+refused request on every prompt. `journalctl --user -u clawmem-watcher.service | grep
+version_skew` finds it; the fix is to run the hook from the same install as `clawmem watch` and
+restart the watcher ([troubleshooting](docs/troubleshooting.md)). The daemon runs inside the
+watcher, so the line appears only once the watcher itself runs v0.38.1.
+
+### Verification
+
+A new unit lock sends three pre-v0.38 requests through a live daemon socket and asserts exactly
+one log line, naming the socket; a ping and a served request add none; a restarted daemon logs
+its own first refusal. A second lock makes the log sink throw on the first refusal: the daemon's
+entire reply is still the single refusal frame, and the line is written on the next refusal
+instead, so a line the sink refused does not count. Each of these mutants fails a lock: the
+once-guard dropped, the log call dropped, the flag hoisted to module scope, the flag set before
+the line is written. Full suite: 2787 pass / 0 fail. Cross-model adversarial review (codex /
+GPT-6, the arc's pinned session) caught the log-sink failure path in its first round and cleared
+the second with zero remaining findings.
+
+The release's suite run also caught a pre-existing test flake. A hydrated-projection test capped
+a leg's recorded 400 ms budget at exactly 400, but the budget is the difference of two
+`performance.now()` instants: when a leg starts within 400 ms of a power-of-two millisecond of
+process uptime, the deadline's addition rounds and the budget reads 400.0000000000582. The bound
+now allows float rounding, as the wall-jump lock's already did; the recorded evidence is
+unchanged.
+
+### What didn't change
+
+The wire contract is byte-identical: a refused request still receives exactly
+`{"error":"version_skew"}`, decided by field presence before anything is decoded, and nothing is
+scanned. The hook is unchanged, including its once-per-process warning for the opposite
+direction. No schema, configuration or CLI change.
+
+---
+
 ## v0.38.0 — the context-surfacing hook ranks, admits, and bookkeeps on one honest key
 
 The hook's ranking pipeline had accumulated incomparable signals: raw cosine and BM25

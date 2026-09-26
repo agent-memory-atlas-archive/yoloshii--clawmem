@@ -62,6 +62,27 @@ function rawRequest(sockPath: string, payload: string, timeoutMs = 2000): Promis
   });
 }
 
+// Like rawRequest, but resolves with EVERYTHING the daemon wrote before it closed the connection —
+// for asserting that nothing follows the first frame. Small ASCII payloads only (one write).
+function rawRequestAll(sockPath: string, payload: string, timeoutMs = 2000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    const timer = setTimeout(() => reject(new Error("rawRequestAll timeout")), timeoutMs);
+    const done = () => { clearTimeout(timer); resolve(buf); };
+    Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) { s.write(payload); },
+        data(_s, d) { buf += d.toString(); },
+        end(s) { done(); s.end(); },
+        close() { done(); },
+        error(_s, e) { clearTimeout(timer); reject(e); },
+        connectError(_s, e) { clearTimeout(timer); reject(e); },
+      },
+    }).catch((e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 // A misbehaving fake daemon: bind a raw listener and react to the client's request with `onData`
 // (write garbage, close silently, or never respond) to exercise the client's fail-open classification.
 function fakeServer(sockPath: string, onData: (s: Socket<{ buf: string }>) => void): { stop: () => void } {
@@ -132,6 +153,53 @@ describe("vector daemon server", () => {
       const resp = await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5, deadlineMs }) + "\n");
       expect(JSON.parse(resp)).toEqual({ error: "version_skew" });
     }
+    expect(scanned).toBe(false);
+  });
+
+  test("v0.38.1: the version_skew refusal is LOGGED once per daemon — repeated pre-O1 requests add no line, and neither does a ping or a served request", async () => {
+    const store = fakeStore();
+    const logs: string[] = [];
+    handle = await startVectorDaemon(store, m => logs.push(m), async () => [{ hash_seq: "h_0", distance: 0 }]);
+    const sock = vecDaemonSocketPath(store.dbPath);
+    const skewLines = (from: string[]) => from.filter(l => l.includes("version_skew"));
+    const preO1 = JSON.stringify({ query: "q", model: "m", limit: 5, deadlineMs: 1 }) + "\n";
+    // Pre-fix the refusal logged nothing, and the old client falls back to FTS silently, so a
+    // mixed-build deployment was invisible on both sides. An old hook sends one of these on every
+    // prompt: every one is refused, only the first is logged.
+    for (let i = 0; i < 3; i++) expect(JSON.parse(await rawRequest(sock, preO1))).toEqual({ error: "version_skew" });
+    expect(skewLines(logs)).toHaveLength(1);
+    expect(skewLines(logs)[0]).toContain(sock); // names the socket — a multi-vault host has one watcher per vault
+    expect(skewLines(logs)[0]).toContain("pre-v0.38");
+    await rawRequest(sock, JSON.stringify({ ping: true }) + "\n");
+    expect(JSON.parse(await rawRequest(sock, JSON.stringify({ query: "q", model: "m", limit: 5 }) + "\n"))).toEqual({ results: [{ hash_seq: "h_0", distance: 0 }] });
+    expect(skewLines(logs)).toHaveLength(1);
+    // Once per DAEMON, not per module: a restarted daemon reports its own first refusal.
+    handle!.close();
+    const logs2: string[] = [];
+    handle = await startVectorDaemon(store, m => logs2.push(m), async () => []);
+    expect(JSON.parse(await rawRequest(sock, preO1))).toEqual({ error: "version_skew" });
+    expect(skewLines(logs2)).toHaveLength(1);
+  });
+
+  test("v0.38.1 (codex r1): a THROWING log sink never touches the answer, and a line the sink refused does not spend the once", async () => {
+    const store = fakeStore();
+    const logs: string[] = [];
+    let skewSinkFailures = 1; // the journal is briefly unwritable for the first refusal
+    let scanned = false;
+    handle = await startVectorDaemon(store, m => {
+      if (m.includes("version_skew") && skewSinkFailures > 0) { skewSinkFailures--; throw new Error("log sink down"); }
+      logs.push(m);
+    }, async () => { scanned = true; return []; });
+    const sock = vecDaemonSocketPath(store.dbPath);
+    const preO1 = JSON.stringify({ query: "q", model: "m", limit: 5, deadlineMs: 1 }) + "\n";
+    const refusal = JSON.stringify({ error: "version_skew" }) + "\n";
+    // The WHOLE stream the daemon wrote before closing: the refusal frame and nothing after it.
+    expect(await rawRequestAll(sock, preO1)).toBe(refusal);
+    expect(logs.filter(l => l.includes("version_skew"))).toHaveLength(0);
+    // The sink recovered: the next refusal is the one logged, and it stays the only one.
+    expect(await rawRequestAll(sock, preO1)).toBe(refusal);
+    expect(await rawRequestAll(sock, preO1)).toBe(refusal);
+    expect(logs.filter(l => l.includes("version_skew"))).toHaveLength(1);
     expect(scanned).toBe(false);
   });
 

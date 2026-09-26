@@ -367,6 +367,10 @@ export async function startVectorDaemon(
   }
 
   let scanInFlight = false;
+  // v0.38.1: a pre-O1 client maps `version_skew` to its generic FTS fallback without a word, so
+  // this daemon's log is the only place a mixed-build deployment can show. Logged once per daemon
+  // (the watcher hosts one per process), never per request — an old hook sends one every prompt.
+  let skewRefusalLogged = false;
 
   const respond = (socket: Socket<DaemonSocketData>, resp: VecResp) => {
     try {
@@ -427,6 +431,15 @@ export async function startVectorDaemon(
       // contract after its own restart (zero-debt activation needs no compatibility window).
       if (parsed && typeof parsed === "object" && "deadlineMs" in parsed) {
         respond(socket, { error: "version_skew" });
+        if (!skewRefusalLogged) {
+          // Only a line the sink ACCEPTED spends the once. A throwing sink is contained here: it
+          // must never reach this request's error path (the answer above is final), and the next
+          // refusal tries the line again.
+          try {
+            log(`[vec-daemon] refused a request from a pre-v0.38 client on ${sockPath} (absolute deadlineMs → version_skew) — its vector legs degrade to FTS until it runs this build (usually the hook, from another install); further refusals are not logged`);
+            skewRefusalLogged = true;
+          } catch { /* sink unavailable — the refusal stands; retry on the next one */ }
+        }
         return;
       }
       req = parsed as VecReq;
