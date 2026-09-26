@@ -638,3 +638,57 @@ describe("unreadablePluginFiles — every file OpenClaw reads, a missing one inc
     tree[root] = { uid: 1000, gid: 1000, mode: 0o40755 };
   });
 });
+
+describe("the walk keeps pathname semantics: no lexical '..', trailing slashes demand directories (codex v0.39 turn 10)", () => {
+  const tree: Record<string, { uid: number; gid: number; mode: number }> = {
+    "/": { uid: 0, gid: 0, mode: 0o40755 },
+    "/dev": { uid: 0, gid: 0, mode: 0o40755 },
+    "/dev/fd": { uid: 0, gid: 0, mode: 0o120777 },
+    "/proc": { uid: 0, gid: 0, mode: 0o40755 },
+    "/proc/self": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/proc/self/fd": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/proc/self/status": { uid: 1000, gid: 1000, mode: 0o100644 },
+    "/public": { uid: 0, gid: 0, mode: 0o40755 },
+    "/public/link": { uid: 0, gid: 0, mode: 0o120777 },
+    "/public/secret": { uid: 0, gid: 0, mode: 0o100644 },
+    "/private": { uid: 1000, gid: 1000, mode: 0o40700 },
+    "/private/sub": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/private/secret": { uid: 1000, gid: 1000, mode: 0o100600 },
+    "/manifest.json": { uid: 1000, gid: 1000, mode: 0o100644 },
+    "/data": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/ext": { uid: 1000, gid: 1000, mode: 0o40755 },
+    "/ext/openclaw.plugin.json": { uid: 1000, gid: 1000, mode: 0o120777 },
+    "/ext/ok.json": { uid: 1000, gid: 1000, mode: 0o120777 },
+    "/ext/package.json": { uid: 1000, gid: 1000, mode: 0o100644 },
+  };
+  const links: Record<string, string> = {
+    "/dev/fd": "/proc/self/fd",
+    "/public/link": "/private/sub",
+    "/ext/openclaw.plugin.json": "/manifest.json/",
+    "/ext/ok.json": "/manifest.json",
+  };
+  const look = (p: string) => { const st = tree[p]; if (!st) throw new Error("ENOENT " + p); return st; };
+  const fsx = {
+    lstatSync: look,
+    statSync: look,
+    readlinkSync: (p: string): string => { const l = links[p]; if (l === undefined) throw new Error("EINVAL " + p); return l; },
+  };
+  test("'..' after a symlink is the physical parent: /dev/fd/../status reads /proc/self/status", () => {
+    expect(canReadAs("/dev/fd/../status", 1000, [1000], fsx)).toBe(true);
+  });
+  test("'..' after a symlink is not lexical: /public/link/../secret is /private/secret, unreadable to others", () => {
+    expect(canReadAs("/public/link/../secret", 2000, [2000], fsx)).toBe(false);
+    expect(canReadAs("/public/link/../secret", 1000, [1000], fsx)).toBe(true);
+  });
+  test("a symlink target ending in a slash demands a directory (ENOTDIR on a regular file)", () => {
+    expect(canReadAs("/ext/openclaw.plugin.json", 1000, [1000], fsx)).toBe(false);
+    expect(canReadAs("/ext/ok.json", 1000, [1000], fsx)).toBe(true);
+  });
+  test("an input trailing slash demands a directory too", () => {
+    expect(canReadAs("/manifest.json/", 1000, [1000], fsx)).toBe(false);
+    expect(canReadAs("/data/", 1000, [1000], fsx)).toBe(true);
+  });
+  test("unreadablePluginFiles reports a manifest whose link target ends in a slash", () => {
+    expect(unreadablePluginFiles("/ext", "/ext/ok.json", 1000, [1000], fsx)).toEqual(["/ext/openclaw.plugin.json"]);
+  });
+});

@@ -241,18 +241,27 @@ const REAL_ACCESS_FS: AccessFs = {
 
 type StatBits = { uid: number; gid: number; mode: number };
 
+/** Absolute WITHOUT lexical normalization: ".." must be resolved by the walk, after symlinks (codex v0.39 turn 10). */
+function absoluteNoNormalize(p: string): string {
+  return p.startsWith("/") ? p : `${process.cwd()}/${p}`;
+}
+
 /**
  * Resolve `path` component by component the way the kernel does, expanding
  * each symlink where it occurs, and return every directory searched on the way
  * (each needs the caller's x bit) plus the final non-symlink target. A
  * symlink's own mode never matters on Linux; the directories on the way to its
  * target do, which is why walking the literal path, or only its realpath, is
- * not enough (codex v0.39 turn 9). null when a component is missing, a
- * non-directory has components after it, or more than 40 symlinks are
- * followed (ELOOP).
+ * not enough (codex v0.39 turn 9). Nothing is normalized lexically first: ".."
+ * is the physical parent of wherever the walk stands, and a trailing slash, on
+ * the input or on a link target, demands a directory (codex v0.39 turn 10).
+ * null when a component is missing, a non-directory has components after it,
+ * or more than 40 symlinks are followed (ELOOP).
  */
 function kernelWalk(path: string, fsm: AccessFs): { searched: StatBits[]; target: StatBits } | null {
-  const pending = pathResolve(path).split("/").filter(Boolean);
+  const abs = absoluteNoNormalize(path);
+  const pending = abs.split("/").filter(Boolean);
+  if (abs.endsWith("/") && pending.length > 0) pending.push("."); // a trailing slash demands a directory
   let cur = "/";
   let curSt: StatBits;
   try { curSt = fsm.lstatSync("/"); } catch { return null; }
@@ -260,8 +269,8 @@ function kernelWalk(path: string, fsm: AccessFs): { searched: StatBits[]; target
   let hops = 0;
   while (pending.length > 0) {
     const name = pending.shift()!;
+    searched.push(curSt); // looking `name` up in `cur` needs x on `cur`, "." and ".." included
     if (name === ".") continue;
-    searched.push(curSt); // looking `name` up in `cur` needs x on `cur`
     if (name === "..") {
       cur = dirname(cur);
       try { curSt = fsm.lstatSync(cur); } catch { return null; }
@@ -278,7 +287,10 @@ function kernelWalk(path: string, fsm: AccessFs): { searched: StatBits[]; target
         cur = "/";
         try { curSt = fsm.lstatSync("/"); } catch { return null; }
       }
-      pending.unshift(...link.split("/").filter(Boolean));
+      if (link === "") return null; // an empty link target is ENOENT
+      const parts = link.split("/").filter(Boolean);
+      if (link.endsWith("/") && parts.length > 0) parts.push("."); // a trailing slash demands a directory
+      pending.unshift(...parts);
       continue;
     }
     if (pending.length === 0) return { searched, target: st };
@@ -311,7 +323,7 @@ export function canExecuteAs(
   gids: readonly number[],
   fsModule: AccessFs = REAL_ACCESS_FS,
 ): boolean {
-  const abs = pathResolve(path);
+  const abs = absoluteNoNormalize(path);
   if (uid === 0) {
     // Root bypasses directory permissions, but execve still requires a
     // regular file with at least one x bit: a 0644 wrapper, or a 0755
@@ -342,7 +354,7 @@ export function canReadAs(
   gids: readonly number[],
   fsModule: AccessFs = REAL_ACCESS_FS,
 ): boolean {
-  const abs = pathResolve(path);
+  const abs = absoluteNoNormalize(path);
   if (uid === 0) {
     try { fsModule.statSync(abs); return true; } catch { return false; }
   }
