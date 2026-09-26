@@ -78,6 +78,7 @@ config.yaml    # Default configuration
 - Use `bun:sqlite` for database operations -- no external SQLite bindings.
 - Error handling: fail fast and loud. No silent swallowing of errors.
 - Prefer early returns over deep nesting.
+- Time: only `src/clock.ts` reads a clock, and deadlines are monotonic. The clock and seam audits in `bun test` enforce it — see [docs/contributing.md](docs/contributing.md#time-and-deadlines-v0380).
 
 ## Reporting Bugs
 

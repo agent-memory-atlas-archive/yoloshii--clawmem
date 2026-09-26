@@ -104,6 +104,16 @@ Fragments are embedded independently. The full-document fragment catches broad q
 
 BM25 uses SQLite's FTS5 extension with prefix matching. Vector search uses the `vec0` extension with cosine similarity. Embedding dimensions depend on the model: 768 for the default EmbeddingGemma-300M, 2560 for the SOTA zembed-1, or provider-determined for cloud embedding.
 
+## Vector query daemon (v0.20.0; wire contract v0.38.0)
+
+The sqlite-vec `MATCH` is synchronous and `bun:sqlite` has no interrupt handler, so a cold scan inside the context-surfacing hook blocks the hook's event loop — a timeout on that loop cannot fire until the scan returns. `clawmem watch` therefore hosts a vector query daemon. The hook sends its query over a per-vault Unix socket (`$XDG_RUNTIME_DIR/clawmem/vec-<hash of the DB path>.sock`) and races the reply against a real timer while its own loop stays free. The daemon is an optimization, never a dependency: with no daemon the hook runs the scan in-process, unbounded as before; a daemon that is busy, errors or runs out of time costs that turn's vector leg — the hook falls back to FTS and never re-runs the scan in-process.
+
+**Hydrated responses (`hydrated-v1`).** The daemon hydrates and projects the results itself — snippets, rerank text and filter verdicts — so document bodies never cross the socket and the hook does no synchronous SQLite work inside its vector deadline. The projection is capped (result count, entry and frame bytes); an over-cap answer is refused and the leg falls back to FTS.
+
+**Relative budgets (`deadline-rel-v1`).** The hook's deadlines are monotonic, and none crosses the wire: each request carries `remainingBudgetMs`, the whole milliseconds left on the leg, sampled just before the write (an integer from 1 to 25000; a hydrated request must carry one). The daemon anchors its own deadline at frame receipt and checks it before and after each synchronous phase — advisory, never cancelling a scan; the hook's timer stays authoritative. Every answer to a budgeted request attests `deadlineProtocol: "deadline-rel-v1"`. Mismatched builds fail closed in both directions: an answer without the attestation, or raw hits returned for a hydrated request, is classified `skew` (FTS plus a once-per-process warning naming the socket), and a request that still carries an absolute `deadlineMs` is refused as `version_skew`.
+
+**Health.** A ping names the exact DB and pid behind the socket and advertises the protocols it serves. `clawmem doctor` and `clawmem vec-daemon-health` report `live` only when both `hydrated-v1` and `deadline-rel-v1` are advertised — the one state in which the hook's vector deadline holds. `live-raw` (attested, a protocol missing) and `live-legacy` (a pre-v0.38 watcher without the ping) prove a listener only. See [vec-daemon-health](../reference/cli.md) and, for version mismatches, [troubleshooting](../troubleshooting.md).
+
 ## Graphs
 
 ClawMem maintains a `memory_relations` table of typed edges between documents: semantic, supporting, contradicts, causal, and temporal. These edges let `intent_search` answer "why" and "what led to" questions by following chains across documents rather than relying on keyword or vector similarity alone.

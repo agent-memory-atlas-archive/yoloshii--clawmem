@@ -77,9 +77,9 @@ its daemon (the liveness probe threw on a missing socket handler and the bind wa
 the hook then ran in-process, unbounded, with no diagnostic; the probe is fixed and the
 stale-socket bind is regression-tested. Because the contract is scoped to daemon-backed
 deployments, the prerequisite is checkable: `clawmem doctor` now verifies the vault's
-daemon by a real round trip, and `clawmem vec-daemon-health` (exit 0 only for a live daemon on the vault's socket —
-attested `live`, or `live-legacy` for a pre-v0.38 watcher that answers the daemon protocol
-but cannot attest its DB/pid) is the scriptable gate the shipping preflight uses.
+daemon by a real round trip, and `clawmem vec-daemon-health` (exit 0 only for an attested `live` daemon on the vault's
+socket; `live-raw` and `live-legacy` prove a listener but not the contract, and exit 1) is
+the scriptable gate the shipping preflight uses.
 In the replay-eval, daemon ownership is re-verified before and after every rep, a
 `steady-state` prewarm that had no vector payload to warm refuses vector-exercising runs,
 and an in-process replay's budget gate is reported as unmeasured (raw timing kept as a
@@ -96,7 +96,9 @@ deadline is advisory (check-before / check-after each synchronous phase — neve
 expansion and rerank transports are cut by monotonic signals; the Stop hook's phase floors are
 monotonic too. A pre-O1 request carrying `deadlineMs` is refused as version skew by field
 presence, and a pre-O1 daemon that ignores the budget is classified `skew` — the leg degrades
-to FTS with a once-per-process warning naming the socket (restart `clawmem watch`). Only the
+to FTS with a once-per-process warning naming the socket (restart `clawmem watch`). The
+mismatch runs both ways, so **upgrade the hook and the watcher in the same step**: a pre-v0.38
+hook talking to a v0.38 watcher loses its vector legs to FTS silently. Only the
 clock module samples a platform clock; two static audits (a raw-clock ratchet and a typed seam
 audit over branded `MonoDeadline` / `DurationMs` / `EpochMs` values, both at zero debt) keep it
 that way. The timing evidence changed with it: every rep's per-leg record is persisted
@@ -141,8 +143,43 @@ experiment-pinned clock, and `eval hook-aggregate` for replicated-draw distribut
 verdicts. `CLAWMEM_SURFACING_TRACE=1` captures the same per-stage trace envelope
 live into `surfacing_diagnostics` for post-hoc diagnosis.
 
+### Verification
+
+Judged replicated A/B on a frozen corpus snapshot: 31 labeled cases (22 tuning, 9 holdout),
+five frozen expansion draws, each captured on the control arm (the pre-v0.38 composite
+admission) and replayed into the candidate (relevance admission), every candidate pair-gated
+at 31 valid pairs. Relevance admission raised graded nDCG from 0.528 to 0.830 and
+must-include recall from 0.50 to 1.00 in every draw (direction-stable across all five), with
+abstention and prior-leg accuracy at 1.00, no must-not hits and no timeouts; latency moved
+within noise (p50 ≈ 57 ms, p95 ≈ 1.8 s). Every run's trust gate passed under the
+daemon-backed protocol and the monotonic deadline contract: across 1,065 vector legs the
+worst overrun past its own deadline was 1.7 ms (tolerance 150 ms), and the slowest handler
+finished in 4.1 s of its 6 s budget. Two draw slots were redrawn under the pre-registered
+protocol after pair-gate refusals caused by transient host load (a control-arm vector leg
+cut at its deadline); the refused draws are kept as evidence, never reused.
+
+Cross-model adversarial review (codex / GPT-5.x and GPT-6), pinned sessions: the ranking,
+admission, bookkeeping and hydrated-v1 work was reviewed turn by turn through the arc; the
+monotonic-deadline design went through thirteen revisions before implementation, and its
+migration cleared a four-round review to zero remaining findings (10→7→1→0). Wall-clock
+steps of ±5 s, injected in the hook process and independently in a daemon child, leave every
+client and daemon deadline decision unchanged; a mutation that makes the control clock
+follow wall time fails all six of those locks. Full suite at clearance: 2785 tests,
+0 failures.
+
+### What didn't change
+
+The MCP retrieval tools keep composite ranking — pins, recency, quality and co-activation
+still act there; only the hook stopped ordering and admitting on it. Without a watcher the
+hook still runs its vector leg in-process: it works, but that leg's timeout is a target, not
+a bound. Defaults are unchanged: `CLAWMEM_HOOK_BUDGET_MS` 6000 and the profiles' token
+budgets and vector timeouts; below the new 25000 maximum the budget's fallback and clamp
+behave as before. Wall time still drives what is genuinely wall-clock — document ages,
+cooldowns, leases, identifiers and timestamps — now read through the clock module instead of
+`Date.now()`. Schema migrations are additive; no reindex, re-embed or graph rebuild.
+
 Upgrade notes (schema auto-migrations, the one-time rerank-cache cold start, the
-recommended `setup hooks` re-run): [docs/guides/upgrading.md](docs/guides/upgrading.md#v0380-channel-aware-hook-ranking-relevance-admission-off-process-bookkeeping).
+recommended `setup hooks` re-run, restarting the watcher together with the hook): [docs/guides/upgrading.md](docs/guides/upgrading.md#v0380-channel-aware-hook-ranking-relevance-admission-off-process-bookkeeping).
 
 ---
 

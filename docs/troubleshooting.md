@@ -286,6 +286,11 @@ builders operate on — so archiving documents legitimately lowers the total.
 - `speed` profile disables vector search entirely, so documents that rank via the hybrid lanes (BM25 + vector agreement compounds fused mass) may not survive membership or admission on BM25 alone.
 - Not a bug — this is the intended tradeoff. Use `balanced` or `deep` for richer retrieval.
 
+**Semantic matches vanished after an upgrade — surfacing looks keyword-only (v0.38.0)**
+- Cause: the hook and the watcher run different ClawMem builds. The v0.38.0 vector wire refuses mixed versions in both directions. A v0.38 hook classifies an older watcher's answers `skew` and prints once per process `[clawmem] vector daemon on <socket> does not implement deadline-rel-v1 (a watcher on an older build) — vector legs degrade to FTS until 'clawmem watch' is restarted on this build`. A v0.38 watcher refuses an older hook's absolute-deadline request as `version_skew`, and that older hook falls back to FTS **silently** — neither side logs it. Surfacing keeps working either way; only the vector legs are lost.
+- A common way to get here: the hook command in `~/.claude/settings.json` and the watcher's service unit (its `ExecStart`, including any drop-in override) point at different installs, so upgrading one leaves the other behind.
+- Fix: run the hook and `clawmem watch` from the same install, then restart the watcher (`systemctl --user restart clawmem-watcher.service`). Verify with `clawmem vec-daemon-health` from that install: exit 0 means `live`, advertising both `hydrated-v1` and `deadline-rel-v1`; `live-raw` or `live-legacy` means the watcher still runs an older build.
+
 **Recall attribution or injected-paths fill-in missing (`recall_events` empty for recent turns)**
 - Since v0.38.0 injection bookkeeping is applied off-process: the hook parks a job, hands it to a detached `clawmem spool-ingest` child, and the child persists it under `<db dir>/surfacing-spool/` (next to `index.sqlite`) then drains it into SQLite. The turn-alignment `context_usage` row is written in-hook and is never affected.
 - Bookkeeping is best-effort by design: if the handoff loses its 250ms flush race (pathological pipe) or the hook's deadline passed before packaging, that turn's learning data is dropped — alignment, prior-turn lookback, and the injection itself are unaffected.

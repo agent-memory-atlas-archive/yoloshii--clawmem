@@ -27,6 +27,23 @@ npx tsc --noEmit
 
 Must pass with zero errors on source files.
 
+## Time and deadlines (v0.38.0)
+
+Only `src/clock.ts` reads a platform clock — `Date.now()`, an argless `new Date()`, `performance.now()`, `process.hrtime()`, `Bun.nanoseconds()` and their kin are refused everywhere else. Use its exports instead:
+
+- **Deadlines and durations** are branded values (`MonoDeadline`, `DurationMs`). Take an instant with `monoNow()`, build a deadline with `deadlineAfter(start, duration(ms))`, test it with `isExpired()`, and arm timers and signals with `deadlineTimer`, `raceDeadline`, `sleep`, `timeoutSignal` or `signalAfter`. A monotonic deadline never moves when the wall clock steps.
+- **Wall time** — ages, cooldowns, leases, identifiers, timestamps — comes from `epochNow()`, `isoNow()` and `toDate()`; use `epochMs(epochNow())` where existing logic needs a plain epoch number.
+- **Numbers leave the brand** only through named exits: `evidenceMs` (timing evidence and logs), `epochMs` (wall-clock numbers), `wireBudget` (the vector daemon's relative budget).
+
+Two static audits enforce this. `bun test` runs both against the repository, and each also runs standalone:
+
+```bash
+bun scripts/o1-clock-audit.ts   # raw clock reads outside src/clock.ts
+bun scripts/o1-seam-audit.ts    # arithmetic, comparison or erasure on branded time values
+```
+
+Their ratchets (`o1-clock-debt.json`, `o1-seam-debt.json`) hold zero entries and only tighten, so a new raw clock read or brand erasure fails the suite. Route the code through `src/clock.ts` instead of adding a debt entry. A test that needs a wall-clock step uses the module's seam (`setWallJumpForTest`, or `CLAWMEM_TEST_WALL_JUMP` in a child process), never a patched `Date`.
+
 ## Project structure
 
 ```
@@ -52,6 +69,9 @@ src/
   errors.ts          Error types
   promptguard.ts     Prompt injection sanitization
   retrieval-gate.ts  Adaptive retrieval filtering
+  clock.ts           The ONLY module that reads a clock (monotonic deadlines, wall time, timers)
+  vector-daemon.ts   Vector query daemon (hosted by `clawmem watch`) and its hook-side client
+  vector-protocol.ts Daemon wire constants (hydrated-v1, deadline-rel-v1, caps)
   hooks.ts           Hook utilities (output format, dedup, logging)
   hooks/
     context-surfacing.ts   UserPromptSubmit hook
@@ -62,6 +82,9 @@ src/
     session-bootstrap.ts   SessionStart hook (optional)
     staleness-check.ts     SessionStart hook (optional)
     curator-nudge.ts       SessionStart hook
+    surfacing-fusion.ts    context-surfacing lane fusion (ordering key, membership)
+    surfacing-bookkeeping.ts  Off-process surfacing bookkeeping (spool)
+  eval/               Hook replay-eval harness (`clawmem eval hook-run` / `hook-aggregate`)
   openclaw/
     index.ts          Plugin entry point (registers as kind=memory, wires hook handlers)
     engine.ts         Retrieval/extraction engine (invoked from hook handlers in index.ts)
@@ -73,6 +96,7 @@ tests/
   unit/               Unit tests
   integration/        Integration tests (when present)
 docs/                 Documentation (this folder)
+scripts/              Tooling, including the O1 clock and seam audits
 bin/
   clawmem             Wrapper script (sets env defaults)
 ```
