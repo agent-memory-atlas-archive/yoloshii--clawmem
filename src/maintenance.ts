@@ -32,6 +32,7 @@ import {
   type DeductiveSynthesisStats,
 } from "./consolidation.ts";
 import { withWorkerLease } from "./worker-lease.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 
 // =============================================================================
 // Config
@@ -310,6 +311,7 @@ export function selectStaleObservationBatch(
        LEFT JOIN recall_stats rs ON rs.doc_id = d.id
        WHERE d.active = 1
          AND d.content_type = 'observation'
+         AND ${notLegacyArtifactSql("d")}
        ORDER BY
          COALESCE(rs.last_recalled_at, d.last_accessed_at, d.modified_at) ASC,
          d.modified_at ASC
@@ -333,6 +335,7 @@ export function selectStaleDeductiveBatch(
        LEFT JOIN recall_stats rs ON rs.doc_id = d.id
        WHERE d.active = 1
          AND d.content_type IN (${placeholders})
+         AND ${notLegacyArtifactSql("d")}
        ORDER BY
          COALESCE(rs.last_recalled_at, d.last_accessed_at, d.modified_at) ASC,
          d.modified_at ASC

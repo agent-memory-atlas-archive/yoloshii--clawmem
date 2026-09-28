@@ -26,6 +26,7 @@ import { createHash } from "crypto";
 import { parseDocument } from "./indexer.ts";
 import { splitDocument } from "./splitter.ts";
 import { canonicalDocId, type Store } from "./store.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 
 export const CANARY_PROBE_VERSION = 1;
 
@@ -252,12 +253,15 @@ export async function runSampledVectorValidation(
   type MetaRow = { hash: string; seq: number; fragment_label: string | null; embed_input_fp: string | null; canonical_id: string | null };
   // Metadata-only eligibility — one row per (hash,seq), NO document join (alias docs must
   // not multiply eligibility), NO body hydration.
+  // A sampled row is re-embedded from its reconstructed input: the legacy pre-compaction snapshot is
+  // never eligible (62.2), so its text never reaches the embedding model here either.
   const eligibleRows = s.db.prepare(`
     SELECT cv.hash, cv.seq, cv.fragment_label, cv.embed_input_fp, cv.canonical_id
     FROM content_vectors cv
     WHERE EXISTS (
       SELECT 1 FROM documents d
       WHERE d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL AND d.embed_state = 'synced'
+        AND ${notLegacyArtifactSql("d")}
     )
   `).all() as MetaRow[];
   const eligible = eligibleRows.length;

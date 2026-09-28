@@ -52,9 +52,9 @@ clawmem doctor                              # full health check (clawmem status 
 | Hook | Trigger | Does |
 |------|---------|------|
 | `context-surfacing` | UserPromptSubmit | retrieval gate → profile-driven hybrid search → FTS supplement → file-aware search → snooze/noise filters → relevance admission on the ordering key → tiered injection → `<vault-context>` (+ optional `<vault-facts>` SPO triples, `<vault-routing>` hint). Budget/results/vector-timeout/escalation driven by `CLAWMEM_PROFILE`. |
-| `postcompact-inject` | SessionStart (compact) | re-injects authoritative state after compaction → `<vault-postcompact>` |
+| `postcompact-inject` | SessionStart (compact) | re-injects THIS session's pre-compaction state + recent vault decisions, framed as reference data → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
-| `precompact-extract` | PreCompact | extracts decisions / file paths / open questions before compaction |
+| `precompact-extract` | PreCompact | extracts the last typed request / decisions / file paths / open questions before compaction → the vault's session-keyed `compaction_state` row |
 | `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples (+ the causal witness writer when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on` — default `off`) |
 | `handoff-generator` | Stop | LLM session summary → handoffs |
 | `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
@@ -158,7 +158,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 ## Indexing rules
 
 - **Indexed** (per collection in `config.yaml`): `**/MEMORY.md` · `**/memory/**` · `**/docs/**` · `**/research/**` · `**/YYYY-MM-DD*` (`.md`/`.txt`).
-- **Excluded (always):** `gits/`, `scraped/`, `.git/`, `node_modules/`, `dist/`, `build/`, `vendor/`, plus any `.`-prefixed segment. **Never index** credential files (`.env`, `*secrets*`, `*credentials*`) or `gits/`. There is **no exclude key in `config.yaml`** — to exclude your own convention (an archive dir such as `_snapshots/` holding timestamped duplicates of live docs), add it to `EXCLUDED_DIRS` in `src/indexer.ts`, then **restart the watcher**; already-indexed docs deactivate on the next `clawmem update`. → [architecture#adding-your-own](docs/concepts/architecture.md#adding-your-own).
+- **Excluded (always):** `gits/`, `scraped/`, `.git/`, `node_modules/`, `dist/`, `build/`, `vendor/`, plus any `.`-prefixed segment. The `precompact-state.md` snapshot ClawMem ≤ v0.39.x wrote into Claude Code memory dirs is recognised by its header: never indexed, never returned by search, retrieval or a glob (whatever indexed it), never read by enrichment or embedding (in an upgraded process: upgrade every ClawMem that shares the vault), and deactivated by the next index pass; `get` or a lifecycle tool by its exact path or docid still reaches it, and a same-named file with your own content indexes normally. **Never index** credential files (`.env`, `*secrets*`, `*credentials*`) or `gits/`. There is **no exclude key in `config.yaml`** — to exclude your own convention (an archive dir such as `_snapshots/` holding timestamped duplicates of live docs), add it to `EXCLUDED_DIRS` in `src/indexer.ts`, then **restart the watcher**; already-indexed docs deactivate on the next `clawmem update`. → [architecture#adding-your-own](docs/concepts/architecture.md#adding-your-own).
 - **Say why a pattern is narrow in a YAML comment beside it.** With no exclude key, a narrowed `pattern` is the exclusion and its comment is the only record of why. `clawmem collection add` and `remove` keep the file's comments (v0.39.1+); earlier versions dropped every comment on each write.
 - **Indexing ≠ embedding:** the watcher indexes on `.md` change but does NOT embed; the embed timer (or `clawmem embed`) keeps vectors fresh. Missing embeddings silently degrade vector recall — BM25 still works.
 

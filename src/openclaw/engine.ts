@@ -137,7 +137,8 @@ import {
   resolveProximityRatio,
   type CompactionThresholdConfig,
 } from "./compaction-threshold.js";
-import { resolveOpenClawSessionFile } from "./transcript-resolver.js";
+import { resolveOpenClawSessionFile, SAFE_SESSION_ID_RE } from "./transcript-resolver.js";
+import { basename } from "node:path";
 
 // =============================================================================
 // Logger interface (mirrors the OpenClaw plugin api.logger shape)
@@ -282,8 +283,8 @@ export type BeforeResetContext = {
  *
  *   2. PRE-EMPTIVE PRECOMPACT: if the messages buffer is at or above the
  *      proximity ratio of the compaction threshold, run precompact-extract
- *      synchronously. This guarantees `precompact-state.md` is written
- *      BEFORE the LLM call begins on this turn — and the LLM call is what
+ *      synchronously. This guarantees the session's pre-compaction state is
+ *      written BEFORE the LLM call begins on this turn — and the LLM call is what
  *      can trigger compaction. There is no race because `before_prompt_build`
  *      is awaited and runs strictly before any compaction trigger.
  *
@@ -486,11 +487,20 @@ export async function handleBeforeCompaction(
   event: BeforeCompactionEvent,
   ctx: BeforeCompactionContext,
 ): Promise<void> {
-  // We can't reliably extract sessionId here — beforeCompactionEvent doesn't
-  // carry it. Use sessionKey (or the sessionFile path stem) as a best-effort
-  // fallback for the precompact-extract hook. precompact-extract reads the
-  // transcript from the path so the session_id field is informational only.
-  const sessionId = ctx.sessionKey || "compaction-fallback";
+  // beforeCompactionEvent carries no sessionId. The pre-compaction state is keyed by session id
+  // (62.2), so a shared literal fallback would make every key-less session overwrite one file, and a
+  // sessionKey ("agent:main:main") is not the id the load-bearing path uses. OpenClaw names the
+  // session file `<sessionId>.jsonl`. A topic session's file is `<sessionId>-topic-<topicId>.jsonl`
+  // (transcript-resolver.ts `buildTranscriptFileName`), and a valid session id may itself contain
+  // "-topic-", so a stem containing it cannot be split with certainty: skip it (this path is only the
+  // defense-in-depth fallback; `before_prompt_build` passes the real id). Otherwise use the stem when it
+  // is a valid session id, else skip.
+  const stem = event.sessionFile ? basename(event.sessionFile).replace(/\.jsonl$/, "") : "";
+  if (stem.includes("-topic-") || !SAFE_SESSION_ID_RE.test(stem)) {
+    logger.debug?.("clawmem: before_compaction precompact skipped — no unambiguous session id in the session file name");
+    return;
+  }
+  const sessionId = stem;
   await maybeRunPrecompactExtract(cfg, thresholdCfg, logger, {
     sessionId,
     sessionFile: event.sessionFile,

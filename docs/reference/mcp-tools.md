@@ -124,7 +124,7 @@ Output is the **union** of the composite top-`limit` and the raw top-`limit`: a 
 
 ### get
 
-Retrieve a single document by path or docid.
+Retrieve a single document by path or docid. A path resolves exactly first (the `clawmem://` path, `collection/path`, then a path inside a collection), then as a path suffix. A suffix and a did-you-mean suggestion never resolve to the `precompact-state.md` snapshot ClawMem ≤ v0.39.x left in Claude Code memory dirs; its exact path or docid does.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -136,7 +136,7 @@ Retrieve a single document by path or docid.
 
 ### multi_get
 
-Retrieve multiple documents by glob pattern or comma-separated list.
+Retrieve multiple documents by glob pattern or comma-separated list. Each listed path resolves as in `get`. A glob never matches the legacy `precompact-state.md` snapshot, even one that spells its name; list its exact path instead.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -197,7 +197,7 @@ Temporal neighborhood — what was created/modified before and after a document.
 
 ### memory_evolution_status
 
-Track how a document's A-MEM metadata evolved over time.
+Track how a document's A-MEM metadata evolved over time. Entries that may carry the text of a `precompact-state.md` snapshot ClawMem ≤ v0.39.x indexed (from one the snapshot triggered, or one an older ClawMem wrote after the upgrade, up to the note's next `reset:` entry) are not shown; the `reset:` entry is.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -246,7 +246,7 @@ Permanently deactivate a memory.
 | `confirm` | boolean | true | False = preview only |
 | `vault` | string | — | Named vault |
 
-**Search behavior (v0.2.6+, all three tools):** Query matching cascades through four strategies: exact path match → BM25 full-text → title-token overlap → vector similarity. This prevents "No matching memory found" errors when the document exists but BM25 fails to match (e.g., too many AND'd terms). Path-like queries (containing `/` or ending in `.md`) try direct path matching first. `memory_forget` requires higher confidence to act — ambiguous matches return candidates instead of mutating.
+**Search behavior (v0.2.6+, all three tools):** Query matching cascades through four strategies: exact path match → BM25 full-text → title-token overlap → vector similarity. This prevents "No matching memory found" errors when the document exists but BM25 fails to match (e.g., too many AND'd terms). Path-like queries (containing `/` or ending in `.md`) try the exact path first — `collection/path`, then a bare `path` when a single document has it (a bare path that several collections share returns the candidates instead of acting, for all three tools) — then a path substring. `memory_forget` requires higher confidence to act — ambiguous matches return candidates instead of mutating. A copy of the `precompact-state.md` snapshot ClawMem ≤ v0.39.x left in Claude Code memory dirs is found only by its exact path; no substring, keyword, title or vector match returns it.
 
 **Targeting confidence (v0.23.0):** the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap to the runner-up when more than one candidate exists) is now live for BM25 candidates — through v0.22.0 every FTS candidate carried a constant score of 1.0, so `memory_forget` treated ANY keyword match as high-confidence and auto-selected it. Weak matches — including a lone weak match — now return the candidate list for disambiguation instead of acting. Stricter, safer targeting for a destructive operation.
 

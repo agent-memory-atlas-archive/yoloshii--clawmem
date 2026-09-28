@@ -164,6 +164,22 @@ builders operate on — so archiving documents legitimately lowers the total.
 
 ## Hooks
 
+**`<vault-postcompact>` shows another session's pre-compaction state (its last request, decisions or files)**
+- ClawMem ≤ v0.39.1 kept one `precompact-state.md` per project directory and injected it on every session start there, so a session could receive another session's last compaction, or an old one again. Fixed in v0.40.0: the state is one row per session in the vault, taken once by the start that follows that session's own compaction. The block's recent decisions, antipatterns and vault context come from the whole vault on purpose; only the pre-compaction state is per session.
+- Upgrade every ClawMem that shares the vault: the hooks, the watcher, the MCP server in every open session, and the OpenClaw or Hermes plugin. An older one still running keeps the old behaviour. Then re-run `clawmem setup hooks` and delete the old files `clawmem doctor` lists; it shows red while one is still being written after the upgrade.
+
+**No pre-compaction state after `/compact`**
+- The PreCompact met a busy vault, failed or timed out. It then stores nothing, on purpose, so that nothing older is injected in its place. On the first open after the upgrade, a vault another process keeps busy can make that one open fail the same way.
+- `postcompact-inject` is not installed for the `compact` start: re-run `clawmem setup hooks`.
+- More than 15 minutes passed between the PreCompact and the start that follows it: an older state is never injected.
+- The transcript had nothing to extract: no typed request, decision or file path. Open questions alone are not stored.
+- OpenClaw and Hermes store the state at compaction, but nothing in them reads it back yet.
+
+**`clawmem doctor` compaction lines (v0.40.0)**
+- "postcompact-inject is installed under SessionStart matcher …": re-run `clawmem setup hooks`.
+- "Legacy pre-compaction state: N precompact-state.md file(s) left by ClawMem ≤ v0.39.x": delete the files. In red ("written after this vault was upgraded"), an older ClawMem process is still running against the vault: upgrade it.
+- "… indexed cop(y|ies) of an old snapshot … still active": `clawmem update` deactivates each one whose file is on disk or was deleted; one from before v0.34 whose file is gone stays until you forget it by its exact path.
+
 **"UserPromptSubmit hook error" (intermittent)**
 - SQLite contention between the watcher and the context-surfacing hook. During active conversations, Claude Code writes rapidly to session transcript `.jsonl` files. Prior to v0.1.6, the watcher processed all `.jsonl` file changes (not just Beads `.beads/*.jsonl`), triggering database opens and brief write locks on every transcript update. If the context-surfacing hook fired during a lock, it exceeded its timeout.
 - Fixed in v0.1.6: The watcher now only processes `.jsonl` files within `.beads/` directories (Dolt backend). Claude Code transcript `.jsonl` files are ignored entirely, eliminating the main source of lock contention and memory bloat.

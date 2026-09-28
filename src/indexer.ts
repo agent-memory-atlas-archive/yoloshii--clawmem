@@ -5,6 +5,7 @@
  */
 
 import { Glob } from "bun";
+import { isLegacyPrecompactState, retireLegacyPrecompactRow } from "./compaction-state.ts";
 import { isoNow } from "./clock.ts";
 import { readFileSync, statSync } from "fs";
 import { basename, relative } from "path";
@@ -275,6 +276,22 @@ export async function indexCollection(
   try {
     for (const relativePath of allEntries) {
       if (shouldExclude(relativePath)) continue;
+
+      // 62.2: the pre-compaction snapshot ClawMem ≤ v0.39.x wrote into Claude Code memory dirs,
+      // recognised by its exact header — never indexed, and left out of activePaths. The file on disk
+      // corroborates an indexed copy at its path, which is retired here: an 'fs' one, or a NULL-origin
+      // (pre-v0.34) one that absence reconciliation would never touch. Retirement happens on an index
+      // pass; retrieval never returns a copy in the meantime, active or not (`notLegacyArtifactSql`),
+      // and an older ClawMem that reactivates one gets it retired again by the next pass. A same-named
+      // file with any other content is indexed as usual.
+      if (relativePath.endsWith("precompact-state.md")) {
+        try {
+          if (isLegacyPrecompactState(relativePath, readFileSync(`${collectionPath}/${relativePath}`, "utf-8"))) {
+            if (retireLegacyPrecompactRow(store, collectionName, relativePath)) stats.removed++;
+            continue;
+          }
+        } catch { /* unreadable here — the read below skips it too */ }
+      }
 
       activePaths.add(relativePath);
       const absolutePath = `${collectionPath}/${relativePath}`;

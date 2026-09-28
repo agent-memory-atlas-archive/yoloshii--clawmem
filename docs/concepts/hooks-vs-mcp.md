@@ -9,9 +9,9 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 | Hook | Trigger | Budget | What it does |
 |------|---------|--------|-------------|
 | `context-surfacing` | UserPromptSubmit | profile-driven (default 800 tokens + factsTokens sub-budget) | Searches vault for context relevant to the user's prompt. Injects results as `<vault-context>` XML with four inner blocks: `<instruction>` (framing — always present), `<facts>` (the surfaced docs), `<relationships>` (memory-graph edges between surfaced docs, v0.7.1), and `<vault-facts>` (raw SPO triples for prompt-seeded entities, v0.9.0 §11.1). A session focus file (v0.9.0 §11.4) steers snippet selection as presentation intent; since v0.38.0 it no longer changes scoring or ordering. |
-| `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
+| `postcompact-inject` | SessionStart (`compact` only) | 1200 tokens | Re-injects THIS session's pre-compaction state (claimed once, then deleted) plus recent vault decisions and antipatterns, framed as reference data rather than instructions. Startup, resume, clear and fork starts get nothing. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
-| `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
+| `precompact-extract` | PreCompact | — | Extracts the last typed request (never a tool result), decisions and open questions from prose, and file paths, before compaction. Stores it as the session's row in the vault's `compaction_state` table (15-minute lifetime). |
 | `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0). Extracts SPO triples from decision/preference/milestone/problem facts. |
 | `handoff-generator` | Stop | — | LLM summarizes the session for cross-session continuity. |
 | `feedback-loop` | Stop | — | Tracks which notes were referenced. Boosts their confidence. Per-turn recall attribution marks which surfaced docs were actually cited. |

@@ -51,7 +51,7 @@ export const DEFAULT_AGENT_ID = "main";
  * paths with `..` or other separators when the upstream sessionId is
  * malformed.
  */
-const SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
+export const SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
 
 /**
  * Mirror of OpenClaw's agent-id validation/normalization from

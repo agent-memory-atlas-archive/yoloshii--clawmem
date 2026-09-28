@@ -22,6 +22,7 @@
  */
 
 import type { Store, SearchResult, VecSearchDetailedResult } from "./store.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { DEFAULT_EMBED_MODEL, rethrowIfFatalVectorError } from "./store.ts";
 import type { LLM } from "./llm.ts";
 import { classifyIntent, extractTemporalConstraint, type IntentType, type IntentResult } from "./intent.ts";
@@ -123,7 +124,7 @@ function hydrateByHash(store: Store, hash: string): (SearchResult & { observatio
            COALESCE(d.authored_at, d.modified_at) as effective_time
     FROM documents d
     LEFT JOIN content c ON c.hash = d.hash
-    WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
+    WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL AND ${notLegacyArtifactSql("d", "c.doc")} LIMIT 1
   `).get(hash) as { collection: string; path: string; title: string; hash: string; observation_type: string | null; body: string | null; modified_at: string; effective_time: string | null } | undefined;
   if (!doc) return null;
   return {
@@ -226,7 +227,7 @@ function collectCausalOneHop(
   const baseGroup = baseParts.length > 0 ? `(${baseParts.join(" AND ")})` : "1=1";
   const whyGroup = `(d.collection = '_clawmem' AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL)`;
   clauses.push(laneActive ? `(${baseGroup} OR ${whyGroup})` : baseGroup);
-  clauses.push(`d.active = 1`, `d.invalidated_at IS NULL`);
+  clauses.push(`d.active = 1`, `d.invalidated_at IS NULL`, notLegacyArtifactSql("d")); // 62.2: never the legacy artifact
   if (timeRange) {
     clauses.push(`COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`);
     params.push(timeRange.start, timeRange.end);
@@ -444,7 +445,7 @@ export async function runCausalRetrieval(
           const mpfpNormalizer = maxMpfpScore > 0 ? 1 / maxMpfpScore : 1;
           for (const node of mpfpNodes) {
             const normalizedScore = node.score * mpfpNormalizer;
-            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(node.docId) as { hash: string } | undefined;
+            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL AND ${notLegacyArtifactSql("documents")} LIMIT 1`).get(node.docId) as { hash: string } | undefined;
             if (doc) {
               const existing = merged.find(m => m.hash === doc.hash);
               if (existing) {
@@ -466,7 +467,7 @@ export async function runCausalRetrieval(
           }).filter((id): id is number => id !== undefined);
           const entityNeighbors = getEntityGraphNeighbors(store.db, seedDocIds, budgets.entityLimit);
           for (const en of entityNeighbors) {
-            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(en.docId) as { hash: string } | undefined;
+            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL AND ${notLegacyArtifactSql("documents")} LIMIT 1`).get(en.docId) as { hash: string } | undefined;
             if (doc && !merged.some(m => m.hash === doc.hash)) {
               merged.push({ hash: doc.hash, score: en.score * 0.7 });
             }

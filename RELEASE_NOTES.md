@@ -4,6 +4,121 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.40.0 — after a compaction, a session gets back its own pre-compaction state and nobody else's
+
+Through v0.39.1 the pre-compaction state was one file per project directory. `precompact-extract`
+wrote `precompact-state.md` into Claude Code's auto-memory directory
+(`~/.claude/projects/<project>/memory/`), and `postcompact-inject` read it back on every session
+start in that directory, with no session key, no age check and no check of why the session
+started. So:
+
+- a session received the last compaction of whichever session in the same project directory had
+  compacted most recently, including one that ran concurrently in another terminal;
+- a fresh start, a resume or a `/clear` received it too, because the installer put
+  `postcompact-inject` under SessionStart matcher `""`;
+- a PreCompact that extracted nothing left the older file in place, to be replayed at the next
+  compaction;
+- the block was injected unfiltered, under the heading "authoritative", which told the model to
+  prefer it over its own summary.
+
+The extraction itself was also wrong. The "last user request" was the last entry with the user
+role, which in an agentic session is almost always a tool result, and decisions were mined from
+tool input and output as well as prose. And PreCompact re-indexed a collection from inside the
+hook, so the state files were indexed and surfaced in search as ordinary memories.
+
+What changed:
+
+- **The state belongs to one session.** PreCompact stores it as that session's row in a new vault
+  table, `compaction_state`. The SessionStart that follows the compaction (source `compact`)
+  takes it once: reads and deletes it in one statement. A state older than 15 minutes is never
+  injected, and a start for any other reason injects nothing. The block's recent decisions,
+  antipatterns and vault context still come from the whole vault, as before; only the
+  pre-compaction state is per session.
+- **A failed PreCompact leaves nothing to replay.** Before it opens the vault, PreCompact registers
+  its attempt in a small database beside the vault (`<vault>-compaction.sqlite`), and the SessionStart takes
+  only the row carrying the registered attempt. A PreCompact that fails after registering, with a
+  busy vault, an unreadable transcript, nothing to extract or the host's timeout, leaves no
+  snapshot to inject, and an older PreCompact that finishes after a newer one started stores
+  nothing, whether it resumes before or after the newer one stored its state. A SessionStart that
+  runs while its PreCompact is still extracting retires that attempt, and one whose read of the vault
+  waited while a newer PreCompact of the session registered injects nothing.
+- **The block is data.** It is framed as notes extracted by pattern matching, to be checked before
+  acting on them, and every field (captured text, vault titles, paths, snippets) is filtered for
+  injection, flattened to one line, bounded, and cannot open or close a tag.
+- **The request is what the user typed.** A classifier separates typed prompts from tool results,
+  harness records (command wrappers, local command output, task notifications, system reminders)
+  and meta entries, and it looks back up to 2000 entries for the last one. Decisions and open
+  questions come from prose only. `readTranscript`'s output is unchanged.
+- **No re-index from PreCompact.** The hook writes nothing into Claude Code's memory directory and
+  indexes nothing.
+- **`clawmem setup hooks`** installs `postcompact-inject` in its own SessionStart group, matcher
+  `compact`, and removes ClawMem's hooks handler by handler, so another tool's hook in the same
+  group survives an install or a `--remove`. The manual JSON in the setup guide now has the
+  `{matcher, hooks}` shape Claude Code expects, and the transcript-path example uses
+  `.transcript_path`.
+- **The old files stay out of retrieval and enrichment.** Search and retrieval never return an
+  indexed copy of the old `precompact-state.md` (recognised by the header the old versions always
+  wrote, never by name alone), whoever indexed it, including an older ClawMem still running against
+  the vault. The check runs inside every query that finds documents nobody named: the keyword,
+  vector, graph, entity and causal routes, timeline neighbours, review reminders, evolution
+  history, a glob or path-suffix match in `get` / `multi_get` / the `clawmem://` resource, the
+  did-you-mean list, the target search of `memory_pin` / `memory_snooze` / `memory_forget`, and the
+  REST export. No automatic enrichment or embedding reads a copy either: A-MEM notes, links and
+  evolution, entity extraction, graph building, consolidation, deduction, conversation synthesis,
+  `clawmem embed` and the doctor's vector sampling all skip it. So there is nothing to migrate first
+  and no window while one runs. A get (or a lifecycle tool) by its exact path or docid still reaches
+  it. The indexer skips the files and deactivates each indexed copy it finds. A file with that name
+  and your own content is an ordinary document.
+- **Notes a copy shaped are rebuilt.** Older versions let a copy feed A-MEM evolution, so another
+  session's text could end up in a note's A-MEM summary and be carried forward. The first writable
+  open clears each such note, the light-lane backfill (`CLAWMEM_ENABLE_CONSOLIDATION=true`) rebuilds
+  it from the note's own text, and `memory_evolution_status` shows a `reset:` entry where the tainted
+  entries were. A note indexed from a file is also rebuilt when the file changes or by `clawmem
+  reindex --enrich`; one that hooks or the API wrote stays without an A-MEM note until the light
+  lane runs (search and injection never use one). No prompt reads such a note meanwhile. A
+  note an older ClawMem still running evolves after the upgrade gets the same treatment, whether or
+  not a copy ever touched it, since an older process reads notes unguarded: this version stamps
+  every evolution entry it writes, and an older one cannot.
+- **REST `/export`** leaves the copies out by default and says how many
+  (`legacy_snapshots_excluded`); `?full=true` includes them (every active document).
+- **`get` and `multi_get` resolve `collection/path` exactly** before they try the text as a path
+  suffix, so a display path no longer depends on the suffix fallback's first match.
+- **`clawmem doctor`** flags `postcompact-inject` under any matcher but `compact`, lists the old
+  files (red when one was written after the upgrade, which means an older ClawMem process is
+  still running against the vault), and lists indexed copies that are still active.
+- **OpenClaw** takes its fallback session id from the transcript file's stem, and skips a stem it
+  cannot split with certainty (one containing `-topic-`).
+
+All of this describes an upgraded process. An older ClawMem still running against the vault keeps
+its own behaviour, the leak included, until it is upgraded or stopped: upgrade every process that
+shares the vault.
+
+The state still depends on Claude Code sending the same `session_id` to PreCompact and to the
+SessionStart that follows it, which is what the field means on both events. One case stays
+open by nature: a PreCompact whose disk refuses both the registration and the vault write cannot
+mark anything stale, so an earlier state of that session that nothing took can still be injected
+within its 15 minutes.
+
+### Verification
+
+Nine test files, `tests/unit/compaction-*.ts`: 120 tests. `compaction-cli.test.ts` runs the two
+hooks through the real `clawmem hook` dispatcher, one process per hook, as the host does;
+`compaction-mcp.test.ts` drives the real MCP server, resource and REST routes;
+`compaction-enrichment.test.ts` runs the enrichment pipelines with a model stub that records every
+prompt; and `compaction-embed.test.ts` runs `clawmem embed` against an embedding server that records
+every input. Of the tests that drive public entry points (the hook dispatcher, `setup hooks`,
+`doctor`, the OpenClaw engine, the MCP server and REST routes, and `clawmem embed`), 34 of 38 fail on
+the v0.39.1 code as each defect predicts; the 4 that pass there are controls. The unit tests of the
+new state store, registration, transcript classifier and A-MEM repair need modules v0.39.1 does not
+have, so they cannot run there. Across the release, 66 targeted reversions of its behaviour each
+make a test fail.
+Full suite: 3047 pass / 0 fail; `tsc` reports the same 85 errors as v0.39.1. Cross-model
+adversarial review (codex / GPT-6, one pinned session) took fifteen turns and 75 findings, 22 of
+them High, all resolved before release; three were questions of scope that the maintainer decided.
+It cleared at turn 15 with zero remaining findings.
+
+---
+
 ## v0.39.1 — collection and context edits keep the comments in config.yaml
 
 Every command that writes `~/.config/clawmem/config.yaml` re-serialised the parsed config with

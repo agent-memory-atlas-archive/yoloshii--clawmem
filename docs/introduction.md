@@ -22,7 +22,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
    │   ├── feedback-loop        → reinforces referenced memories
    │   ├── precompact-extract   → preserves state before context compaction
    │   ├── curator-nudge        → surfaces maintenance suggestions
-   │   └── postcompact-inject   → re-injects authoritative context after compaction
+   │   └── postcompact-inject   → re-injects the session's pre-compaction state after compaction
    │
    ├── MCP Tools (agent-initiated, ~10%)
    │   ├── memory_retrieve      → auto-routing entry point

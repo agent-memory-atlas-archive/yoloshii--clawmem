@@ -26,9 +26,9 @@ Hooks handle ~90% of retrieval at zero agent effort.
 | Hook | Trigger | Does |
 |------|---------|------|
 | `context-surfacing` | UserPromptSubmit | retrieval gate → profile-driven hybrid search → FTS supplement → file-aware search → snooze/noise filters → relevance admission on the ordering key → tiered injection → `<vault-context>` (+ optional `<vault-facts>` / `<vault-routing>`). Budget/results/vector-timeout/escalation driven by `CLAWMEM_PROFILE`. |
-| `postcompact-inject` | SessionStart (compact) | re-injects authoritative state after compaction → `<vault-postcompact>` |
+| `postcompact-inject` | SessionStart (compact) | re-injects THIS session's pre-compaction state + recent vault decisions, framed as reference data → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
-| `precompact-extract` | PreCompact | extracts decisions / file paths / open questions before compaction |
+| `precompact-extract` | PreCompact | extracts the last typed request / decisions / file paths / open questions before compaction → the vault's session-keyed `compaction_state` row |
 | `decision-extractor` | Stop | LLM → observations + causal links + contradiction detection + SPO triples |
 | `handoff-generator` | Stop | LLM session summary → handoffs |
 | `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |

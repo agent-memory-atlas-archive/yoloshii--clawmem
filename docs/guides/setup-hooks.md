@@ -14,7 +14,7 @@ This installs hooks into `~/.claude/settings.json`:
 |------|-------|---------|---------|
 | `context-surfacing` | UserPromptSubmit | 8s | Search vault, inject relevant context |
 | `curator-nudge` | SessionStart | 5s | Surface maintenance suggestions |
-| `postcompact-inject` | SessionStart | 5s | Re-inject state after compaction |
+| `postcompact-inject` | SessionStart (matcher `compact`) | 5s | Re-inject this session's state after compaction |
 | `precompact-extract` | PreCompact | 5s | Preserve state before compaction |
 | `decision-extractor` | Stop | 30s | Extract observations from conversation |
 | `handoff-generator` | Stop | 30s | Summarize session for continuity |
@@ -28,52 +28,49 @@ plus a safety margin ([configuration](../reference/configuration.md)).
 
 ## Manual install (full reference)
 
-If you prefer to configure hooks manually instead of running `setup hooks`, add this to `~/.claude/settings.json`. Replace `/path/to/clawmem` with your actual install path (e.g. `~/.bun/bin/clawmem` or `~/clawmem/bin/clawmem`):
+If you prefer to configure hooks manually instead of running `setup hooks`, add this to `~/.claude/settings.json`. Replace `/path/to/clawmem` with your actual install path (e.g. `~/.bun/bin/clawmem` or `~/clawmem/bin/clawmem`). Each event holds a list of groups, and each group is `{matcher, hooks: [...]}`; Claude Code does not run a handler placed directly in the event list. `postcompact-inject` needs its own SessionStart group with matcher `compact`, because SessionStart also fires on startup, resume, clear and fork:
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
       {
-        "type": "command",
-        "command": "/path/to/clawmem hook context-surfacing",
-        "timeout": 8
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "CLAWMEM_HOOK_BUDGET_MS=6000 /path/to/clawmem hook context-surfacing", "timeout": 8 }
+        ]
       }
     ],
     "SessionStart": [
       {
-        "type": "command",
-        "command": "/path/to/clawmem hook curator-nudge",
-        "timeout": 5
+        "matcher": "compact",
+        "hooks": [
+          { "type": "command", "command": "/path/to/clawmem hook postcompact-inject", "timeout": 5 }
+        ]
       },
       {
-        "type": "command",
-        "command": "/path/to/clawmem hook postcompact-inject",
-        "timeout": 5
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/path/to/clawmem hook curator-nudge", "timeout": 5 }
+        ]
       }
     ],
     "PreCompact": [
       {
-        "type": "command",
-        "command": "/path/to/clawmem hook precompact-extract",
-        "timeout": 5
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/path/to/clawmem hook precompact-extract", "timeout": 5 }
+        ]
       }
     ],
     "Stop": [
       {
-        "type": "command",
-        "command": "/path/to/clawmem hook decision-extractor",
-        "timeout": 30
-      },
-      {
-        "type": "command",
-        "command": "/path/to/clawmem hook handoff-generator",
-        "timeout": 30
-      },
-      {
-        "type": "command",
-        "command": "/path/to/clawmem hook feedback-loop",
-        "timeout": 30
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/path/to/clawmem hook decision-extractor", "timeout": 30 },
+          { "type": "command", "command": "/path/to/clawmem hook handoff-generator", "timeout": 30 },
+          { "type": "command", "command": "/path/to/clawmem hook feedback-loop", "timeout": 30 }
+        ]
       }
     ]
   }
@@ -95,20 +92,63 @@ These hooks exist but are not installed by default:
 | `session-bootstrap` | SessionStart | Redundant with `context-surfacing` for most setups. Useful for heavy bootstrap context on session start. |
 | `staleness-check` | SessionStart | Can add latency on session start. Useful for surfacing stale document alerts. |
 
-To add them, append to the `SessionStart` array in the config above:
+To add them, append a group to the `SessionStart` array in the config above:
 
 ```json
 {
-  "type": "command",
-  "command": "/path/to/clawmem hook session-bootstrap",
-  "timeout": 5
-},
-{
-  "type": "command",
-  "command": "/path/to/clawmem hook staleness-check",
-  "timeout": 5
+  "matcher": "",
+  "hooks": [
+    { "type": "command", "command": "/path/to/clawmem hook session-bootstrap", "timeout": 5 },
+    { "type": "command", "command": "/path/to/clawmem hook staleness-check", "timeout": 5 }
+  ]
 }
 ```
+
+## Compaction hooks
+
+`precompact-extract` (PreCompact) and `postcompact-inject` (SessionStart, `source: "compact"`) bracket a context
+compaction.
+
+- PreCompact extracts the last request the user typed, decisions and open questions from the conversation's prose,
+  and the files touched. It stores them as that session's row in the vault's `compaction_state` table.
+- Before it opens the vault, PreCompact registers its attempt in a small database beside the vault
+  (`<vault>-compaction.sqlite`), which only the two compaction hooks write. That registration supersedes every earlier attempt of the session. So a PreCompact that
+  fails after it (a busy vault, an unreadable transcript, nothing extracted, the host's timeout) leaves no snapshot
+  to be injected, and an older PreCompact, whether it resumes before or after a newer one stored its state, stores
+  nothing. The one case it cannot cover is a disk that refuses the registration and the vault write both: nothing
+  can be marked stale without a write.
+- The compaction's SessionStart consumes the registration, then takes the row carrying it (reads and deletes it in
+  one statement), and injects it once as `<vault-postcompact>` with recent vault decisions. If a newer PreCompact
+  of the session registered while the take waited for the vault, or the registration database cannot be read,
+  nothing is injected. A state older than 15 minutes is never injected, and a SessionStart for startup, resume,
+  clear or fork injects nothing.
+- The block is framed as reference data extracted by pattern matching, not as instructions, and every field in it is
+  filtered and flattened to one line.
+- This relies on Claude Code sending the same `session_id` to PreCompact and to the SessionStart that follows it,
+  which is the documented meaning of the field on both events.
+
+**Upgrading from v0.39.x or earlier.** Those versions wrote one `precompact-state.md` per project into Claude Code's
+memory directory (`~/.claude/projects/<project>/memory/`) and read it back on every session start in that project.
+Four steps:
+- Upgrade every ClawMem process that shares the vault: the hooks, the watcher, the MCP server in every open
+  session, and the OpenClaw or Hermes plugin. What follows is what an upgraded process does. An older one still
+  running keeps its own behaviour until it is upgraded or stopped: it writes and reads the files, injects them,
+  and enriches notes from them.
+- Re-run `clawmem setup hooks` to move `postcompact-inject` into its own `compact` group. The hook already ignores
+  other starts, so this only stops a wasted process launch.
+- `clawmem doctor` lists any leftover `precompact-state.md` files. An upgraded ClawMem uses them for nothing; only
+  the doctor (to list them) and the indexer (to retire their copies) look at them. Delete them.
+- ClawMem recognises those files by the header the old versions wrote. In an upgraded process, search, retrieval,
+  globs and the default REST export never return an indexed copy, and enrichment and embedding never read one,
+  whatever version indexed it and whether or not the vault has been re-indexed since. `get` by the copy's exact
+  path or docid still returns it. An A-MEM note that a copy shaped, or that an older process evolved after the
+  upgrade, is never read by an upgraded process's enrichment prompts; it is cleared at the next writable open or
+  background pass and rebuilt from the note's own text by the light-lane backfill (`CLAWMEM_ENABLE_CONSOLIDATION=true`,
+  in the watcher or the MCP server). A note indexed from a file is also rebuilt when the file changes, or by
+  `clawmem reindex --enrich`; one that hooks or the API wrote has no other rebuild path, so without the light lane
+  it stays without an A-MEM note (search and injection never use one). The indexer never indexes a copy again and deactivates each
+  one whose file it finds, and `clawmem doctor` lists the copies still active. `clawmem doctor` also shows red
+  while an older ClawMem keeps writing the files. A file with that name and your own content is indexed as usual.
 
 ## Timeouts
 
@@ -150,7 +190,7 @@ OK='{"continue":true,"suppressOutput":false}'
 input=$(cat)
 
 # Every early return must output JSON
-transcript=$(echo "$input" | jq -r '.transcriptPath // empty')
+transcript=$(echo "$input" | jq -r '.transcript_path // empty')
 if [[ -z "$transcript" ]]; then
     echo "$OK"; exit 0
 fi

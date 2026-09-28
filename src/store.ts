@@ -13,6 +13,7 @@
  */
 
 import { monoNow, deadlineAfter, earliest, isExpired, timeoutSignal, type DurationMs, type MonoDeadline, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
+import { COMPACTION_STATE_DDL, fenceEvolutionWriters, notLegacyArtifactSql, notLegacyTaintedEvolutionSql, resetLegacyDerivedNotes } from "./compaction-state.ts";
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
@@ -696,6 +697,23 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     END
   `);
 
+  // 62.2: the session-keyed pre-compaction state (compaction-state.ts): one row per session id.
+  db.exec(COMPACTION_STATE_DDL);
+
+  // 62.2: the pre-compaction snapshot ClawMem ≤ v0.39.x wrote into Claude Code memory dirs and then
+  // indexed is never returned by retrieval (`notLegacyArtifactSql`, a read-side predicate on every
+  // ranked retrieval path), and the indexer deactivates each indexed copy whose file it finds. Nothing
+  // is migrated here. This version's first writable open records the upgrade time in vault_flags
+  // (read-guarded, written once, never updated): `clawmem doctor` uses it to spot a legacy file written
+  // after the upgrade — the mark of an older ClawMem process still running. A failure (a busy or
+  // read-only vault) leaves it for the next open.
+  try {
+    const since = "migration:retire-legacy-precompact-state";
+    if (!db.prepare(`SELECT 1 FROM vault_flags WHERE flag = ?`).get(since)) {
+      db.prepare(`INSERT OR IGNORE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(since, "0", isoNow());
+    }
+  } catch { /* the next open records it */ }
+
   // SAME: Session tracking
   db.exec(`
     CREATE TABLE IF NOT EXISTS session_log (
@@ -1053,6 +1071,11 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       FOREIGN KEY (triggered_by) REFERENCES documents(id) ON DELETE CASCADE
     )
   `);
+  // 62.2 (codex T11 #1, T12 #1): which ClawMem wrote an evolution entry. This version stamps every entry it
+  // writes (`writer`); an older one cannot. The column and the evolution-writer floor are created together
+  // in one transaction (never in the CREATE above), so an unstamped entry above the floor came from an older
+  // process still running against the vault. Read-guarded; fail-closed: when it cannot commit, the open fails.
+  fenceEvolutionWriters(db);
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_evolution_memory_id ON memory_evolution(memory_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_evolution_triggered_by ON memory_evolution(triggered_by)`);
@@ -1377,6 +1400,11 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_run ON judge_events(run_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_action ON judge_events(action)`);
+
+  // 62.2 (codex T9 #3, T12 #2): an A-MEM note a legacy pre-compaction snapshot shaped (and one an older
+  // ClawMem evolved again after its reset) is cleared for a rebuild from its own document, and marked in its
+  // evolution history (compaction-state.ts). Read-guarded and fail-open: nothing to reset means no write.
+  resetLegacyDerivedNotes(db);
 }
 
 
@@ -2682,11 +2710,12 @@ export type DocumentRow = {
 // =============================================================================
 
 export function getHashesNeedingEmbedding(db: Database): number {
+  // Mirrors the embedding worklists: the legacy pre-compaction snapshot is never embedded (62.2).
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND v.hash IS NULL AND ${notLegacyArtifactSql("d")}
   `).get() as { count: number };
   return result.count;
 }
@@ -3247,12 +3276,15 @@ export function timeline(
   const collFilter = sameCollection ? "AND collection = ?" : "";
   const collArgs = sameCollection ? [focusRow.collection] : [];
 
+  // 62.2: the neighbours never include the legacy pre-compaction artifact (compaction-state.ts); the
+  // focus is the caller's own choice and is returned whatever it is.
   // 3. Before: documents modified before focus, closest first, compound ordering
   const beforeRows = db.prepare(`
     SELECT id, collection, path, title, content_type, modified_at
     FROM documents
     WHERE active = 1
       AND (modified_at < ? OR (modified_at = ? AND id < ?))
+      AND ${notLegacyArtifactSql("documents")}
       ${collFilter}
     ORDER BY modified_at DESC, id DESC
     LIMIT ?
@@ -3267,6 +3299,7 @@ export function timeline(
     FROM documents
     WHERE active = 1
       AND (modified_at > ? OR (modified_at = ? AND id > ?))
+      AND ${notLegacyArtifactSql("documents")}
       ${collFilter}
     ORDER BY modified_at ASC, id ASC
     LIMIT ?
@@ -3660,10 +3693,11 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
 }
 
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
+  // Suggestions are discovery by name: the legacy snapshot is never suggested (62.2).
   const allFiles = db.prepare(`
     SELECT d.path
     FROM documents d
-    WHERE d.active = 1
+    WHERE d.active = 1 AND ${notLegacyArtifactSql("d")}
   `).all() as { path: string }[];
   const queryLower = query.toLowerCase();
   const scored = allFiles
@@ -3675,6 +3709,8 @@ export function findSimilarFiles(db: Database, query: string, maxDistance: numbe
 }
 
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
+  // A glob is discovery by pattern, even one that spells the snapshot's name: the legacy snapshot is
+  // never matched (62.2). An exact path or docid still reaches it (findDocument / findDocuments).
   const allFiles = db.prepare(`
     SELECT
       'clawmem://' || d.collection || '/' || d.path as virtual_path,
@@ -3683,7 +3719,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
       d.collection
     FROM documents d
     JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
+    WHERE d.active = 1 AND ${notLegacyArtifactSql("d", "content.doc")}
   `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
 
   const glob = new Glob(pattern);
@@ -4115,6 +4151,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1 AND d.invalidated_at IS NULL
+      AND ${notLegacyArtifactSql("d", "content.doc")}
   `;
   const params: (string | number)[] = [ftsQuery];
 
@@ -4290,6 +4327,7 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+      AND ${notLegacyArtifactSql("d", "content.doc")}
   `;
   const params: string[] = [...hashSeqs];
 
@@ -4461,6 +4499,7 @@ export function projectVecResults(
       JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
       JOIN content ON content.hash = d.hash
       WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+        AND ${notLegacyArtifactSql("d", "content.doc")}
     `;
     const params: string[] = [...hashSeqs];
     if (opts.collections && opts.collections.length > 0) {
@@ -4625,6 +4664,7 @@ function hydrateVecResultsClassified(
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+      AND ${notLegacyArtifactSql("d", "content.doc")}
   `;
   const params: string[] = [...hashSeqs];
 
@@ -4818,7 +4858,8 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, deadl
 
 /**
  * Get all unique content hashes that need embeddings (from active documents).
- * Returns hash, document body, and a sample path for display purposes.
+ * Returns hash, document body, and a sample path for display purposes. The legacy pre-compaction
+ * snapshot is never sent to an embedding model (62.2).
  */
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
   return db.prepare(`
@@ -4826,7 +4867,7 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND v.hash IS NULL AND ${notLegacyArtifactSql("d", "c.doc")}
     GROUP BY d.hash
   `).all() as { hash: string; body: string; path: string }[];
 }
@@ -4845,6 +4886,8 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
   // MIN() per column can synthesize a tuple belonging to no document, which then produces a
   // canonicalDocId that matches nothing at doctor time. min(collection||'/'||path) picks a
   // deterministic real alias; the correlated join recovers that row's actual columns.
+  // The legacy pre-compaction snapshot is never sent to an embedding model, as a candidate or as the
+  // alias a shared hash is embedded under (62.2).
   return db.prepare(`
     SELECT g.hash, c.doc as body, d.path as path, d.title as title, d.collection as collection
     FROM (
@@ -4855,6 +4898,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
       WHERE dd.active = 1
         AND COALESCE(dd.embed_attempts, 0) < 3
         AND ((v.hash IS NULL OR v0.hash IS NULL) OR dd.embed_state IN ('pending', 'failed'))
+        AND ${notLegacyArtifactSql("dd")}
       GROUP BY dd.hash
     ) g
     JOIN documents d ON d.hash = g.hash AND d.active = 1 AND (d.collection || '/' || d.path) = g.canon_key
@@ -4908,8 +4952,10 @@ export function getVectorConsistency(db: Database): {
     for (const k of cvKeys) if (!vvKeys.has(k)) cvMissingVv++;
     let vvOrphan = 0;
     for (const k of vvKeys) if (!cvKeys.has(k)) vvOrphan++;
+    // Mirrors the worklist: a legacy snapshot copy is never embedded, so it is never "pending" (62.2).
     const pending = (db.prepare(
-      `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND (embed_state = 'pending' OR embed_state IS NULL)`
+      `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND (embed_state = 'pending' OR embed_state IS NULL)
+         AND ${notLegacyArtifactSql("documents")}`
     ).get() as { n: number }).n;
     return { cvCount: cvKeys.size, vvCount: vvKeys.size, cvMissingVv, vvOrphan, pending };
   })();
@@ -5707,6 +5753,17 @@ type DbDocRow = {
  * - Relative paths: path/to/file.md
  * - Short docid: #abc123 (first 6 chars of hash)
  */
+/** The active document whose display path (`collection/path`) is exactly `displayPath`, or null. */
+function findByDisplayPath(db: Database, selectCols: string, displayPath: string): DbDocRow | null {
+  return db.prepare(`
+    SELECT ${selectCols}
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.collection || '/' || d.path = ? AND d.active = 1
+    LIMIT 1
+  `).get(displayPath) as DbDocRow | null;
+}
+
 export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
@@ -5751,13 +5808,18 @@ export function findDocument(db: Database, filename: string, options: { includeB
     WHERE 'clawmem://' || d.collection || '/' || d.path = ? AND d.active = 1
   `).get(filepath) as DbDocRow | null;
 
-  // Try fuzzy match by virtual path
+  // Then by the display path (collection/path), exactly
+  if (!doc) doc = findByDisplayPath(db, selectCols, filepath);
+
+  // Try fuzzy match by virtual path. A suffix is discovery by pattern: it never resolves to the
+  // legacy snapshot, which the exact forms above and below still reach (62.2).
   if (!doc) {
     doc = db.prepare(`
       SELECT ${selectCols}
       FROM documents d
       JOIN content ON content.hash = d.hash
       WHERE 'clawmem://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+        AND ${notLegacyArtifactSql("d", "content.doc")}
       LIMIT 1
     `).get(`%${filepath}`) as DbDocRow | null;
   }
@@ -5914,12 +5976,15 @@ export function findDocuments(
         JOIN content ON content.hash = d.hash
         WHERE 'clawmem://' || d.collection || '/' || d.path = ? AND d.active = 1
       `).get(name) as DbDocRow | null;
+      if (!doc) doc = findByDisplayPath(db, selectCols, name);
       if (!doc) {
+        // A suffix is discovery by pattern: never the legacy snapshot (62.2).
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
           WHERE 'clawmem://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+            AND ${notLegacyArtifactSql("d", "content.doc")}
           LIMIT 1
         `).get(`%${name}`) as DbDocRow | null;
       }
@@ -6342,7 +6407,7 @@ function getDocumentsByTypeFn(db: Database, contentType: string, limit: number =
            LENGTH(c.doc) as bodyLength, d.pinned
     FROM documents d
     JOIN content c ON c.hash = d.hash
-    WHERE d.active = 1 AND d.content_type = ?
+    WHERE d.active = 1 AND d.content_type = ? AND ${notLegacyArtifactSql("d", "c.doc")}
     ORDER BY ${orderExpr} DESC
     LIMIT ?
   `).all(contentType, limit) as DocumentRow[];
@@ -6383,6 +6448,7 @@ function getStaleDocumentsFn(db: Database, beforeDate: string): DocumentRow[] {
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.review_by IS NOT NULL AND d.review_by != '' AND d.review_by <= ?
+      AND ${notLegacyArtifactSql("d", "c.doc")}
     ORDER BY d.review_by ASC
   `).all(beforeDate) as DocumentRow[];
 }
@@ -6559,11 +6625,12 @@ export function countActiveRelations(db: Database, relationType: string): number
 }
 
 export function buildTemporalBackbone(db: Database): number {
-  // Get all documents ordered by creation time
+  // Get all documents ordered by creation time. The legacy pre-compaction snapshot is never a graph
+  // node (62.2): the backbone steps over it.
   const docs = db.prepare(`
     SELECT id, created_at, modified_at
     FROM documents
-    WHERE active = 1
+    WHERE active = 1 AND ${notLegacyArtifactSql("documents")}
     ORDER BY created_at ASC
   `).all() as { id: number; created_at: string; modified_at: string }[];
 
@@ -6594,12 +6661,13 @@ export async function buildSemanticGraph(
   db: Database,
   threshold: number = 0.7
 ): Promise<number> {
-  // Query all documents with embeddings
+  // Query all documents with embeddings. The legacy pre-compaction snapshot is never a graph node,
+  // as a source or as a neighbour (62.2).
   const docs = db.prepare(`
     SELECT DISTINCT d.id, d.hash
     FROM documents d
     JOIN content_vectors cv ON d.hash = cv.hash
-    WHERE d.active = 1 AND cv.seq = 0
+    WHERE d.active = 1 AND cv.seq = 0 AND ${notLegacyArtifactSql("d")}
   `).all() as { id: number; hash: string }[];
 
   let edges = 0;
@@ -6618,6 +6686,7 @@ export async function buildSemanticGraph(
       WHERE v1.hash_seq = ? || '_0'
         AND d2.id != ?
         AND d2.active = 1
+        AND ${notLegacyArtifactSql("d2")}
         AND vec_distance_cosine(v1.embedding, v2.embedding) < ?
       ORDER BY distance
       LIMIT 10
@@ -6757,6 +6826,7 @@ function collectCausalEdges(
          WHERE mr.${nearCol} IN (${placeholders})
            AND mr.relation_type = 'causal'
            AND d.active = 1 AND d.invalidated_at IS NULL
+           AND ${notLegacyArtifactSql("d")}
          ORDER BY COALESCE(mr.weight, 1.0) DESC, mr.source_id, mr.target_id
          LIMIT ?`,
       ).all(...st.frontier, remaining) as Array<{
@@ -7004,6 +7074,9 @@ export function getEvolutionTimeline(
   if (limit < 1) limit = 1;
   if (limit > 100) limit = 100;
 
+  // Naming the focus document does not name its triggers: an entry the legacy snapshot triggered is
+  // dropped before the limit, and so is every later entry until the note's reset marker, since those
+  // carried the snapshot's text forward (62.2, `notLegacyTaintedEvolutionSql`).
   const query = `
     SELECT
       e.version,
@@ -7020,6 +7093,7 @@ export function getEvolutionTimeline(
     JOIN documents d ON d.id = e.triggered_by
     WHERE e.memory_id = ?
       AND d.active = 1
+      AND ${notLegacyTaintedEvolutionSql("e")}
     ORDER BY e.created_at DESC
     LIMIT ?
   `;

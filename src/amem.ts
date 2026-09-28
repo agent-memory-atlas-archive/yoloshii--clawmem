@@ -11,6 +11,7 @@ import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
 import type { Store } from "./store.ts";
 import { enrichDocumentEntities } from "./entity.ts";
+import { EVOLUTION_WRITER, notLegacyArtifactSql, notLegacyTaintedNoteSql } from "./compaction-state.ts";
 
 export interface MemoryNote {
   keywords: string[];
@@ -485,12 +486,12 @@ export async function constructMemoryNote(
   docId: number
 ): Promise<MemoryNote> {
   try {
-    // Get document info
+    // Get document info. The legacy pre-compaction snapshot is never an enrichment input (62.2).
     const doc = store.db.prepare(`
       SELECT d.collection, d.path, d.title, c.doc as body
       FROM documents d
       JOIN content c ON c.hash = d.hash
-      WHERE d.id = ? AND d.active = 1
+      WHERE d.id = ? AND d.active = 1 AND ${notLegacyArtifactSql("d", "c.doc")}
     `).get(docId) as { collection: string; path: string; title: string; body: string } | null;
 
     if (!doc) {
@@ -655,11 +656,13 @@ export async function generateMemoryLinks(
   kNeighbors: number = 8
 ): Promise<number> {
   try {
-    // Get source document info
+    // Get source document info. The legacy pre-compaction snapshot is never linked, and a note it shaped
+    // lends no context until its reset rebuilds it (62.2).
     const sourceDoc = store.db.prepare(`
-      SELECT d.id, d.hash, d.title, d.collection, d.path, d.amem_context
+      SELECT d.id, d.hash, d.title, d.collection, d.path,
+        CASE WHEN ${notLegacyTaintedNoteSql("d")} THEN d.amem_context END AS amem_context
       FROM documents d
-      WHERE d.id = ? AND d.active = 1
+      WHERE d.id = ? AND d.active = 1 AND ${notLegacyArtifactSql("d")}
     `).get(docId) as { id: number; hash: string; title: string; collection: string; path: string; amem_context: string | null } | null;
 
     if (!sourceDoc) {
@@ -691,13 +694,14 @@ export async function generateMemoryLinks(
         SELECT
           d2.id as target_id,
           d2.title as target_title,
-          d2.amem_context as target_context,
+          CASE WHEN ${notLegacyTaintedNoteSql("d2")} THEN d2.amem_context END as target_context,
           vec_distance_cosine(v1.embedding, v2.embedding) as distance
         FROM vectors_vec v1, vectors_vec v2
         JOIN documents d2 ON v2.hash_seq = d2.hash || '_0'
         WHERE v1.hash_seq = ? || '_0'
           AND d2.id != ?
           AND d2.active = 1
+          AND ${notLegacyArtifactSql("d2")}
         ORDER BY distance
         LIMIT ?
       `).all(sourceDoc.hash, sourceDoc.id, kNeighbors) as {
@@ -847,12 +851,15 @@ export async function evolveMemories(
   memoryId: number,
   triggeredBy: number
 ): Promise<boolean> {
+  // A note is never evidence for itself (62.2: a self-triggered entry is also the shape a reset marker takes).
+  if (memoryId === triggeredBy) return false;
   try {
-    // Get current memory state
+    // Get current memory state. Neither the memory nor any evidence below is the legacy
+    // pre-compaction snapshot, or a note it shaped that no reset has rebuilt yet (62.2).
     const memory = store.db.prepare(`
       SELECT id, title, amem_keywords, amem_tags, amem_context
       FROM documents
-      WHERE id = ? AND active = 1
+      WHERE id = ? AND active = 1 AND ${notLegacyArtifactSql("documents")} AND ${notLegacyTaintedNoteSql("documents")}
     `).get(memoryId) as {
       id: number;
       title: string;
@@ -879,6 +886,8 @@ export async function evolveMemories(
       WHERE mr.source_id = ?
         AND d.active = 1
         AND d.amem_context IS NOT NULL
+        AND ${notLegacyArtifactSql("d")}
+        AND ${notLegacyTaintedNoteSql("d")}
       ORDER BY mr.weight DESC
       LIMIT 5
     `).all(memoryId) as Array<{
@@ -1005,6 +1014,7 @@ If no evolution is needed:
       WHERE id = ?
     `);
 
+    // Stamped with this version's writer (62.2): an unstamped entry after the upgrade marks an older writer.
     const historyStmt = store.db.prepare(`
       INSERT INTO memory_evolution (
         memory_id,
@@ -1014,8 +1024,9 @@ If no evolution is needed:
         new_keywords,
         previous_context,
         new_context,
-        reasoning
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        reasoning,
+        writer
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '${EVOLUTION_WRITER}')
     `);
 
     try {

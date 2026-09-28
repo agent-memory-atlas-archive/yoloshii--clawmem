@@ -179,7 +179,7 @@ systemctl --user status clawmem-watcher.service
 | `sync_turn(user, assistant)` | Transcript JSONL append | Bridges Hermes turn pairs to ClawMem file format. Suppressed when `agent_context != "primary"`. |
 | `on_turn_start()` | — | Not overridden — base no-op |
 | `on_session_end(messages)` | `decision-extractor` + `handoff-generator` + `feedback-loop` | Parallel, 30s timeout each. Suppressed when `agent_context != "primary"`. |
-| `on_pre_compress(messages)` | `precompact-extract` | Side effect only (Hermes ignores return). Suppressed when `agent_context != "primary"`. |
+| `on_pre_compress(messages)` | `precompact-extract` | Side effect only (Hermes ignores return): stores the session-keyed pre-compaction state in the vault's `compaction_state` table, which nothing in Hermes reads back today. Suppressed when `agent_context != "primary"`. |
 | `on_memory_write()` | No-op | Avoids duplication with built-in memory (filesystem watcher already indexes MEMORY.md / USER.md if they live under a configured collection). |
 | `on_delegation()` | No-op | Subagent observation handled at the parent's primary context already; nothing useful to add here. |
 | `get_tool_schemas()` | 5 REST-backed tools | retrieve, get, session_log, timeline, similar |

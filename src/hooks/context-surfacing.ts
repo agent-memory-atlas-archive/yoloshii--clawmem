@@ -7,6 +7,7 @@
  */
 
 import type { Store, SearchResult } from "../store.ts";
+import { notLegacyArtifactSql } from "../compaction-state.ts";
 import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore, rerankTextHash, isProjectedVecResult } from "../store.ts";
 import { searchVecBounded } from "../vector-daemon.ts";
 import { getVaultPath, getActiveProfile, surfaceSecondaryVaults } from "../config.ts";
@@ -1691,8 +1692,8 @@ export function fetchRelationSnippets(
                 ds.title AS source_title,
                 dt.title AS target_title
          FROM memory_relations mr
-         JOIN documents ds ON ds.id = mr.source_id AND ds.active = 1
-         JOIN documents dt ON dt.id = mr.target_id AND dt.active = 1
+         JOIN documents ds ON ds.id = mr.source_id AND ds.active = 1 AND ${notLegacyArtifactSql("ds")}
+         JOIN documents dt ON dt.id = mr.target_id AND dt.active = 1 AND ${notLegacyArtifactSql("dt")}
          WHERE mr.source_id IN (${placeholders})
            AND mr.target_id IN (${placeholders})
            AND mr.source_id != mr.target_id

@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set, hook host-timeout vs internal-budget inequality since v0.38.0, and the compaction leftovers since v0.40.0: `postcompact-inject` under a matcher other than `compact`, old `precompact-state.md` files (red when one was written after the upgrade), indexed copies of them still active)
 clawmem rerank-health           # Live cache-bypassed reranker probe: coverage + discrimination check, and provider-identity attestation (v0.38.0 — a passing probe enables remote rerank-score caching; a failed or unfingerprintable probe REVOKES it)
 ```
 
@@ -142,6 +142,7 @@ clawmem hook decision-extractor
 clawmem hook handoff-generator
 clawmem hook feedback-loop
 clawmem hook precompact-extract
+clawmem hook postcompact-inject
 clawmem hook session-bootstrap
 clawmem hook staleness-check
 clawmem hook curator-nudge

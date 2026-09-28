@@ -7,6 +7,7 @@
  */
 
 import type { Store } from "../store.ts";
+import { notLegacyArtifactSql } from "../compaction-state.ts";
 import { toDate, epochNow } from "../clock.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
@@ -128,6 +129,7 @@ function findReviewDue(
       SELECT collection, path, title, review_by
       FROM documents
       WHERE active = 1
+        AND ${notLegacyArtifactSql("documents")}
         AND review_by IS NOT NULL
         AND review_by != ''
         AND review_by <= ?

@@ -20,6 +20,7 @@ import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 import { hashContent } from "./indexer.ts";
 import { passesMergeSafety } from "./text-similarity.ts";
 import { withWorkerLease } from "./worker-lease.ts";
+import { notLegacyArtifactSql, notLegacyTaintedNoteSql, resetLegacyDerivedNotes } from "./compaction-state.ts";
 import {
   evaluateMergeContradiction,
   persistMergeEvaluation,
@@ -398,14 +399,19 @@ export async function runConsolidationTick(
 }
 
 /**
- * Phase 1: Find and enrich up to 3 documents missing A-MEM metadata.
+ * Phase 1: Find and enrich up to 3 documents missing A-MEM metadata. The legacy pre-compaction
+ * snapshot is never selected (62.2): it is no enrichment input, and a selected row that can never
+ * gain a note would hold its slot on every run.
  */
 async function backfillAmem(store: Store, llm: LlamaCpp): Promise<void> {
+  // A long-lived worker resets notes a legacy snapshot shaped since this store opened (62.2), so the
+  // selection below rebuilds them from their own text.
+  resetLegacyDerivedNotes(store.db);
   const docs = store.db
     .prepare<DocumentToEnrich, []>(
       `SELECT id, hash, title
        FROM documents
-       WHERE amem_keywords IS NULL AND active = 1
+       WHERE amem_keywords IS NULL AND active = 1 AND ${notLegacyArtifactSql("documents")}
        ORDER BY created_at ASC
        LIMIT 3`
     )
@@ -499,12 +505,13 @@ export async function consolidateObservations(
     : [maxDocs];
 
   const observations = store.db.prepare(`
-    SELECT d.id, d.title, d.facts, d.amem_context as context, d.modified_at, d.collection
+    SELECT d.id, d.title, d.facts, CASE WHEN ${notLegacyTaintedNoteSql("d")} THEN d.amem_context END as context, d.modified_at, d.collection
     FROM documents d
     ${joinClause}
     WHERE d.active = 1
       AND d.content_type = 'observation'
       AND d.facts IS NOT NULL
+      AND ${notLegacyArtifactSql("d")}
       ${candidateFilter}
       AND d.id NOT IN (
         SELECT value FROM (
@@ -1096,6 +1103,7 @@ export async function generateDeductiveObservations(
       AND d.content_type IN (${DEDUCTIVE_TYPES.map(() => '?').join(',')})
       AND d.observation_type IS NOT NULL
       AND d.facts IS NOT NULL
+      AND ${notLegacyArtifactSql("d")}
       AND d.modified_at >= datetime('now', '-7 days')
       AND d.id NOT IN (
         SELECT value FROM (
@@ -1285,7 +1293,7 @@ Return ONLY the JSON array. /no_think`;
     //  - Else (no Jaccard matches at all) → insert as new.
     const existingDedups = store.db.prepare(`
       SELECT id, title FROM documents
-      WHERE content_type = 'deductive' AND active = 1
+      WHERE content_type = 'deductive' AND active = 1 AND ${notLegacyArtifactSql("documents")}
       ORDER BY created_at DESC LIMIT 20
     `).all() as { id: number; title: string }[];
 
@@ -1541,6 +1549,7 @@ export function computeSurprisalScores(
     JOIN content_vectors cv ON d.hash = cv.hash AND cv.seq = 0
     WHERE d.active = 1
       AND d.observation_type IS NOT NULL
+      AND ${notLegacyArtifactSql("d")}
   `;
   const params: any[] = [];
   if (options?.collection) {

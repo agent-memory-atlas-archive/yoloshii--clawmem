@@ -1,62 +1,37 @@
 /**
- * PreCompact hook — extracts session state before auto-compaction.
+ * PreCompact hook — extracts session state before compaction.
  *
- * Reads the full uncompressed transcript, extracts decisions and working
- * state via regex (no LLM calls), and writes a handoff file to Claude Code's
- * auto-memory directory. This file survives compaction and is automatically
- * reloaded by Claude Code.
+ * Reads the uncompressed transcript, extracts the last human request, decisions, open questions and
+ * file paths via regex (no LLM calls), and writes them as THIS session's pre-compaction state
+ * (`src/compaction-state.ts`). `postcompact-inject` reads it back on the same session's
+ * SessionStart(compact) and deletes it.
+ *
+ * 62.2: through v0.39.1 this wrote one `precompact-state.md` per project directory into Claude Code's
+ * auto-memory dir (read by every session there — CM-01), took the last user-ROLE entry (usually a
+ * tool result) as the request and mined tool traffic for decisions (CM-03), and re-indexed a
+ * collection from inside the hook (CM-04, NEW-2).
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { isoNow } from "../clock.ts";
-import { join, resolve } from "path";
 import {
   type HookInput,
   type HookOutput,
+  type TranscriptTurn,
   makeEmptyOutput,
-  readTranscript,
+  readTranscriptTurns,
   validateTranscriptPath,
   estimateTokens,
 } from "../hooks.ts";
 import type { Store } from "../store.ts";
 import { extractDecisions } from "./decision-extractor.ts";
-import { indexCollection } from "../indexer.ts";
-import { loadConfig } from "../collections.ts";
+import {
+  type CompactionExtract, beginCompaction, completeCompaction, discardCompactionState, isValidSessionId, registerCompaction,
+} from "../compaction-state.ts";
 
-// ---------------------------------------------------------------------------
-// Auto-memory path discovery
-// ---------------------------------------------------------------------------
-
-function getAutoMemoryDir(transcriptPath?: string): string | null {
-  // Best source: derive from transcript_path which is already
-  // ~/.claude/projects/<project-dir>/<session>.jsonl
-  if (transcriptPath) {
-    const projectDir = resolve(transcriptPath, "..");
-    const memDir = join(projectDir, "memory");
-    if (existsSync(memDir)) return memDir;
-    // Create it if the project dir exists
-    if (existsSync(projectDir)) {
-      try {
-        mkdirSync(memDir, { recursive: true });
-        return memDir;
-      } catch { /* fall through */ }
-    }
-  }
-
-  // Fallback: CWD-based lookup
-  const cwd = process.cwd();
-  const sanitized = cwd.replace(/\//g, "-").replace(/^-/, "");
-  const memDir = join(
-    process.env.HOME || "/tmp",
-    ".claude",
-    "projects",
-    sanitized,
-    "memory"
-  );
-  if (existsSync(memDir)) return memDir;
-
-  return null;
-}
+/** Decisions, questions and file paths come from the same recent window as before. */
+const RECENT_TURNS = 200;
+/** The last human request is searched further back: a long agentic stretch can bury it. */
+const REQUEST_SEARCH_TURNS = 2000;
 
 // ---------------------------------------------------------------------------
 // File path extraction from transcript
@@ -89,41 +64,18 @@ function extractFilePaths(messages: { role: string; content: string }[]): string
 }
 
 // ---------------------------------------------------------------------------
-// Last user request extraction
+// Last human request
 // ---------------------------------------------------------------------------
 
-function getLastUserRequest(messages: { role: string; content: string }[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]!;
-    if (msg.role === "user" && msg.content.length > 10) {
-      return msg.content.slice(0, 500);
+/** The last thing the user TYPED (over 10 chars) — never a tool result, meta entry or harness wrapper. */
+function getLastHumanRequest(turns: TranscriptTurn[]): string {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i]!;
+    if (t.kind === "human" && t.text.trim().length > 10) {
+      return t.text.trim().slice(0, 500);
     }
   }
   return "";
-}
-
-// ---------------------------------------------------------------------------
-// Tool output pruning — strip verbose tool results from messages
-// ---------------------------------------------------------------------------
-
-/**
- * Prune verbose tool output blocks from message content.
- * Keeps tool invocation lines but strips their large result payloads.
- */
-function pruneToolOutputs(content: string): string {
-  // Strip Read/Grep/Glob/Bash tool result blocks (multi-line outputs)
-  let pruned = content;
-
-  // Remove large indented tool output blocks (lines starting with spaces/tabs after tool mention)
-  pruned = pruned.replace(
-    /(?:Result of (?:calling |)(?:the )?(?:Read|Grep|Glob|Bash|Write|Edit|NotebookEdit) tool[^\n]*\n)(?:[ \t]+[^\n]*\n)*/gi,
-    ""
-  );
-
-  // Remove file content dumps (numbered lines like "     1→...")
-  pruned = pruned.replace(/(?:^ *\d+→[^\n]*\n){5,}/gm, "[file content pruned]\n");
-
-  return pruned;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,115 +148,80 @@ function rankDecisionsByRelevance(
 
 export async function precompactExtract(
   store: Store,
-  input: HookInput
+  input: HookInput,
+  /**
+   * `attempt`: the registration the CLI made BEFORE it opened the vault (null: that registration
+   * failed). Omitted, the hook registers here, on the store it was given.
+   */
+  opts: { attempt?: string | null } = {},
 ): Promise<HookOutput> {
+  // No usable session id → nothing can be scoped to a session, so nothing is written.
+  const sessionId = input.sessionId;
+  if (!isValidSessionId(sessionId)) return makeEmptyOutput("precompact-extract");
+
+  // FIRST, before reading anything: register a new attempt outside the vault, then open it in the
+  // vault. The registration alone makes the session's previous state ineligible, so from here on any
+  // failure (a busy vault, an unreadable transcript, nothing to extract, a crash, the host's timeout)
+  // leaves NO state — never an earlier compaction's snapshot for SessionStart(compact) to replay — and
+  // an older PreCompact that finishes later cannot store over this one.
+  const attempt = "attempt" in opts ? opts.attempt : registerCompaction(store, sessionId);
+  if (!attempt) {
+    // Unregistered: nothing this hook stores could be taken, and what it cannot supersede it clears.
+    discardCompactionState(store, sessionId);
+    process.stderr.write("precompact-extract: could not register a compaction attempt; nothing stored\n");
+    return makeEmptyOutput("precompact-extract");
+  }
+  if (!beginCompaction(store, sessionId, attempt)) {
+    process.stderr.write("precompact-extract: could not open a compaction attempt (vault busy); nothing stored\n");
+    return makeEmptyOutput("precompact-extract");
+  }
+
   const transcriptPath = validateTranscriptPath(input.transcriptPath ?? "");
-  if (!transcriptPath) {
-    return makeEmptyOutput("precompact-extract");
-  }
+  if (!transcriptPath) return makeEmptyOutput("precompact-extract");
 
-  const messages = readTranscript(transcriptPath, 200);
-  if (messages.length === 0) {
-    return makeEmptyOutput("precompact-extract");
-  }
+  const turns = readTranscriptTurns(transcriptPath, REQUEST_SEARCH_TURNS);
+  const recent = turns.slice(-RECENT_TURNS);
 
-  // Prune verbose tool outputs before extraction (keeps messages focused)
-  const prunedMessages = messages.map(m => ({
-    ...m,
-    content: m.role === "assistant" ? pruneToolOutputs(m.content) : m.content,
-  }));
+  // Decisions and open questions: human prompts and assistant PROSE only — tool input and tool
+  // output are never mined (CM-03). A decision's context is the preceding human turn.
+  const prose = recent
+    .filter(t => t.kind === "human" || t.kind === "assistant")
+    .map(t => ({ role: t.kind === "human" ? "user" : "assistant", content: t.text }));
+  // File paths keep reading the inline rendering, where tool calls carry their file_path.
+  const rendered = recent.map(t => ({ role: t.role, content: t.rendered }));
 
-  // Extract components (use pruned messages for decisions/questions, raw for file paths)
-  let decisions = extractDecisions(prunedMessages);
-  const lastRequest = getLastUserRequest(messages); // raw — need full user request
-  const filePaths = extractFilePaths(messages); // raw — need exact paths
-  const openQuestions = extractOpenQuestions(prunedMessages);
+  const lastRequest = getLastHumanRequest(turns);
+  const decisions = rankDecisionsByRelevance(extractDecisions(prose), lastRequest);
+  const filePaths = extractFilePaths(rendered);
+  const openQuestions = extractOpenQuestions(prose);
 
-  // Query-aware ranking: prioritize decisions relevant to the active task (E9)
-  decisions = rankDecisionsByRelevance(decisions, lastRequest);
-
-  // Skip if nothing meaningful extracted
+  // Nothing extracted: the attempt stays without a payload, so there is nothing to take.
   if (decisions.length === 0 && !lastRequest && filePaths.length === 0) {
     return makeEmptyOutput("precompact-extract");
   }
 
-  // Build the handoff document
-  const now = isoNow();
-  const sections: string[] = [
-    `# Pre-Compaction State`,
-    ``,
-    `_Extracted ${now.slice(0, 19)} before auto-compaction. This is authoritative._`,
-    ``,
-  ];
-
-  if (lastRequest) {
-    sections.push(`## Last User Request`, ``, lastRequest, ``);
+  const extract: CompactionExtract = {
+    trigger: input.trigger,
+    lastRequest,
+    decisions: decisions.slice(0, 15).map(d => ({ text: d.text, context: d.context })),
+    openQuestions,
+    filePaths,
+  };
+  if (!completeCompaction(store, sessionId, attempt, extract)) {
+    // Not stored: a newer PreCompact of this session began meanwhile, or the write failed.
+    // The audit row means "a snapshot was stored", so none is written.
+    process.stderr.write("precompact-extract: the session's compaction state was not stored\n");
+    return makeEmptyOutput("precompact-extract");
   }
 
-  if (decisions.length > 0) {
-    sections.push(`## Key Decisions This Session`, ``);
-    for (const d of decisions.slice(0, 15)) {
-      sections.push(`- ${d.text}`);
-      if (d.context) {
-        sections.push(`  > Context: ${d.context.slice(0, 150)}`);
-      }
-    }
-    sections.push(``);
-  }
-
-  if (openQuestions.length > 0) {
-    sections.push(`## Open Questions / Unresolved`, ``);
-    for (const q of openQuestions) {
-      sections.push(`- ${q}`);
-    }
-    sections.push(``);
-  }
-
-  if (filePaths.length > 0) {
-    sections.push(`## Files Modified This Session`, ``);
-    for (const p of filePaths) {
-      sections.push(`- ${p}`);
-    }
-    sections.push(``);
-  }
-
-  const content = sections.join("\n");
-
-  // Write to auto-memory
-  const memDir = getAutoMemoryDir(input.transcriptPath);
-  if (memDir) {
-    const statePath = join(memDir, "precompact-state.md");
-    try {
-      writeFileSync(statePath, content, "utf-8");
-    } catch (e) {
-      process.stderr.write(`precompact-extract: failed to write state: ${e}\n`);
-    }
-
-    // Reindex the auto-memory collection so extracted memories are immediately searchable
-    try {
-      const config = loadConfig();
-      const collectionsMap = config.collections || {};
-      // Find collection covering this memory dir
-      const memEntry = Object.entries(collectionsMap).find(([, c]) =>
-        memDir.startsWith(c.path) || c.path.startsWith(memDir)
-      );
-      if (memEntry) {
-        const [colName, col] = memEntry;
-        await indexCollection(store, colName, col.path, col.pattern || "**/*.md");
-      }
-    } catch (e) {
-      process.stderr.write(`precompact-extract: archive reindex failed (non-fatal): ${e}\n`);
-    }
-  }
-
-  // Audit trail
+  // Audit trail — written only for a stored snapshot
   try {
     store.insertUsage({
-      sessionId: input.sessionId || "unknown",
-      timestamp: now,
+      sessionId,
+      timestamp: isoNow(),
       hookName: "precompact-extract",
       injectedPaths: [],
-      estimatedTokens: estimateTokens(content),
+      estimatedTokens: estimateTokens(JSON.stringify(extract)),
       wasReferenced: 0,
     });
   } catch {

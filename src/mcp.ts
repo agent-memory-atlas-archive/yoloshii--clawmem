@@ -8,6 +8,7 @@
  */
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -487,10 +488,11 @@ This is the recommended entry point for ALL memory queries.`,
       `).get(collection, relativePath) as { collection: string; path: string; title: string; body: string } | null;
 
       if (!doc) {
+        // A suffix is discovery by pattern: never the legacy snapshot (62.2).
         doc = store.db.prepare(`
           SELECT d.collection, d.path, d.title, c.doc as body
           FROM documents d JOIN content c ON c.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1 LIMIT 1
+          WHERE d.path LIKE ? AND d.active = 1 AND ${notLegacyArtifactSql("d", "c.doc")} LIMIT 1
         `).get(`%${relativePath}`) as typeof doc;
       }
 
@@ -770,7 +772,8 @@ This is the recommended entry point for ALL memory queries.`,
                  d.collection || '/' || d.path as displayPath,
                  d.title, COALESCE(d.authored_at, d.modified_at) as effective_at
           FROM documents d
-          WHERE d.active = 1 AND d.invalidated_at IS NULL AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?${temporalExclSql}
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND ${notLegacyArtifactSql("d")}
+            AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?${temporalExclSql}
           ORDER BY COALESCE(d.authored_at, d.modified_at) DESC LIMIT 30
         `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; effective_at: string }[];
 
@@ -800,7 +803,7 @@ This is the recommended entry point for ALL memory queries.`,
               const doc = store.db.prepare(`
                 SELECT d.collection, d.path, d.title, c.doc as body
                 FROM documents d LEFT JOIN content c ON c.hash = d.hash
-                WHERE d.id = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
+                WHERE d.id = ? AND d.active = 1 AND d.invalidated_at IS NULL AND ${notLegacyArtifactSql("d", "c.doc")} LIMIT 1
               `).get(en.docId) as { collection: string; path: string; title: string; body: string | null } | undefined;
               if (!doc) return null;
               if (excl && excl.includes(doc.collection)) return null;
@@ -875,7 +878,8 @@ This is the recommended entry point for ALL memory queries.`,
             const doc = store.db.prepare(`
               SELECT d.hash, d.collection, d.path, d.title, d.modified_at, c.doc as body
               FROM documents d LEFT JOIN content c ON c.hash = d.hash
-              WHERE 'clawmem://' || d.collection || '/' || d.path = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
+              WHERE 'clawmem://' || d.collection || '/' || d.path = ? AND d.active = 1 AND d.invalidated_at IS NULL
+                AND ${notLegacyArtifactSql("d", "c.doc")} LIMIT 1
             `).get(b.file) as { hash: string; collection: string; path: string; title: string; modified_at: string; body: string | null } | undefined;
             if (doc) {
               return {
@@ -953,6 +957,8 @@ This is the recommended entry point for ALL memory queries.`,
     title: string;
     score: number;
     source: "path" | "fts" | "title" | "vec";
+    /** An exact path that names more than one document: the caller must choose (never auto-selected). */
+    ambiguousPath?: boolean;
   };
 
   const STOPWORDS = new Set([
@@ -971,13 +977,31 @@ This is the recommended entry point for ALL memory queries.`,
     query: string,
     limit: number = 5
   ): Promise<LifecycleCandidate[]> {
-    // 1. Exact path match (handles queries like "stack/research/foo.md")
+    // 1. Path match (handles queries like "stack/research/foo.md"): an exact path first, then a
+    //    substring. A path named exactly may target the legacy pre-compaction snapshot; a substring is
+    //    discovery and never does (62.2). Exact means one document: the display path (`collection/path`)
+    //    is resolved first, and a bare relative path only when a single collection holds it; one that
+    //    names several documents is returned as an ambiguity, never auto-selected.
     if (query.includes("/") || query.endsWith(".md")) {
       const normalized = query.replace(/^\//, "");
+      const exactBy = (column: string) => store.db.prepare(`
+        SELECT collection || '/' || path as displayPath, title
+        FROM documents WHERE active = 1 AND invalidated_at IS NULL AND ${column} = ?
+        ORDER BY collection, path
+        LIMIT ?
+      `).all(normalized, limit + 1) as { displayPath: string; title: string }[];
+      for (const column of ["collection || '/' || path", "path"]) {
+        const exactHits = exactBy(column);
+        if (exactHits.length === 1) return [{ ...exactHits[0]!, score: 1.0, source: "path" as const }];
+        if (exactHits.length > 1) {
+          return exactHits.slice(0, limit).map(h => ({ ...h, score: 1.0, source: "path" as const, ambiguousPath: true }));
+        }
+      }
       const pathHits = store.db.prepare(`
         SELECT collection || '/' || path as displayPath, title
         FROM documents WHERE active = 1 AND invalidated_at IS NULL
         AND (path LIKE ? OR collection || '/' || path LIKE ?)
+        AND ${notLegacyArtifactSql("documents")}
         LIMIT ?
       `).all(`%${normalized}%`, `%${normalized}%`, limit) as { displayPath: string; title: string }[];
       if (pathHits.length > 0) {
@@ -1009,7 +1033,7 @@ This is the recommended entry point for ALL memory queries.`,
           SELECT collection || '/' || path as displayPath, title, modified_at,
             ${tokens.map(() => `(CASE WHEN LOWER(title) LIKE ? THEN 1 ELSE 0 END)`).join(" + ")} as match_count
           FROM documents
-          WHERE active = 1 AND invalidated_at IS NULL
+          WHERE active = 1 AND invalidated_at IS NULL AND ${notLegacyArtifactSql("documents")}
         ) WHERE match_count >= ?
         ORDER BY match_count DESC, modified_at DESC
         LIMIT ?
@@ -1058,6 +1082,11 @@ This is the recommended entry point for ALL memory queries.`,
   ): { target: LifecycleCandidate } | { ambiguous: string } | { notFound: string } {
     if (candidates.length === 0) {
       return { notFound: `No matching memory found for "${query}"` };
+    }
+
+    if (candidates.some(c => c.ambiguousPath)) {
+      const list = candidates.map((c, i) => `${i + 1}. ${c.displayPath} — "${c.title}"`).join("\n");
+      return { ambiguous: `"${query}" names more than one document. Use its collection/path:\n${list}` };
     }
 
     const top = candidates[0]!;

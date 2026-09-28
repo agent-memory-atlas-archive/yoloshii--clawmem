@@ -8,6 +8,7 @@
 import type { Database } from "bun:sqlite";
 import type { IntentType } from "./intent.ts";
 import { getIntentWeights } from "./intent.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 
 // =============================================================================
 // Types
@@ -15,7 +16,8 @@ import { getIntentWeights } from "./intent.ts";
 
 /**
  * Candidate-eligibility policy (v0.32.0). Collection scoping and the effective-time window are
- * caller-supplied; the CORE predicates — active = 1, invalidated_at IS NULL, and the
+ * caller-supplied; the CORE predicates — active = 1, invalidated_at IS NULL, not the legacy
+ * pre-compaction artifact (62.2), and the
  * COALESCE(authored_at, modified_at) effective-time axis for any time window — are baked into
  * every traversal SQL and cannot be waived by any caller. Ineligible rows are pruned in the
  * neighbor/edge queries themselves — BEFORE beam selection, per-node top-k, and mass
@@ -28,7 +30,8 @@ export interface CandidateEligibility {
 }
 
 export function eligibilitySql(alias: string, e: CandidateEligibility | undefined): { sql: string; params: string[] } {
-  const clauses = [`${alias}.active = 1`, `${alias}.invalidated_at IS NULL`];
+  // 62.2: the legacy pre-compaction artifact is never a traversal candidate (compaction-state.ts).
+  const clauses = [`${alias}.active = 1`, `${alias}.invalidated_at IS NULL`, notLegacyArtifactSql(alias)];
   const params: string[] = [];
   if (e?.allowCollections && e.allowCollections.length > 0) {
     clauses.push(`${alias}.collection IN (${e.allowCollections.map(() => "?").join(",")})`);

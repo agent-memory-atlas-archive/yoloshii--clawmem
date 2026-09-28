@@ -20,6 +20,7 @@ import { listCollections } from "./collections.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal-retrieval.ts";
 import { capCausalWire } from "./causal-reader.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
@@ -553,7 +554,12 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
 
 // --- Export ---
 
-function handleExport(_req: Request, _url: URL, store: Store): Response {
+function handleExport(_req: Request, url: URL, store: Store): Response {
+  // An export returns the body of every active document, named by nobody, so by default the legacy
+  // pre-compaction snapshot is left out, as from a glob (62.2). `?full=true` asks for it explicitly: every
+  // active document. (Neither is a backup of the vault: inactive rows and other tables are not exported.)
+  // The response counts what the default left out, so the omission is never silent.
+  const full = queryBool(url, "full", false);
   const docs = store.db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.content_type, d.confidence,
            d.access_count, d.quality_score, d.pinned, d.created_at, d.modified_at,
@@ -561,14 +567,19 @@ function handleExport(_req: Request, _url: URL, store: Store): Response {
            c.doc as body
     FROM documents d
     JOIN content c ON c.hash = d.hash
-    WHERE d.active = 1
+    WHERE d.active = 1${full ? "" : ` AND ${notLegacyArtifactSql("d", "c.doc")}`}
     ORDER BY d.collection, d.path
   `).all() as any[];
+  const excluded = full ? 0 : (store.db.prepare(
+    `SELECT COUNT(*) AS n FROM documents d WHERE d.active = 1 AND NOT ${notLegacyArtifactSql("d")}`
+  ).get() as { n: number }).n;
 
   return jsonResponse({
     version: "1.0.0",
     exported_at: isoNow(),
     count: docs.length,
+    full,
+    legacy_snapshots_excluded: excluded,
     documents: docs,
   });
 }

@@ -583,8 +583,8 @@ class ClawMemProvider(MemoryProvider):
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Run precompact-extract (side effect only — Hermes ignores return).
 
-        Suppressed for non-primary agent contexts so the precompact state file
-        in auto-memory never picks up cron/subagent context as primary state.
+        Suppressed for non-primary agent contexts so the session's pre-compaction
+        state never picks up cron/subagent context as primary state.
         """
         if self._agent_context != "primary":
             return ""

@@ -382,7 +382,7 @@ CLAWMEM_API_TOKEN=secret ./bin/clawmem serve # with bearer token auth
 | POST | `/lifecycle/sweep` | Archive stale docs (dry_run default) |
 | GET | `/graph/causal/:docid` | Causal chain traversal |
 | GET | `/graph/similar/:docid` | k-NN neighbors |
-| GET | `/export` | Full vault export as JSON |
+| GET | `/export` | Active-document export as JSON (`?full=true` includes legacy `precompact-state.md` snapshot copies) |
 | POST | `/reindex` | Trigger re-scan |
 | POST | `/graphs/build` | Rebuild temporal + semantic graphs |
 
@@ -627,9 +627,9 @@ Hooks installed by `clawmem setup hooks`:
 | Hook | Event | What It Does |
 |---|---|---|
 | `context-surfacing` | UserPromptSubmit | Retrieval gate → lane-based hybrid search (BM25 + vector + file-aware (E13) + gated prior-turn + deep expansion variants) → weighted RRF fusion onto one channel-aware ordering key → snooze/noise filters → relevance admission with query-level abstention (v0.38.0) → tiered injection (HOT/WARM/COLD) → `<vault-context>` + `<vault-routing>` hint. Profile-driven budget/results/timeout; `CLAWMEM_HOOK_BUDGET_MS` is the authoritative internal deadline. |
-| `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
+| `postcompact-inject` | SessionStart (compact) | Re-injects context after compaction, framed as reference data: this session's pre-compaction state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
-| `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
+| `precompact-extract` | PreCompact | Extracts the last typed request, decisions, file paths and open questions before compaction → the vault's session-keyed `compaction_state` row, taken once by the same session's `postcompact-inject` |
 | `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries), infers causal links, detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0) |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation + usage relations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
@@ -880,11 +880,10 @@ The primary workspace where the agent operates. Path varies by client (e.g., `~/
 │   │   ├── profile.md               #     Static facts + dynamic context
 │   │   ├── preferences/             #     Extracted preferences (update_existing merge policy)
 │   │   └── entities/                #     Named entities (people, services, repos)
-│   ├── agent/                       #   Agent memories (operational, session-derived)
-│   │   ├── observations/            #     Decisions + observations from transcripts
-│   │   ├── handoffs/                #     Session summaries with next steps
-│   │   └── antipatterns/            #     Accumulated negative patterns (∞ half-life)
-│   └── precompact-state.md          #   Pre-compaction snapshot (transient)
+│   └── agent/                       #   Agent memories (operational, session-derived)
+│       ├── observations/            #     Decisions + observations from transcripts
+│       ├── handoffs/                #     Session summaries with next steps
+│       └── antipatterns/            #     Accumulated negative patterns (∞ half-life)
 └── ...
 ```
 
@@ -907,12 +906,11 @@ Each project gets its own collection. Same structure, with optional Beads integr
 ├── _clawmem/                        # Auto-generated per-project
 │   ├── user/
 │   │   └── preferences/
-│   ├── agent/
-│   │   ├── observations/
-│   │   ├── handoffs/
-│   │   ├── antipatterns/
-│   │   └── beads/                   #   Beads issues as searchable markdown
-│   └── precompact-state.md
+│   └── agent/
+│       ├── observations/
+│       ├── handoffs/
+│       ├── antipatterns/
+│       └── beads/                   #   Beads issues as searchable markdown
 ├── CLAUDE.md
 ├── src/
 └── README.md

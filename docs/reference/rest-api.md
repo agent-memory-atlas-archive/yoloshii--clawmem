@@ -171,7 +171,7 @@ do not break.
 | GET | `/profile` | Get user profile |
 | POST | `/reindex` | Trigger re-scan. Response includes `enrichAttempted`/`enrichStored` note counters (v0.37.0) — a run whose enrichment produced nothing is visible, not an unqualified success |
 | POST | `/graphs/build` | Rebuild temporal + semantic graphs |
-| GET | `/export` | Full vault export as JSON |
+| GET | `/export` | Vault export as JSON: every active document except copies of the `precompact-state.md` snapshot ClawMem ≤ v0.39.x left in Claude Code memory dirs, counted in `legacy_snapshots_excluded`. `?full=true` includes them: every active document. Inactive documents and the vault's other tables are not exported; back up the SQLite file itself for that |
 
 ## Response format
 

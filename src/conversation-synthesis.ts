@@ -26,6 +26,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { isoNow } from "./clock.ts";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
@@ -368,6 +369,7 @@ export function resolveLinkTarget(
          WHERE collection = ?
            AND active = 1
            AND LOWER(TRIM(title)) = ?
+           AND ${notLegacyArtifactSql("documents")}
          ORDER BY created_at DESC
          LIMIT 2`,
       )
@@ -485,6 +487,7 @@ export async function runConversationSynthesis(
          WHERE d.collection = ?
            AND d.active = 1
            AND d.content_type IN (${placeholders})
+           AND ${notLegacyArtifactSql("d", "c.doc")}
          ORDER BY d.created_at ASC, d.id ASC
          LIMIT ?`,
       )

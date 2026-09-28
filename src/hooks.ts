@@ -19,6 +19,10 @@ export type HookInput = {
   transcriptPath?: string;
   hookEventName?: string;
   toolInput?: Record<string, unknown>;
+  /** SessionStart: "startup" | "resume" | "clear" | "compact" (62.2 — postcompact-inject runs on "compact" only). */
+  source?: string;
+  /** PreCompact: "manual" | "auto". */
+  trigger?: string;
 };
 
 export type HookOutput = {
@@ -58,6 +62,8 @@ export async function readHookInput(): Promise<HookInput> {
       transcriptPath: parsed.transcript_path ?? parsed.transcriptPath,
       hookEventName: parsed.hook_event_name ?? parsed.hookEventName,
       toolInput: parsed.tool_input ?? parsed.toolInput,
+      source: typeof parsed.source === "string" ? parsed.source : undefined,
+      trigger: typeof parsed.trigger === "string" ? parsed.trigger : undefined,
     };
   } catch {
     return {};
@@ -265,6 +271,74 @@ export type TranscriptMessage = {
 };
 
 /**
+ * The non-empty JSONL lines at the tail of a transcript. Throws on I/O errors (callers catch).
+ * Shared by `readTranscript` and `readTranscriptTurns` so both see the same window.
+ */
+function readTranscriptTailLines(transcriptPath: string, lastN: number): string[] {
+  const fs = require("fs");
+  const stat = fs.statSync(transcriptPath);
+  let content: string;
+
+  // For large transcripts (>10MB), read backwards in chunks until we have enough lines
+  if (stat.size > 10 * 1024 * 1024) {
+    const chunkSize = 2 * 1024 * 1024; // 2MB chunks
+    const maxChunks = 5; // Up to 10MB of tail
+    const targetLines = lastN * 3; // Overshoot — not all lines are role messages
+    const buffers: Buffer[] = [];
+    let totalRead = 0;
+
+    // Accumulate raw Buffers (decode once after assembly to avoid UTF-8 boundary corruption)
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      for (let chunk = 0; chunk < maxChunks; chunk++) {
+        const readSize = Math.min(chunkSize, stat.size - totalRead);
+        if (readSize <= 0) break;
+        const offset = Math.max(0, stat.size - totalRead - readSize);
+        const buf = Buffer.alloc(readSize);
+        fs.readSync(fd, buf, 0, readSize, offset);
+        buffers.unshift(buf);
+        totalRead += readSize;
+
+        // Check line count on decoded text to see if we have enough
+        const decoded = Buffer.concat(buffers).toString("utf-8");
+        if (decoded.split("\n").length >= targetLines) break;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const assembled = Buffer.concat(buffers).toString("utf-8");
+    // Drop first partial line (we likely started mid-line)
+    const firstNewline = assembled.indexOf("\n");
+    content = firstNewline > 0 ? assembled.slice(firstNewline + 1) : assembled;
+  } else {
+    content = fs.readFileSync(transcriptPath, "utf-8");
+  }
+
+  return content.split("\n").filter((l: string) => l.trim());
+}
+
+/**
+ * An entry's content as one string: text blocks verbatim, tool_use / tool_result blocks rendered
+ * inline. This is the rendering the Stop hooks consume through `readTranscript`.
+ */
+function renderTranscriptContent(content: any): string {
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((b: any) => {
+            if (b.type === "text") return b.text;
+            if (b.type === "tool_use") return `[tool_use name="${b.name}" id="${b.id}"] ${JSON.stringify(b.input ?? {})}`;
+            if (b.type === "tool_result") return `[tool_result id="${b.tool_use_id}"] ${typeof b.content === "string" ? b.content.slice(0, 500) : ""}`;
+            return "";
+          })
+          .filter((s: string) => s)
+          .join("\n")
+      : JSON.stringify(content);
+}
+
+/**
  * Read and parse a Claude Code transcript (.jsonl file).
  * Returns the last N messages.
  */
@@ -274,47 +348,7 @@ export function readTranscript(
   roleFilter?: "user" | "assistant"
 ): TranscriptMessage[] {
   try {
-    const fs = require("fs");
-    const stat = fs.statSync(transcriptPath);
-    let content: string;
-
-    // For large transcripts (>10MB), read backwards in chunks until we have enough lines
-    if (stat.size > 10 * 1024 * 1024) {
-      const chunkSize = 2 * 1024 * 1024; // 2MB chunks
-      const maxChunks = 5; // Up to 10MB of tail
-      const targetLines = lastN * 3; // Overshoot — not all lines are role messages
-      const buffers: Buffer[] = [];
-      let totalRead = 0;
-
-      // Accumulate raw Buffers (decode once after assembly to avoid UTF-8 boundary corruption)
-      const fd = fs.openSync(transcriptPath, "r");
-      try {
-        for (let chunk = 0; chunk < maxChunks; chunk++) {
-          const readSize = Math.min(chunkSize, stat.size - totalRead);
-          if (readSize <= 0) break;
-          const offset = Math.max(0, stat.size - totalRead - readSize);
-          const buf = Buffer.alloc(readSize);
-          fs.readSync(fd, buf, 0, readSize, offset);
-          buffers.unshift(buf);
-          totalRead += readSize;
-
-          // Check line count on decoded text to see if we have enough
-          const decoded = Buffer.concat(buffers).toString("utf-8");
-          if (decoded.split("\n").length >= targetLines) break;
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-
-      const assembled = Buffer.concat(buffers).toString("utf-8");
-      // Drop first partial line (we likely started mid-line)
-      const firstNewline = assembled.indexOf("\n");
-      content = firstNewline > 0 ? assembled.slice(firstNewline + 1) : assembled;
-    } else {
-      content = fs.readFileSync(transcriptPath, "utf-8");
-    }
-
-    const lines = content.split("\n").filter((l: string) => l.trim());
+    const lines = readTranscriptTailLines(transcriptPath, lastN);
     const messages: TranscriptMessage[] = [];
 
     for (const line of lines) {
@@ -324,19 +358,7 @@ export function readTranscript(
         const msg = entry.message ?? entry;
         if (msg.role && msg.content) {
           const role = msg.role as TranscriptMessage["role"];
-          const text = typeof msg.content === "string"
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content
-                  .map((b: any) => {
-                    if (b.type === "text") return b.text;
-                    if (b.type === "tool_use") return `[tool_use name="${b.name}" id="${b.id}"] ${JSON.stringify(b.input ?? {})}`;
-                    if (b.type === "tool_result") return `[tool_result id="${b.tool_use_id}"] ${typeof b.content === "string" ? b.content.slice(0, 500) : ""}`;
-                    return "";
-                  })
-                  .filter((s: string) => s)
-                  .join("\n")
-              : JSON.stringify(msg.content);
+          const text = renderTranscriptContent(msg.content);
 
           if (!roleFilter || role === roleFilter) {
             messages.push({ role, content: text });
@@ -348,6 +370,148 @@ export function readTranscript(
     }
 
     return messages.slice(-lastN);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * What an entry IS, as opposed to its role. Claude Code writes tool results, skill expansions,
+ * slash-command records, local-command output, task notifications and compact summaries as
+ * user-ROLE entries; only `human` is something the user typed.
+ */
+export type TranscriptTurnKind = "human" | "assistant" | "tool_result" | "meta";
+
+export type TranscriptTurn = {
+  role: string;
+  kind: TranscriptTurnKind;
+  /**
+   * Assistant: text blocks only (no tool_use rendering). Human: the typed text with host-injected
+   * context blocks stripped, or "/name args" for a slash command that carries a task. Others: "".
+   */
+  text: string;
+  /** The same entry as `readTranscript` renders it. */
+  rendered: string;
+  /** Set on a human turn that is a slash command's task ("/name args"). */
+  command?: true;
+};
+
+/**
+ * The top-level blocks of `text` when it is nothing but one or more complete tag-wrapped blocks
+ * (whitespace between them); null otherwise. Linear scan, no backtracking regex over user text.
+ */
+function topLevelBlocks(text: string): { tag: string; inner: string }[] | null {
+  const blocks: { tag: string; inner: string }[] = [];
+  let i = 0;
+  const n = text.length;
+  while (true) {
+    while (i < n && /\s/.test(text[i]!)) i++;
+    if (i >= n) return blocks.length > 0 ? blocks : null;
+    const open = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/.exec(text.slice(i, i + 200));
+    if (!open) return null;
+    const tag = open[1]!;
+    const innerStart = i + open[0].length;
+    const close = text.indexOf(`</${tag}>`, innerStart);
+    if (close < 0) return null;
+    blocks.push({ tag, inner: text.slice(innerStart, close) });
+    i = close + tag.length + 3;
+  }
+}
+
+/**
+ * The records Claude Code writes as user-role entries on the user's behalf, by their top-level tag:
+ * slash-command records, local-command output and its caveat, task notifications, bash-mode I/O,
+ * `#` memory input, and system reminders. An entry is a host record only when EVERY top-level block
+ * is one of these; anything else (a prompt made of the user's own markup, `<task>…</task>`) is typed
+ * text. A wrapper the host introduces later reads as typed text until it is added here.
+ */
+export const HOST_RECORD_TAGS: ReadonlySet<string> = new Set([
+  "command-name", "command-message", "command-args",
+  "local-command-stdout", "local-command-stderr", "local-command-caveat",
+  "task-notification",
+  "bash-input", "bash-stdout", "bash-stderr",
+  "user-memory-input",
+  "system-reminder",
+]);
+
+/**
+ * A slash-command record's task: "/name args". `null` = a command record without a task (no
+ * arguments, or `/compact`, whose arguments are compaction instructions). Only TOP-LEVEL
+ * `command-name` / `command-args` blocks count.
+ */
+function commandTask(blocks: { tag: string; inner: string }[]): string | null {
+  const name = blocks.find(b => b.tag === "command-name")?.inner.trim();
+  if (!name || name === "/compact") return null;
+  const args = blocks.find(b => b.tag === "command-args")?.inner.trim() ?? "";
+  return args ? `${name} ${args}` : null;
+}
+
+/** Context blocks a host may prepend to the user's prompt (ClawMem's own, and system reminders). */
+const INJECTED_BLOCK_RE = /<(vault-[a-z-]+|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/g;
+
+function transcriptTextBlocks(content: any): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b: any) => b && b.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text)
+    .join("\n");
+}
+
+/** The entry's kind, and for human turns the typed text (injected context blocks stripped). */
+function classifyTranscriptEntry(entry: any, msg: any): { kind: TranscriptTurnKind; text: string; command?: true } {
+  if (msg.role === "assistant") return { kind: "assistant", text: transcriptTextBlocks(msg.content) };
+  if (msg.role === "toolResult" || msg.role === "tool") return { kind: "tool_result", text: "" }; // OpenClaw / generic
+  if (msg.role !== "user") return { kind: "meta", text: "" };
+  if (entry.isMeta || entry.isCompactSummary || entry.isVisibleInTranscriptOnly) return { kind: "meta", text: "" };
+  if (entry.toolUseResult !== undefined) return { kind: "tool_result", text: "" };
+  if (Array.isArray(msg.content) && msg.content.some((b: any) => b && b.type === "tool_result")) {
+    return { kind: "tool_result", text: "" };
+  }
+  const text = transcriptTextBlocks(msg.content);
+  if (text.trimStart().startsWith("[Request interrupted by user")) return { kind: "meta", text: "" };
+  const blocks = topLevelBlocks(text);
+  if (blocks && blocks.every(b => HOST_RECORD_TAGS.has(b.tag))) {
+    const task = blocks.some(b => b.tag === "command-name") ? commandTask(blocks) : null;
+    return typeof task === "string" ? { kind: "human", text: task, command: true } : { kind: "meta", text: "" };
+  }
+  return { kind: "human", text: text.replace(INJECTED_BLOCK_RE, "").trim() };
+}
+
+/** Claude Code follows a LOCAL (built-in) command's record with its output; a prompt command expands instead. */
+const LOCAL_COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
+
+/**
+ * Read a transcript as classified turns (62.2, CM-03). The window matches `readTranscript`'s
+ * (the last N parsed entries); entries without a role or content are skipped, as there.
+ */
+export function readTranscriptTurns(transcriptPath: string, lastN: number = 200): TranscriptTurn[] {
+  try {
+    const turns: TranscriptTurn[] = [];
+    for (const line of readTranscriptTailLines(transcriptPath, lastN)) {
+      try {
+        const entry = JSON.parse(line);
+        const msg = entry.message ?? entry;
+        if (!msg.role || !msg.content) continue;
+        const { kind, text, command } = classifyTranscriptEntry(entry, msg);
+        const turn: TranscriptTurn = { role: String(msg.role), kind, text, rendered: renderTranscriptContent(msg.content) };
+        if (command) turn.command = true;
+        turns.push(turn);
+      } catch {
+        // Skip malformed lines
+      }
+    }
+    // A built-in command (`/model sonnet`) is a setting change, not a task: its record is followed by
+    // local-command output. Only prompt commands (skills, custom commands) keep their arguments as a task.
+    for (let i = 0; i < turns.length - 1; i++) {
+      const t = turns[i]!;
+      if (t.command && LOCAL_COMMAND_OUTPUT_RE.test(turns[i + 1]!.rendered)) {
+        t.kind = "meta";
+        t.text = "";
+        delete t.command;
+      }
+    }
+    return turns.slice(-lastN);
   } catch {
     return [];
   }

@@ -8,6 +8,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { notLegacyArtifactSql } from "./compaction-state.ts";
 import { createHash } from "crypto";
 import type { LLM } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
@@ -621,11 +622,12 @@ export async function enrichDocumentEntities(
     // Get document content (snapshot for extraction)
     // v0.8.3 (§1.5): fetch content_type so extractEntities can apply a
     // content-type-aware cap instead of the flat slice(0, 10).
+    // The legacy pre-compaction snapshot is never an extraction input (62.2).
     const doc = db.prepare(`
       SELECT d.title, d.content_type, c.doc as body
       FROM documents d
       JOIN content c ON c.hash = d.hash
-      WHERE d.id = ? AND d.active = 1
+      WHERE d.id = ? AND d.active = 1 AND ${notLegacyArtifactSql("d", "c.doc")}
     `).get(docId) as { title: string; content_type: string | null; body: string } | null;
 
     if (!doc) {
@@ -651,7 +653,7 @@ export async function enrichDocumentEntities(
     // Recheck input hash before writing — abort if content changed during LLM call
     const recheckHash = db.prepare(`
       SELECT d.title, c.doc as body FROM documents d
-      JOIN content c ON c.hash = d.hash WHERE d.id = ? AND d.active = 1
+      JOIN content c ON c.hash = d.hash WHERE d.id = ? AND d.active = 1 AND ${notLegacyArtifactSql("d", "c.doc")}
     `).get(docId) as { title: string; body: string } | null;
 
     if (!recheckHash || computeInputHash(recheckHash.title, recheckHash.body) !== inputHash) {
@@ -763,7 +765,7 @@ export async function enrichDocumentEntities(
         const otherDocs = db.prepare(`
           SELECT em.doc_id FROM entity_mentions em
           JOIN documents d ON d.id = em.doc_id
-          WHERE em.entity_id = ? AND em.doc_id != ? AND d.active = 1
+          WHERE em.entity_id = ? AND em.doc_id != ? AND d.active = 1 AND ${notLegacyArtifactSql("d")}
           LIMIT 20
         `).all(entityId, docId) as { doc_id: number }[];
 
@@ -927,7 +929,7 @@ export function getEntityGraphNeighbors(
   for (const co of scored) {
     const docs = db.prepare(`
       SELECT em.doc_id FROM entity_mentions em
-      JOIN documents d ON d.id = em.doc_id AND d.active = 1
+      JOIN documents d ON d.id = em.doc_id AND d.active = 1 AND ${notLegacyArtifactSql("d")}
       WHERE em.entity_id = ?
       LIMIT 10
     `).all(co.neighborEntity) as { doc_id: number }[];

@@ -156,7 +156,7 @@ This is not a breaking change dressed up as a refactor. It is ClawMem moving int
 
 ### Precompact state capture — where it actually runs
 
-ClawMem does not own a compaction algorithm. It uses OpenClaw's built-in runtime compactor, and its only job on the compaction path is to run `precompact-extract` (which writes decisions, file paths, and open questions to auto-memory) **before** the compactor mutates the transcript.
+ClawMem does not own a compaction algorithm. It uses OpenClaw's built-in runtime compactor, and its only job on the compaction path is to run `precompact-extract` (which writes the session's decisions, file paths, and open questions to the vault's session-keyed `compaction_state` table) **before** the compactor mutates the transcript. No OpenClaw hook reads that state back after compaction today; rows are kept per session and swept after 7 days.
 
 The load-bearing surface for that extraction is `before_prompt_build`, not `before_compaction`. `before_prompt_build` runs on every turn. When token usage approaches the compaction threshold (the proximity heuristic in `src/openclaw/compaction-threshold.ts`), `before_prompt_build` awaits `precompact-extract` synchronously as part of the same hook. Because the plugin-hook bus awaits `before_prompt_build` before dispatching to the LLM, state capture completes strictly before the LLM call that could trigger compaction on this turn. No race with the compactor.
 

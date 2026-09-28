@@ -94,6 +94,8 @@ import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
 import { precompactExtract } from "./hooks/precompact-extract.ts";
 import { postcompactInject } from "./hooks/postcompact-inject.ts";
+import { isLegacyPrecompactState, legacyPrecompactStateFiles, notLegacyArtifactSql, registerCompaction } from "./compaction-state.ts";
+import { postcompactMatcherIssues, stripClawmemHooks } from "./hook-settings.ts";
 import { pretoolInject } from "./hooks/pretool-inject.ts";
 import { curatorNudge } from "./hooks/curator-nudge.ts";
 import {
@@ -2009,10 +2011,32 @@ async function cmdHook(args: string[]) {
   }
 
   const input = await readHookInput();
+  // 62.2: PreCompact registers its attempt beside the vault BEFORE the vault is opened, so a contended
+  // or failing open (or the host's timeout) cannot leave an earlier compaction's state takeable.
+  let compactionAttempt: string | null | undefined;
+  if (hookName === "precompact-extract") {
+    try { compactionAttempt = registerCompaction({ dbPath: getDefaultDbPath() }, input.sessionId); } catch { compactionAttempt = null; }
+  }
   // Open the store capped from the START for the context-surfacing hook (not just after open via the
   // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
   // hooks (Stop-lane, 30s budget) keep the 5000ms default.
-  const s = getStore(hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS : 5000);
+  // 62.2: the two compaction hooks run under a 5 s host timeout, so their busy wait is capped at 2 s:
+  // a contended vault fails them closed (nothing stored, nothing injected) instead of timing out.
+  let s: Store;
+  try {
+    s = getStore(
+      hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS
+        : hookName === "precompact-extract" || hookName === "postcompact-inject" ? 2000
+        : 5000,
+    );
+  } catch (err) {
+    // A vault that cannot be opened (busy past the wait, or the 62.2 evolution-writer fence failing closed
+    // on the first upgraded open) fails the hook open: one stderr line and the empty output. A PreCompact
+    // has registered already, so nothing older can be injected.
+    console.error(`[clawmem] hook ${hookName}: the vault could not be opened (${err instanceof Error ? err.message : String(err)})`);
+    writeHookOutput(makeEmptyOutput(hookName));
+    return;
+  }
   let output: HookOutput;
 
   try {
@@ -2043,7 +2067,7 @@ async function cmdHook(args: string[]) {
         output = await stalenessCheck(s, input);
         break;
       case "precompact-extract":
-        output = await precompactExtract(s, input);
+        output = await precompactExtract(s, input, { attempt: compactionAttempt });
         break;
       case "postcompact-inject":
         output = await postcompactInject(s, input);
@@ -2386,25 +2410,29 @@ async function cmdSetupHooks(args: string[]) {
 
   if (!settings.hooks) settings.hooks = {};
 
+  // 62.2: install and --remove strip ClawMem's OWN handlers only (`hook-settings.ts`): a group keeps
+  // its other handlers and its matcher. Through v0.39.1 any group holding a command that contained
+  // "clawmem" was deleted whole, taking a user's hook in the same group with it.
   if (remove) {
     // Remove clawmem hooks
     for (const event of ["UserPromptSubmit", "Stop", "SessionStart", "PreCompact"]) {
       if (settings.hooks[event]) {
-        settings.hooks[event] = settings.hooks[event].filter((entry: any) =>
-          !entry.hooks?.some((h: any) => h.command?.includes("clawmem"))
-        );
+        settings.hooks[event] = stripClawmemHooks(settings.hooks[event]);
         if (settings.hooks[event].length === 0) delete settings.hooks[event];
       }
     }
     console.log(`${c.green}Removed ClawMem hooks from ${settingsPath}${c.reset}`);
   } else {
-    // Install clawmem hooks
-    const hookConfig: Record<string, string[]> = {
-      UserPromptSubmit: ["context-surfacing"],
-      SessionStart: ["postcompact-inject", "curator-nudge"],
-      PreCompact: ["precompact-extract"],
-      Stop: ["decision-extractor", "handoff-generator", "feedback-loop"],
-    };
+    // Install clawmem hooks. 62.2 (CM-05): postcompact-inject gets its OWN SessionStart group with
+    // matcher "compact" — SessionStart also fires on startup/resume/clear, and through v0.39.1 the
+    // shared matcher-"" group ran it on every session start.
+    const hookGroups: { event: string; matcher: string; hooks: string[] }[] = [
+      { event: "UserPromptSubmit", matcher: "", hooks: ["context-surfacing"] },
+      { event: "SessionStart", matcher: "compact", hooks: ["postcompact-inject"] },
+      { event: "SessionStart", matcher: "", hooks: ["curator-nudge"] },
+      { event: "PreCompact", matcher: "", hooks: ["precompact-extract"] },
+      { event: "Stop", matcher: "", hooks: ["decision-extractor", "handoff-generator", "feedback-loop"] },
+    ];
 
     // Use Claude Code's native timeout property instead of shell `timeout` wrapper.
     // Shell `timeout` kills the process with SIGTERM (exit 124) which produces
@@ -2445,14 +2473,13 @@ async function cmdSetupHooks(args: string[]) {
       Stop: 30, // LLM-based extraction hooks need more time
     };
 
-    for (const [event, hooks] of Object.entries(hookConfig)) {
-      if (!settings.hooks[event]) settings.hooks[event] = [];
+    // Remove existing clawmem entries ONCE per event, before any group is added: an event with two
+    // groups (SessionStart) would otherwise lose the first when the second is written.
+    for (const event of new Set(hookGroups.map(g => g.event))) {
+      settings.hooks[event] = stripClawmemHooks(settings.hooks[event] ?? []);
+    }
 
-      // Remove existing clawmem entries first
-      settings.hooks[event] = settings.hooks[event].filter((entry: any) =>
-        !entry.hooks?.some((h: any) => h.command?.includes("clawmem"))
-      );
-
+    for (const { event, matcher, hooks } of hookGroups) {
       const timeout = timeouts[event] || 5;
 
       // Add new entries with native timeout property. The context-surfacing
@@ -2461,7 +2488,7 @@ async function cmdSetupHooks(args: string[]) {
       // reads it from its own environment and doctor parses it from the
       // command string, neither depending on ambient env (codex turn-23 F4).
       settings.hooks[event].push({
-        matcher: "",
+        matcher,
         hooks: hooks.map(name => ({
           type: "command",
           command: name === "context-surfacing"
@@ -2473,8 +2500,8 @@ async function cmdSetupHooks(args: string[]) {
     }
 
     console.log(`${c.green}Installed ClawMem hooks to ${settingsPath}${c.reset}`);
-    for (const [event, hooks] of Object.entries(hookConfig)) {
-      console.log(`  ${event}: ${hooks.join(", ")}`);
+    for (const { event, matcher, hooks } of hookGroups) {
+      console.log(`  ${event}${matcher ? ` (${matcher})` : ""}: ${hooks.join(", ")}`);
     }
   }
 
@@ -3829,6 +3856,12 @@ async function cmdDoctor() {
             console.log(`${c.yellow}!${c.reset} Claude Code hooks: ${entries.length} context-surfacing entries are installed — each runs on every prompt (the vault is surfaced once per entry); keep one`);
           }
         } catch { /* budget check is advisory — never blocks the doctor (every red line above already counted its issue) */ }
+        // 62.2 (CM-05): the v0.39.x installer put postcompact-inject under matcher "", so it ran on every
+        // session start. The hook itself now ignores all but compactions; re-running setup stops the spawn.
+        const pcMatchers = postcompactMatcherIssues(settings);
+        if (pcMatchers.length > 0) {
+          console.log(`${c.yellow}!${c.reset} Claude Code hooks: postcompact-inject is installed under SessionStart matcher ${pcMatchers.map(m => `"${m}"`).join(", ")}, so it starts on every session start (it acts only on compactions). Fix: re-run 'clawmem setup hooks' (installs it under matcher "compact")`);
+        }
       } else {
         console.log(`${c.yellow}!${c.reset} Claude Code hooks: not installed (run 'clawmem setup hooks')`);
       }
@@ -3838,6 +3871,47 @@ async function cmdDoctor() {
   } catch {
     console.log(`${c.yellow}!${c.reset} Claude Code hooks: could not check`);
   }
+
+  // 5b. Legacy pre-compaction state (62.2): ClawMem ≤ v0.39.x wrote precompact-state.md into Claude
+  // Code's per-project memory dirs. This version's compaction hooks never use it (the doctor lists it and
+  // the indexer retires its copies); ClawMem never deletes it itself. A file modified AFTER this version first opened the vault (vault_flags, store.ts) was
+  // written by an older ClawMem process that is still running (and still has the cross-session leak):
+  // that one is a red line.
+  try {
+    const legacy = legacyPrecompactStateFiles(pathResolve(process.env.HOME || "~", ".claude", "projects"));
+    if (legacy.length > 0) {
+      let retiredAt = NaN;
+      try {
+        const row = getStore().db.prepare(`SELECT updated_at FROM vault_flags WHERE flag = 'migration:retire-legacy-precompact-state'`).get() as { updated_at: string } | null;
+        if (row) retiredAt = Date.parse(row.updated_at);
+      } catch { /* no flag yet */ }
+      const live = Number.isFinite(retiredAt) ? legacy.filter(f => f.mtimeMs > retiredAt) : [];
+      if (live.length > 0) {
+        console.log(`${c.red}✗${c.reset} Legacy pre-compaction state: ${live.length} precompact-state.md file(s) were written after this vault was upgraded, so an older ClawMem process is still running (hooks, watcher, MCP server, or the OpenClaw/Hermes plugin) and still has the cross-session compaction leak. Upgrade every ClawMem install that shares this vault:`);
+        for (const f of live.slice(0, 5)) console.log(`    ${f.path}`);
+        issues++;
+      }
+      console.log(`${c.yellow}!${c.reset} Legacy pre-compaction state: ${legacy.length} precompact-state.md file(s) left by ClawMem ≤ v0.39.x. Upgraded compaction hooks no longer use them; the doctor and the indexer only look at them, while an older ClawMem still running may still write and read them. Delete the files:`);
+      for (const f of legacy.slice(0, 5)) console.log(`    ${f.path}`);
+      if (legacy.length > 5) console.log(`    … and ${legacy.length - 5} more`);
+    }
+  } catch { /* advisory only */ }
+  // Indexed copies of the artifact that are still active. Retrieval never returns them
+  // (notLegacyArtifactSql); an index pass deactivates each one whose file it finds, and absence
+  // reconciliation an 'fs' one whose file is gone. A pre-v0.34 (NULL-origin) one with no file has
+  // nothing to confirm that ClawMem wrote it, so only the user removes it.
+  try {
+    const copies = (getStore().db.prepare(
+      `SELECT d.collection, d.path, d.origin, c.doc FROM documents d LEFT JOIN content c ON c.hash = d.hash
+       WHERE d.active = 1 AND substr(d.path, -19) = 'precompact-state.md'`
+    ).all() as { collection: string; path: string; origin: string | null; doc: string | null }[])
+      .filter(r => isLegacyPrecompactState(r.path, r.doc ?? ""));
+    if (copies.length > 0) {
+      console.log(`${c.yellow}!${c.reset} Legacy pre-compaction state: ${copies.length} indexed cop${copies.length === 1 ? "y" : "ies"} of an old snapshot ${copies.length === 1 ? "is" : "are"} still active. Search and retrieval never return ${copies.length === 1 ? "it" : "them"}; 'clawmem update' deactivates each one whose file is on disk or was deleted. One from before v0.34 whose file is gone stays until you forget it (MCP memory_forget with its path):`);
+      for (const r of copies.slice(0, 5)) console.log(`    ${r.collection}/${r.path}${r.origin === null ? "  (pre-v0.34)" : ""}`);
+      if (copies.length > 5) console.log(`    … and ${copies.length - 5} more`);
+    }
+  } catch { /* advisory only */ }
 
   // 6. MCP registered
   try {
@@ -5316,6 +5390,7 @@ async function cmdDiary(args: string[]) {
         FROM documents d
         JOIN content c ON c.hash = d.hash
         WHERE d.active = 1 AND d.collection = '_clawmem' AND d.path LIKE 'diary/%'
+          AND ${notLegacyArtifactSql("d", "c.doc")}
         ${values.agent ? "AND d.domain = ?" : ""}
         ORDER BY d.modified_at DESC
         LIMIT ?

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.39.1**.
+Guide for upgrading between released versions. Current: **v0.40.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -17,7 +17,7 @@ cd ~/clawmem && git pull
 systemctl --user restart clawmem-watcher.service  # if installed as a user unit
 ```
 
-Hooks (spawned fresh per Claude Code invocation) pick up new code automatically on their next invocation. A hook that happens to start while the upgrade is still replacing files can load a mix of old and new modules and fail. The failure is non-blocking — Claude Code carries on without that hook's output — so that one prompt runs without ClawMem context (or that one turn-end extraction is skipped), and the next invocation loads the new code cleanly. The MCP stdio server is respawned per agent session — a **new** session gets the new code, but a session already open when you upgrade keeps its old-code server alive until you reconnect (`/mcp` in Claude Code) or close it. For most releases that stale server is harmless — it just lacks the new features. **For releases that migrate the vault and change write semantics (v0.31.0, v0.32.0), it is not** — see the mixed-version caution in the v0.31.0 section below. The safe order on those upgrades: stop persistent daemons (`clawmem watch`, `clawmem serve`, the systemd embed/watcher/curator units) → upgrade → reconnect or restart every open agent session → start the daemons again.
+Hooks (spawned fresh per Claude Code invocation) pick up new code automatically on their next invocation. A hook that happens to start while the upgrade is still replacing files can load a mix of old and new modules and fail. The failure is non-blocking — Claude Code carries on without that hook's output — so that one prompt runs without ClawMem context (or that one turn-end extraction is skipped), and the next invocation loads the new code cleanly. The MCP stdio server is respawned per agent session — a **new** session gets the new code, but a session already open when you upgrade keeps its old-code server alive until you reconnect (`/mcp` in Claude Code) or close it. For most releases that stale server is harmless — it just lacks the new features. **For releases that migrate the vault and change write semantics (v0.31.0, v0.32.0), it is not** — see the mixed-version caution in the v0.31.0 section below. **Nor for v0.40.0:** until you reconnect it, an old server keeps the cross-session compaction leak and enriches notes from the old snapshot files (see the v0.40.0 section). The safe order on those upgrades: stop persistent daemons (`clawmem watch`, `clawmem serve`, the systemd embed/watcher/curator units) → upgrade → reconnect or restart every open agent session → start the daemons again.
 
 ### What auto-applies on first open
 
@@ -58,6 +58,59 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.40.0: the post-compaction block carries only this session's pre-compaction state
+
+**Nothing has to be run; three things are worth doing.** Through v0.39.1 the
+pre-compaction state was one `precompact-state.md` per project directory, read back on every
+session start there, so a session could receive another session's state — see the
+[release notes](../../RELEASE_NOTES.md) and [setup-hooks](setup-hooks.md#compaction-hooks).
+
+- **Upgrade every ClawMem install that shares the vault** — the hooks, the watcher, the MCP
+  server in every open session, and the OpenClaw or Hermes plugin wherever they run. Everything
+  below describes an upgraded process. An older version still running writes and reads the old
+  file, injects it, and enriches notes from it, so its sessions keep the leak until it is upgraded
+  or stopped. `clawmem doctor` shows red while a legacy file is being written after the upgrade.
+- **Re-run `clawmem setup hooks`.** It moves `postcompact-inject` into its own SessionStart group
+  with matcher `compact`. The hook already ignores every other start, so an old layout stays
+  correct; the re-run only stops a wasted process launch per session start. Other tools' hooks in
+  the same groups are kept.
+- **Delete the old `precompact-state.md` files.** `clawmem doctor` lists them. An upgraded
+  ClawMem uses them for nothing: only the doctor lists them and the indexer retires their copies.
+
+What happens on its own:
+
+- Search, retrieval, globs and path suffixes stop returning indexed copies of the old file at once,
+  whatever version indexed them, and enrichment and embedding stop reading them. The indexer
+  deactivates each copy whose file it finds (reason `absent`) on its next pass, and `clawmem doctor`
+  lists the copies still active. One from before v0.34 whose file is gone stays until you forget it
+  (`memory_forget` with its exact path, `collection/path`).
+- Older versions let a copy feed A-MEM enrichment, so a note's A-MEM summary can carry text from
+  another session, and an older ClawMem still running after the upgrade reads notes unguarded. So an
+  upgraded process never hands an enrichment prompt a note a copy shaped, or one an older ClawMem
+  evolved after the upgrade (its evolution entries carry no writer stamp). The first writable open
+  (and each background pass) clears such a note, and its `memory_evolution_status` history shows a
+  `reset:` entry in place of the entries that carried the text. The light-lane backfill
+  (`CLAWMEM_ENABLE_CONSOLIDATION=true`) rebuilds it from the note's own text. A note indexed from a
+  file is also rebuilt when the file changes or by `clawmem reindex --enrich`; one that hooks or the
+  API wrote stays without an A-MEM note until the light lane runs (search and injection never use
+  one).
+- The first writable open adds a `writer` column to `memory_evolution` and records where the vault's
+  history ends, in one short write. If another process holds the vault's write lock for longer than
+  that open waits, the open fails and changes nothing: a hook skips its work that once, and a
+  watcher, an MCP server or a CLI command reports the error and exits; start it again.
+- A small database `<vault>-compaction.sqlite` appears beside the vault file (for the default
+  vault, `~/.cache/clawmem/index.sqlite-compaction.sqlite`). It holds one registration per
+  compacting session; each is marked taken when its compaction's session start takes it, and each
+  is removed after 7 days.
+- REST `GET /export` leaves the old copies out and reports how many in `legacy_snapshots_excluded`;
+  `GET /export?full=true` includes them (every active document; the export is not a vault backup).
+- `get` and `multi_get` resolve `collection/path` exactly before trying the text as a path suffix.
+- **Downgrading** is safe: v0.39.x ignores the new table, column and flag and the registration
+  database, and goes back to its own file-based behaviour, leak included. Upgrading again later
+  clears the notes it evolved in between.
+
+Nothing to re-embed or re-index, and no config change.
 
 ## v0.39.1: collection edits keep the comments in `config.yaml`
 
