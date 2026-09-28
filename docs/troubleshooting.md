@@ -423,6 +423,15 @@ builders operate on — so archiving documents legitimately lowers the total.
 - The vault name isn't configured in `config.yaml` or `CLAWMEM_VAULTS`.
 - Fix: Add the vault to `~/.config/clawmem/config.yaml` or set `CLAWMEM_VAULTS` env var.
 
+**Editing collections fails with "Cannot edit … in place"**
+- Since v0.39.1, ClawMem reads back the text an edit is about to write to `config.yaml` and stops if anything outside the edited entry would change, or the edit would not come out as asked. The file is left untouched; the message names anything else the edit would have changed.
+- The usual cause is a YAML merge key (`<<:`), anchor or alias the edit cannot keep, such as a collection that exists only through a merge key.
+- Fix: edit `~/.config/clawmem/config.yaml` by hand (write a merged collection out as a plain entry), then run `clawmem update`.
+
+**Comments in `config.yaml` disappeared after `clawmem collection add` or `remove`**
+- Before v0.39.1 every write re-serialised the whole file and dropped its comments and blank lines, with exit 0 and no warning.
+- Fix: upgrade to v0.39.1 or later, then restore the comments from a backup or version control. Later edits keep them.
+
 **Vault path with ~ doesn't resolve**
 - Fixed in current version. Vault paths now support `~` expansion.
 - If using an older version, use absolute paths.

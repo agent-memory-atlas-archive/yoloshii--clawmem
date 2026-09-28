@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.39.0**.
+Guide for upgrading between released versions. Current: **v0.39.1**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,28 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.39.1: collection edits keep the comments in `config.yaml`
+
+**No vault migration and nothing to run.** `clawmem collection add` and `collection remove` now
+edit `~/.config/clawmem/config.yaml` in place instead of rewriting it, so comments, blank lines,
+quoting and key order outside the edited entry survive — see the
+[CLI reference](../reference/cli.md#collection-management).
+
+- **Comments an earlier version already dropped do not come back.** Every write before v0.39.1
+  re-serialised the whole file without them. Restore any you still need from a backup or from
+  version control.
+- **Re-adding an existing name keeps its `update` command.** Earlier versions rebuilt the entry
+  from path, pattern and context, and dropped `update`.
+- **Writes no longer copy the lifecycle defaults into the file.** A `lifecycle:` block an earlier
+  version wrote stays as it is. ClawMem still applies the defaults when it reads the file, so the
+  effective policy is unchanged.
+- **An edit the file's YAML cannot keep now stops instead.** A command that reports
+  `Cannot edit … in place` has left the file untouched: the file uses a merge key, anchor or
+  alias the edit would have changed, such as a collection that only a `<<:` merge key provides.
+  Edit it by hand — see [troubleshooting](../troubleshooting.md#general).
 
 ---
 

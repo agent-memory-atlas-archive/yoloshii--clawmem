@@ -4,6 +4,66 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.39.1 — collection and context edits keep the comments in config.yaml
+
+Every command that writes `~/.config/clawmem/config.yaml` re-serialised the parsed config with
+`YAML.stringify`: `clawmem collection add` and `clawmem collection remove`, and the rename and
+context writers behind the store's collection-rename and context-delete paths. Each write
+silently dropped every comment, blank line and quoting choice in the file, with exit 0 and no
+warning. Those comments are often the only record of why an entry looks the way it does. The
+config has no exclude key, so a collection whose pattern lists its subtrees instead of `**/*.md`,
+to keep vendored clones out of the vault, is explained in a comment or not at all — and a later
+tidy-up that cannot see the reason widens the glob.
+
+The writers now edit the parsed YAML document in place. An edit rewrites only its own lines;
+comments, blank lines, quoting and key order everywhere else come back as they were. Removing a
+collection removes the comment lines directly above it; a comment that a blank line separates
+from the entry, such as a section header, stays where it was, and so does a comment at the end
+of the `collections:` line. Collection names that YAML reads as numbers (`2024:`) are matched as
+the names they are. YAML aliases keep their values: when an edit changes or removes what an alias
+names, that alias becomes a copy of it first, and aliases an edit does not reach are written as
+they were. Several aliases to one mapping or list share one copy, so they stay one value. An alias
+inside the node it names (an entry that refers to itself) is not copied; it goes on naming that
+node, edit included.
+
+Before it writes, each edit reads back the text it is about to write and checks that the effective
+config changed only where the edit names, and as asked. Where the file uses a YAML feature an
+in-place edit cannot keep, such as a collection that only a merge key (`!!merge <<:`) provides, the
+command stops with an error naming what would have changed, and the file is left untouched.
+
+Two smaller changes come with it:
+
+- `clawmem collection add` with a name that already exists updates that collection's path and
+  pattern in place and keeps its `update` command. It used to rebuild the entry from path,
+  pattern and context and drop `update` without a word.
+- A write no longer copies the lifecycle defaults into the file. `lifecycle` stays as you wrote
+  it; ClawMem still applies the defaults when it reads the file, so the effective policy is
+  unchanged.
+
+A few cosmetic limits remain, all from the YAML library's printer, and none of them loses data or
+a comment. Indentation is normalised to two spaces, as before. A comment on the last line of the
+file gains a blank line above it on the first write. An anchored block whose first comment
+follows a blank line has its anchor moved onto a line of its own. Flow collections (`[a, b]`) are
+all written with the spacing most of the file's flow collections use.
+
+### Verification
+
+`tests/unit/collections-config-comments.test.ts` (59 tests) states the exact file each writer
+must produce from a commented config: add, re-add, remove (first, middle, last and only entry,
+with and without a blank-line header), rename, a numeric-looking name, an empty `{}`, a missing
+file, an end-of-file comment, a parse error, and the three context writers; then anchors, aliases,
+tags, alias and list keys, flow spacing, merge keys, self-references, and `!!set` and `!!omap`
+values. On the v0.39.0 code 47 of the 59 fail; the 12 that pass cover behaviour this release
+keeps. Full suite: 2927 pass / 0 fail. Cross-model adversarial review (codex / GPT-6, one pinned
+session) took ten turns and twenty findings, five of them High, all fixed except one Low accepted
+as the flow-spacing limit above. They included aliases an edit changed or left dangling, explicit
+tags kept on new values, key aliases and list keys renamed, a self-referencing alias copied
+without end, and a collection that only a merge key provides written half-made, which led to the
+read-back check. The last two rounds found that check refusing correct edits, of self-referencing
+files and of `!!omap` and `!!set` values. It cleared at turn 10 with zero remaining findings.
+
+---
+
 ## v0.39.0 — the OpenClaw plugin installs and runs on current OpenClaw, and `forgotten` counts only forget
 
 OpenClaw added three checks between April and May 2026 that each switched off part of the

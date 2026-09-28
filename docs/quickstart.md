@@ -124,6 +124,8 @@ collections:
     pattern: "**/*.md"              # works with Obsidian, Logseq, Foam, Dendron
 ```
 
+Comments you add to the file stay put when `clawmem collection add` or `remove` edits it later (v0.39.1+), so a narrowed pattern can carry a note saying why.
+
 After editing the config, re-index and embed:
 
 ```bash

@@ -19,6 +19,8 @@ clawmem collection list                        # List all collections
 clawmem collection remove <name>               # Remove a collection
 ```
 
+`collection add` and `collection remove` edit `~/.config/clawmem/config.yaml` in place: comments, blank lines and quoting outside the edited entry come back unchanged (since v0.39.1). Adding a name that already exists updates its path and pattern and keeps its `context` and `update`. Removing a collection also removes the comment lines directly above it; a comment set off from the entry by a blank line stays. Before writing, each edit reads back the text it is about to write; if the config would change anywhere else, or not as asked (a collection that only a YAML merge key `<<` provides, say), the command stops with an error and leaves the file untouched.
+
 ## Indexing
 
 ```bash
