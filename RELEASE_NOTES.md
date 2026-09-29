@@ -4,6 +4,92 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.40.2 — the watcher re-indexes files saved atomically and files changed together
+
+`clawmem watch` acts on the file name each change event carries. Bun before 1.4.0 folds the events
+that reach one watched directory together into one callback per event type, named after the first
+file; Bun 1.4.0 reports each event under its own name. Three common changes lost their name on the
+way:
+
+- an atomic save — a temp file written beside the target and renamed over it, which is how many
+  editors, atomic-write libraries and agent tools save (Claude Code's Write and Edit tools among
+  them) — arrived under the temp file's name (`notes.md.tmp.4242.9f3c`), and the watcher's `.md`
+  filter dropped it;
+- a rename inside one directory (`draft.md` → `notes.md`) arrived under the old name only;
+- of two files written or deleted back-to-back in one directory, only the first arrived.
+
+Those changes reached the vault only when something ran a full pass (`clawmem update`, the
+`reindex` tool). For a Claude Code auto-memory collection that was nearly every memory file the
+agent wrote.
+
+The watcher no longer relies on the name alone. It keeps a listing of each watched directory: every
+file it acts on, with its inode, size, mtime and ctime. Every event, whatever name it carries,
+schedules one rescan of its directory `debounceMs` (2 s) later; a later event does not push a pending
+rescan back, so a busy directory cannot starve it. The rescan compares each file with the listing as
+it stands at that moment and hands each one that appeared, changed or disappeared to the same
+per-file debounce and routing an event goes through. A file whose own timer is already pending is
+left to that timer, and every delivery records the file's state in the listing, so a rescan never
+re-delivers a state that was already delivered, whether an event or an earlier rescan delivered it.
+
+### What changed
+
+- `src/watcher.ts`: the listing and the rescan. Each directory is listed before its watch starts and
+  again right after; a change between the two listings is delivered, so a save that lands while the
+  watch starts is not lost. Collection paths that overlap, or name one directory in two spellings
+  (`/notes` and `/./notes`), share one listing and one rescan per directory. A rescan reads the
+  directory asynchronously, then looks at 256 entries at a time and yields between batches, including
+  when it checks the files it no longer finds. For a directory of 10,000 `.md` files, the event loop
+  (which also serves the vector daemon) stalled at most about 3 ms during a rescan, against about
+  32 ms for one synchronous pass. On a host watching 15,274 directories holding 17,977 `.md` files,
+  the two startup listings took about 0.3 s, next to a directory walk of 7 s or more. `close()` also
+  cancels pending rescans, and no watch callback schedules work after it.
+- Docs: `docs/troubleshooting.md` (a new *Indexing* entry; the editor-autosave note),
+  `docs/guides/upgrading.md`, `AGENTS.md`, `SKILL.md`.
+
+### Verification
+
+`tests/unit/watcher.test.ts` adds fourteen tests. Eleven drive the real watcher. Six check delivery,
+each exactly once under the file's own name: an atomic save that replaces a file and one that
+creates it, a rename inside a directory (both names), two files written back-to-back, two files
+deleted together, and an atomic save in a subdirectory. Three check that nothing extra is delivered:
+a change the event stream reports by name is delivered once; files the watcher ignores, hidden files
+and untouched files are not delivered; `close()` cancels a pending rescan. Under Bun 1.3.14 the six
+delivery tests fail against the v0.40.1 watcher and the other three pass; under Bun 1.4.2 all nine
+pass against both. Two more check that an atomic save in a directory two collection paths share
+(overlapping, or one spelled with `/./`) is delivered once. Three pin the startup listing: which
+files it holds; appeared, changed and removed files; a directory that is gone.
+`tests/integration/cmdwatch-atomic-save.integration.test.ts` runs the real `clawmem watch` with a
+Claude Code auto-memory collection: a file created by an atomic save, the same file replaced by one,
+and two files rewritten back-to-back all reach the index with their new titles; against the v0.40.1
+watcher under Bun 1.3.14 the first step never indexes. Full suite: 3079 pass / 0 fail; tsc unchanged.
+Cross-model adversarial review (codex / GPT-6, one pinned session) took four turns and eleven findings,
+nine Medium and two Low, all fixed. They included a rescan that held the event loop on a large
+directory, a save missed in the moment a watch starts, a timer firing mid-rescan and overlapping
+collection paths each re-delivering a file, mass removals that skipped the batching, and a claim
+that a same-size rewrite inside one timestamp tick was covered (it is now a stated limit). It cleared
+at turn 4 with zero remaining findings.
+
+### What didn't change
+
+- On Bun 1.4.0 and later the events already carry the right names: rescans find nothing more, and
+  each change is still indexed once.
+- The per-file debounce, the pre-check and routing (`watchTargets`), the directory cap and which
+  directories are watched. Directories created after the watcher starts are still not watched until
+  it restarts.
+- Each file a rescan delivers starts an index pass of its collection, as each delivered event always
+  has: a burst of N changed files costs N passes, the count Bun 1.4.0 and later already produced. On
+  older Bun, where the fold hid most of a burst, that is new load after a large checkout or copy
+  into a watched directory.
+- A rewrite that keeps a file's size and lands within one filesystem timestamp tick of the watcher's
+  last look at it leaves inode, size, mtime and ctime all unchanged, so no rescan can see it. On Bun
+  before 1.4.0 such a write, if its event is folded away, waits for the file's next change or a full
+  pass.
+- Nothing to migrate. Restart the watcher, then run `clawmem update` once to index anything the old
+  watcher missed. Upgrading Bun to 1.4.0 or later also fixes the event names for earlier ClawMem
+  versions.
+
+---
+
 ## v0.40.1 — the watcher re-indexes every collection it watches, and its directory cap is a setting
 
 `clawmem watch` checks each changed `.md` file against its collection's pattern before it opens

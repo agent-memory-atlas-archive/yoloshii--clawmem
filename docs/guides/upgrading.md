@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.40.0**.
+Guide for upgrading between released versions. Current: **v0.40.2**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,23 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.40.2: the watcher re-indexes files saved atomically
+
+**No vault migration.** Restart the watcher (`systemctl --user restart clawmem-watcher.service`,
+or restart `clawmem watch`), then run `clawmem update` once to index anything the old watcher
+missed.
+
+- **Files saved atomically now re-index on change.** On Bun before 1.4.0, a file saved by writing a
+  temp file and renaming it over the original (many editors and agent tools, Claude Code's Write
+  and Edit among them), a rename inside a directory, and the second of two files changed
+  back-to-back in one directory never reached the watcher under their own names, so they waited
+  for a full index pass. The watcher now rescans a directory after any event in it — see
+  [troubleshooting](../troubleshooting.md#indexing).
+- **Bun 1.4.0 or later is recommended** whatever the ClawMem version: it reports each event under
+  its own name. Older ClawMem versions on Bun 1.4.0+ get the event names right too.
 
 ---
 

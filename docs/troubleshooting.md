@@ -153,6 +153,13 @@ builders operate on — so archiving documents legitimately lowers the total.
 **Watcher fires events but wrong collection processes them**
 - Fixed in current version. Collections are now sorted by path length (most specific first).
 
+**A file saved by an editor or agent tool is not re-indexed until `clawmem update` (Bun before 1.4.0)**
+- Symptom: after a save, the watcher journal shows no `[change]` or `[rename]` line for the file, although a `touch` of the same file logs one. Common with Claude Code's Write and Edit tools, editors with safe-write or atomic save, and atomic-write libraries.
+- Cause: those tools save atomically: they write a temp file beside the target (`notes.md.tmp.4242.9f3c`) and rename it over the target. Bun before 1.4.0 folds the events that reach one watched directory together into one callback per event type, named after the first file, so the save arrives under the temp file's name and the watcher's `.md` filter drops it. A rename inside a directory arrives under the old name only, and of two files written or deleted back-to-back in one directory only the first arrives.
+- **Fixed in v0.40.2:** every event schedules one rescan of its directory (`debounceMs`, 2 s, after the first event), which compares each `.md` file with the directory's listing (inode, size, mtime and ctime) and re-indexes each one that appeared, changed or disappeared. Restart the watcher after upgrading and run `clawmem update` once to index anything it missed.
+- One case stays out of reach of a rescan: a rewrite that keeps the file's size and lands within one filesystem timestamp tick of the watcher's last look at it leaves all four values unchanged. On Bun before 1.4.0, if its event is folded away, that write waits for the file's next change or a full pass; Bun 1.4.0 or later reports it by name.
+- On an older ClawMem: upgrade Bun to 1.4.0 or later (`bun upgrade`) and restart the watcher, which fixes the event names; until then, run `clawmem update` after saves the watcher missed.
+
 **reindex --force crashes with "UNIQUE constraint failed"**
 - Fixed in current version. Force mode now reactivates inactive rows instead of inserting.
 
@@ -212,6 +219,7 @@ builders operate on — so archiving documents legitimately lowers the total.
 
 4. **Editor autosave and temp files.** Some editors (VS Code, JetBrains) write `.md~`, `.md.tmp`, or shadow copies during autosave. These don't match the `.md` extension check in the watcher, but frequent filesystem churn in the same directory can cause `fs.watch` callback overhead on some platforms (especially WSL2 where filesystem events cross the Linux/Windows boundary).
    - Fix: If memory grows without visible `[change]` log entries, the overhead is in `fs.watch` itself, not in ClawMem's handler. Consider reducing the number of watched directories by consolidating collections or excluding directories with heavy non-`.md` file churn.
+   - Since v0.40.2 an event for any file, `.md` or not, also schedules one rescan of its directory, at most one per directory every `debounceMs` (2 s): it reads the directory and stats its `.md` files 256 at a time, letting other work run between batches, and it reaches the database only when one of those files changed (see the *Indexing* entry on atomic saves).
 
 5. **Too many watched directories / inotify FD exhaustion (v0.2.3 fix).**
    - Prior to v0.2.3, the watcher used `fs.watch(dir, { recursive: true })` which registers an OS-level inotify watch on **every subdirectory** in the tree — including excluded directories like `gits/`, `node_modules/`, `.git/`. The `shouldExclude()` filter only prevented *processing* events from excluded paths but couldn't prevent the kernel from allocating inotify handles for them. A collection path like `~/Projects` with 67,000 subdirectories would exhaust inotify limits and eventually hang WSL or Linux.

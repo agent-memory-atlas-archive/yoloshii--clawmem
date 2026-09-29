@@ -4,10 +4,14 @@
  * Walks each directory tree at startup, skipping excluded dirs (gits/,
  * node_modules/, .git/, etc.), and watches only non-excluded directories.
  * This prevents inotify FD exhaustion on trees with large cloned repos.
+ *
+ * Every event also schedules a rescan of its directory (v0.40.2): the file
+ * name an event carries is not reliable enough to act on alone.
  */
 
-import { watch, readdirSync, statSync, type WatchEventType } from "fs";
-import { join, relative } from "path";
+import { watch, readdirSync, statSync, lstatSync, type Stats, type WatchEventType } from "fs";
+import { readdir } from "fs/promises";
+import { join, relative, resolve } from "path";
 import { shouldExclude, EXCLUDED_DIRS } from "./indexer.ts";
 
 export type WatcherOptions = {
@@ -73,13 +77,190 @@ function walkNonExcludedDirs(root: string): string[] {
   return dirs;
 }
 
+/** A file name the watcher acts on: `.md` (indexing), or `.jsonl` within `.beads/` (Dolt backend). */
+function watchesName(filename: string): boolean {
+  return filename.endsWith(".md") || (filename.endsWith(".jsonl") && filename.includes(".beads/"));
+}
+
+/** Whether a directory entry is a file the watcher acts on, judged from the collection root. */
+function accepts(root: string, watchDir: string, name: string): boolean {
+  return watchesName(name) && !shouldExclude(relative(root, join(watchDir, name)));
+}
+
+/**
+ * What a listing records for one file: inode, size, mtime and ctime from lstat, so a rename over it, a write,
+ * a touch or a chmod each changes it. Null when the path is gone or is not a file or symlink.
+ */
+function statOf(path: string): string | null {
+  let st: Stats;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return null;
+  }
+  if (!st.isFile() && !st.isSymbolicLink()) return null;
+  return `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+}
+
+function isGone(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** A directory listing (file name → `statOf`), and each file that appeared (`rename`), changed (`change`) or disappeared (`rename`) since the previous one. */
+export type Listing = { files: Map<string, string>; changes: [name: string, event: WatchEventType][] };
+
+/**
+ * List the files the watcher acts on in one watched directory and compare them with `previous`. A directory that
+ * is gone lists as empty; null when it cannot be read for another reason. Synchronous: the watcher lists each
+ * directory as its watch starts.
+ */
+export function listWatchedFiles(root: string, watchDir: string, previous: Map<string, string> | null): Listing | null {
+  let names: string[];
+  try {
+    names = readdirSync(watchDir);
+  } catch (err) {
+    if (!isGone(err)) return null;
+    names = [];
+  }
+  const listing: Listing = { files: new Map(), changes: [] };
+  for (const name of names) {
+    if (!accepts(root, watchDir, name)) continue;
+    const stat = statOf(join(watchDir, name));
+    if (stat === null) continue;
+    listing.files.set(name, stat);
+    const before = previous?.get(name);
+    if (previous && before === undefined) listing.changes.push([name, "rename"]);
+    else if (previous && before !== stat) listing.changes.push([name, "change"]);
+  }
+  if (previous) for (const name of previous.keys()) if (!listing.files.has(name)) listing.changes.push([name, "rename"]);
+  return listing;
+}
+
+/** Directory entries a rescan looks at before it lets timers and I/O run again. */
+const RESCAN_CHUNK = 256;
+
+/**
+ * One watched directory's rescan state. Registrations whose collection paths overlap share it: a directory is
+ * only reached through names neither walk excludes, so they agree on which of its files the watcher acts on.
+ */
+type WatchedDir = {
+  root: string;
+  listing: Map<string, string>;   // file → `statOf` when last compared or delivered
+  listed: boolean;                // the startup listing is taken
+  timer: ReturnType<typeof setTimeout> | null;
+  scanning: boolean;
+  again: boolean;                 // an event arrived during the rescan: run one more when it ends
+};
+
 export function startWatcher(
   directories: string[],
   options: WatcherOptions
 ): { close: () => void } {
   const { debounceMs = 2000, onChanged, onError } = options;
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
+  const rescans = new Set<ReturnType<typeof setTimeout>>();
+  const watched = new Map<string, WatchedDir>();
   const watchers: ReturnType<typeof watch>[] = [];
+  let closed = false;
+
+  // Debounced per file: the last event for a path wins, `debounceMs` after it. `onFire` runs just before
+  // onChanged and records the file in its directory's listing as it is now, the state about to be indexed.
+  const schedule = (fullPath: string, event: WatchEventType, onFire: () => void) => {
+    if (closed) return;
+    const existing = pending.get(fullPath);
+    if (existing) clearTimeout(existing);
+
+    pending.set(fullPath, setTimeout(async () => {
+      pending.delete(fullPath);
+      onFire();
+      try {
+        await onChanged(fullPath, event);
+      } catch (err) {
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+      }
+    }, debounceMs));
+  };
+
+  const recordAsDelivered = (watchDir: string, state: WatchedDir, name: string) => () => {
+    const stat = statOf(join(watchDir, name));
+    if (stat === null) state.listing.delete(name);
+    else state.listing.set(name, stat);
+  };
+
+  // Compare one file with its listing entry, both as they are at this moment; on a difference, record the file's
+  // state and deliver it, unless its own per-file timer is pending (that timer indexes the file when it fires).
+  const compareAndDeliver = (watchDir: string, state: WatchedDir, name: string) => {
+    const now = statOf(join(watchDir, name));
+    const before = state.listing.get(name);
+    if ((now ?? undefined) === before) return;
+    if (now === null) state.listing.delete(name);
+    else state.listing.set(name, now);
+    const fullPath = join(watchDir, name);
+    if (!pending.has(fullPath)) {
+      schedule(fullPath, before === undefined || now === null ? "rename" : "change", recordAsDelivered(watchDir, state, name));
+    }
+  };
+
+  const rescan = async (watchDir: string, state: WatchedDir) => {
+    state.scanning = true;
+    try {
+      const known = [...state.listing.keys()];
+      let names: string[];
+      try {
+        names = await readdir(watchDir);
+      } catch (err) {
+        if (!isGone(err)) return;      // unreadable for now: the next event rescans it
+        names = [];
+      }
+      const seen = new Set<string>();
+      for (let i = 0; i < names.length; i += RESCAN_CHUNK) {
+        if (i > 0) await new Promise<void>((done) => setImmediate(done));
+        if (closed) return;
+        for (const name of names.slice(i, i + RESCAN_CHUNK)) {
+          if (!accepts(state.root, watchDir, name)) continue;
+          seen.add(name);
+          compareAndDeliver(watchDir, state, name);
+        }
+      }
+      // Files listed before the read that the read did not see, in the same batches; one first recorded since
+      // is newer than the read.
+      const missing = known.filter((name) => !seen.has(name));
+      for (let i = 0; i < missing.length; i += RESCAN_CHUNK) {
+        await new Promise<void>((done) => setImmediate(done));
+        if (closed) return;
+        for (const name of missing.slice(i, i + RESCAN_CHUNK)) {
+          if (state.listing.has(name)) compareAndDeliver(watchDir, state, name);
+        }
+      }
+    } catch (err) {
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      state.scanning = false;
+    }
+    if (!closed && state.again) {
+      state.again = false;
+      armRescan(watchDir, state);
+    }
+  };
+
+  // One rescan per directory, `debounceMs` after the first event; a later event does not push it back, so a busy
+  // directory cannot starve it. An event during a rescan earns one more after it: the rescan may have read that
+  // file before the change.
+  const armRescan = (watchDir: string, state: WatchedDir) => {
+    if (closed || state.timer) return;
+    if (state.scanning) {
+      state.again = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      rescans.delete(timer);
+      state.timer = null;
+      void rescan(watchDir, state);
+    }, debounceMs);
+    state.timer = timer;
+    rescans.add(timer);
+  };
   const maxDirs = resolveMaxWatchDirs(process.env, (raw) =>
     console.log(`[watcher] WARNING: CLAWMEM_WATCH_MAX_DIRS=${JSON.stringify(raw)} is not a positive integer — using ${DEFAULT_MAX_WATCH_DIRS}`));
 
@@ -97,35 +278,50 @@ export function startWatcher(
     }
 
     for (const watchDir of watchableDirs) {
+      // Bun before 1.4.0 folds the events that reach one directory together into one callback per event type,
+      // named after the first file: an atomic save (a temp file renamed over the target) arrives under the temp
+      // file's name, a rename under the old name only, and the second of two files written back-to-back not at
+      // all. So every event, whatever name it carries, also arms a rescan of its directory, which compares each
+      // file the watcher acts on with the directory's listing and delivers what appeared, changed or disappeared.
+      // Keyed by the resolved path: `/v/./notes` and `/v/notes` are one directory, as `join` already treats them.
+      let state = watched.get(resolve(watchDir));
+      if (!state) {
+        state = { root: dir, listing: new Map(), listed: false, timer: null, scanning: false, again: false };
+        watched.set(resolve(watchDir), state);
+      }
+      const dirState = state;
       try {
+        const before = dirState.listed ? null : listWatchedFiles(dir, watchDir, null);
         // Non-recursive watch — each dir watched individually
         const watcher = watch(watchDir, (event, filename) => {
+          if (closed) return;
+          armRescan(watchDir, dirState);
           if (!filename) return;
-          // Accept .md files (indexing) and .jsonl only within .beads/ (Dolt backend)
-          const isMd = filename.endsWith(".md");
-          const isBeadsJsonl = filename.endsWith(".jsonl") && filename.includes(".beads/");
-          if (!isMd && !isBeadsJsonl) return;
+          if (!watchesName(filename)) return;
 
           const relativeToDirRoot = relative(dir, join(watchDir, filename));
           if (shouldExclude(relativeToDirRoot)) return;
 
-          const fullPath = join(watchDir, filename);
-          const existing = pending.get(fullPath);
-          if (existing) clearTimeout(existing);
-
-          pending.set(fullPath, setTimeout(async () => {
-            pending.delete(fullPath);
-            try {
-              await onChanged(fullPath, event);
-            } catch (err) {
-              onError?.(err instanceof Error ? err : new Error(String(err)));
-            }
-          }, debounceMs));
+          schedule(join(watchDir, filename), event, recordAsDelivered(watchDir, dirState, filename));
         });
         watcher.on("error", (err) => {
           onError?.(err instanceof Error ? err : new Error(String(err)));
         });
         watchers.push(watcher);
+        if (!dirState.listed) {
+          // Listed again now that the watch is live. A change between the two listings may have reached the
+          // watch under another file's name, so it is delivered here; a later change reaches a rescan.
+          const after = listWatchedFiles(dir, watchDir, before?.files ?? null);
+          const initial = after ?? before;
+          if (initial) for (const [name, stat] of initial.files) dirState.listing.set(name, stat);
+          if (after) {
+            for (const [name, event] of after.changes) {
+              const fullPath = join(watchDir, name);
+              if (!pending.has(fullPath)) schedule(fullPath, event, recordAsDelivered(watchDir, dirState, name));
+            }
+          }
+          dirState.listed = true;
+        }
       } catch (err) {
         // Individual dir watch failure is non-fatal — skip it
         if (onError) {
@@ -137,7 +333,10 @@ export function startWatcher(
 
   return {
     close: () => {
+      closed = true;
       for (const w of watchers) w.close();
+      for (const t of rescans) clearTimeout(t);
+      rescans.clear();
       for (const t of pending.values()) clearTimeout(t);
       pending.clear();
     },
