@@ -16,6 +16,27 @@ export type WatcherOptions = {
   onError?: (error: Error) => void;
 };
 
+/** Default cap on the directories watched under one collection path (`CLAWMEM_WATCH_MAX_DIRS` overrides it). */
+export const DEFAULT_MAX_WATCH_DIRS = 500;
+
+/**
+ * The per-collection-path cap on watched directories: `CLAWMEM_WATCH_MAX_DIRS` when it is a positive
+ * integer, else DEFAULT_MAX_WATCH_DIRS (an unusable value is reported through `onInvalid`). Each watched
+ * directory costs one OS watch; on Linux that is an inotify watch, counted against the per-user
+ * `fs.inotify.max_user_watches` limit every process shares, so size the cap against that limit.
+ */
+export function resolveMaxWatchDirs(
+  env: Record<string, string | undefined> = process.env,
+  onInvalid?: (raw: string) => void,
+): number {
+  const raw = env.CLAWMEM_WATCH_MAX_DIRS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_WATCH_DIRS;
+  const n = /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
+  if (Number.isSafeInteger(n) && n > 0) return n;
+  onInvalid?.(raw);
+  return DEFAULT_MAX_WATCH_DIRS;
+}
+
 /**
  * Walk a directory tree, returning only directories that are NOT excluded.
  * Stops recursion into excluded subtrees (gits/, node_modules/, .git/, etc.).
@@ -59,16 +80,18 @@ export function startWatcher(
   const { debounceMs = 2000, onChanged, onError } = options;
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
   const watchers: ReturnType<typeof watch>[] = [];
+  const maxDirs = resolveMaxWatchDirs(process.env, (raw) =>
+    console.log(`[watcher] WARNING: CLAWMEM_WATCH_MAX_DIRS=${JSON.stringify(raw)} is not a positive integer — using ${DEFAULT_MAX_WATCH_DIRS}`));
 
   for (const dir of directories) {
     // Walk the tree, skipping excluded dirs — watch each non-excluded dir individually
     const watchableDirs = walkNonExcludedDirs(dir);
 
-    // Safety: warn and cap if a single collection path produces too many dirs
-    const MAX_WATCH_DIRS = 500;
-    if (watchableDirs.length > MAX_WATCH_DIRS) {
-      console.log(`[watcher] WARNING: ${dir} has ${watchableDirs.length} dirs — capping at ${MAX_WATCH_DIRS} to prevent FD exhaustion. Consider narrowing the collection path.`);
-      watchableDirs.length = MAX_WATCH_DIRS;
+    // Cap the dirs one collection path watches (CLAWMEM_WATCH_MAX_DIRS, default 500). Dirs past the cap
+    // go unwatched: a change there waits for the collection's next full index pass.
+    if (watchableDirs.length > maxDirs) {
+      console.log(`[watcher] WARNING: ${dir} has ${watchableDirs.length} dirs — watching the first ${maxDirs}; changes in the others wait for the next full index pass (clawmem update). Raise the cap with CLAWMEM_WATCH_MAX_DIRS, or narrow the collection path.`);
+      watchableDirs.length = maxDirs;
     } else {
       console.log(`[watcher] ${dir}: watching ${watchableDirs.length} dirs`);
     }

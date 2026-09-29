@@ -63,7 +63,7 @@ import { GoldFileError } from "./eval/gold.ts";
 import { runHookEval, HookEvalIntegrityError, PAIR_TREATMENTS, type RunHookEvalResult, type PairTreatment, type VectorExecSpec } from "./eval/hook-run.ts";
 import { aggregateReplicatedRunDirs, writeReplicatedArtifacts, type ReplicatedAggregate } from "./eval/replicated.ts";
 import { HookGoldFileError } from "./eval/hook-gold.ts";
-import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import { indexCollection, parseDocument, hashContent, pathWithin, watchTargets } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -3509,16 +3509,14 @@ async function cmdWatch() {
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,
     onChanged: async (fullPath, event) => {
-      // Find which collection this belongs to
-      const col = collections.find(c => fullPath.startsWith(c.path));
-      if (!col) return;
-
       // Beads: trigger sync on any change within .beads/ directory
       // Dolt backend writes to .beads/dolt/ — watch for any file change there
       if (fullPath.includes(".beads/")) {
+        const col = collections.find(c => pathWithin(c.path, fullPath) !== null);
+        if (!col) return;
         const projectDir = detectBeadsProject(fullPath.replace(/\/\.beads\/.*$/, ""));
         if (projectDir) {
-          const relativePath = fullPath.slice(col.path.length + 1);
+          const relativePath = pathWithin(col.path, fullPath);
           console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
           const result = await s.syncBeadsIssues(projectDir);
           console.log(`  beads: +${result.created} ~${result.synced}`);
@@ -3526,34 +3524,17 @@ async function cmdWatch() {
         return;
       }
 
-      // Quick pattern check: skip files that can't match the collection pattern
-      // before touching the DB. This prevents broad path collections (e.g. ~/Projects)
-      // with narrow patterns (e.g. single filename) from triggering DB access on
-      // every .md change under the tree.
-      const relativePath = fullPath.slice(col.path.length + 1);
-      if (col.pattern && col.pattern !== "**/*.md") {
-        const patterns = col.pattern.includes("{")
-          ? col.pattern.replace(/^\{|\}$/g, "").split(",")
-          : [col.pattern];
-        const couldMatch = patterns.some(p => {
-          // Simple glob check: if pattern has no wildcards, it's a filename match
-          if (!p.includes("*") && !p.includes("?")) return relativePath === p || relativePath.endsWith("/" + p);
-          // If pattern starts with **/, any relative path could match
-          if (p.startsWith("**/")) return true;
-          // If pattern has a directory prefix, check it
-          const patternDir = p.substring(0, p.lastIndexOf("/") + 1);
-          if (patternDir) return relativePath.startsWith(patternDir);
-          return true; // Fallback: let indexCollection handle it
-        });
-        if (!couldMatch) return;
-      }
-
-      console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
-
-      // Re-index just this collection
-      const stats = await indexCollection(s, col.name, col.path, col.pattern);
-      if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
-        console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}`);
+      // Re-index every collection whose index pass would take this file. The quick
+      // pattern check runs before any DB access, so broad path collections (e.g.
+      // ~/Projects) with narrow patterns (e.g. a single filename) do not touch the DB
+      // on every .md change under the tree. Since v0.40.1 it matches the way an index
+      // pass scans, and an event reaches every such collection, not only the longest path.
+      for (const target of watchTargets(collections, fullPath)) {
+        console.log(`${c.dim}[${event}]${c.reset} ${target.col.name}/${target.relativePath}`);
+        const stats = await indexCollection(s, target.col.name, target.col.path, target.col.pattern);
+        if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
+          console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}`);
+        }
       }
     },
     onError: (err) => {

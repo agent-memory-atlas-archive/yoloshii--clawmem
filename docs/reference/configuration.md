@@ -111,6 +111,12 @@ ClawMem's mutation contract.
 | `CLAWMEM_SERVE_MODE` | `external` | Hermes plugin serve mode: `external` (you run `clawmem serve`) or `managed` (the plugin starts/stops `serve`). |
 | `CLAWMEM_BIN` | (auto-detect on PATH) | Path to the `clawmem` binary, for the Hermes plugin when it is not on `PATH`. |
 
+## File watcher
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CLAWMEM_WATCH_MAX_DIRS` | `500` | **v0.40.1.** The most directories `clawmem watch` watches under one collection path. At startup the watcher walks each collection path, skipping excluded directories, and watches every directory it finds up to this cap. Past the cap, its log prints `WARNING: <path> has N dirs — watching the first <cap>`, and a change in an unwatched directory reaches the vault only on the collection's next full index pass (`clawmem update`). Raise it for a collection with more directories, or narrow the collection path. Each watched directory is one OS watch; on Linux that is an inotify watch, counted against the per-user `fs.inotify.max_user_watches` limit that every process shares (`cat /proc/sys/fs/inotify/max_user_watches`), so leave room for editors and other watchers. Each collection's startup `[watcher]` line gives its count (`watching N dirs`, or `watching the first <cap>` when capped). Their sum is an upper bound on the watcher's kernel watches: overlapping collection paths register some directories twice, and the kernel counts each directory once — [troubleshooting](../troubleshooting.md) shows how to read the exact count. Unset or empty means `500`; any other value that is not a positive integer also falls back to `500`, with a warning line. Read when the watcher starts, so restart it after a change. |
+
 ## Hooks, session & paths
 
 | Variable | Default | Effect |

@@ -8,7 +8,7 @@ import { Glob } from "bun";
 import { isLegacyPrecompactState, retireLegacyPrecompactRow } from "./compaction-state.ts";
 import { isoNow } from "./clock.ts";
 import { readFileSync, statSync } from "fs";
-import { basename, relative } from "path";
+import { basename, isAbsolute, posix, relative, sep } from "path";
 import matter from "gray-matter";
 import { createHash } from "crypto";
 import type { Store } from "./store.ts";
@@ -215,6 +215,49 @@ function expandBraces(pattern: string): string[] {
   const match = pattern.match(/^\{(.+)\}$/);
   if (!match) return [pattern];
   return match[1]!.split(",").map(s => s.trim());
+}
+
+/**
+ * Whether a changed file at `relativePath` can match a collection's `pattern` — the watcher's pre-check.
+ * It matches the way an index pass scans (the same brace expansion and Bun.Glob), so the watcher never
+ * skips a file indexCollection would index. Before v0.40.1 a literal-prefix check dropped every event
+ * for a pattern with a wildcard directory (the Claude Code auto-memory pattern) or a brace list with a
+ * suffix (`{README,guide}.md`).
+ */
+export function matchesCollectionPattern(pattern: string, relativePath: string): boolean {
+  return expandBraces(pattern).some(p => {
+    // A pattern that is not relative to the collection root: let the index pass decide.
+    if (p.startsWith("/") || p.split("/").includes("..")) return true;
+    // "./README.md", "docs/./x/*.md", "docs//x/*.md" and "**/*.md/" scan the same files as their normal form.
+    return new Glob(posix.normalize(p).replace(/\/+$/, "")).match(relativePath);
+  });
+}
+
+/** `fullPath` relative to `root`, in "/" form — or null when it is not inside `root` (either may be unnormalised). */
+export function pathWithin(root: string, fullPath: string): string | null {
+  const rel = relative(root, fullPath);
+  if (rel === "" || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) return null;
+  return rel.split(sep).join("/");
+}
+
+/**
+ * The collections a changed file re-indexes (the watcher's routing): every collection whose path contains
+ * the file and whose pattern can match it, each with the file's path relative to that collection. Before
+ * v0.40.1 an event reached only the longest matching path, so an overlapping outer collection missed a file
+ * the inner collection's pattern rejected; a string-prefix test also matched `notes-archive/` to `notes`.
+ */
+export function watchTargets<C extends { name: string; path: string; pattern?: string }>(
+  collections: readonly C[],
+  fullPath: string,
+): { col: C; relativePath: string }[] {
+  const targets: { col: C; relativePath: string }[] = [];
+  for (const col of collections) {
+    const relativePath = pathWithin(col.path, fullPath);
+    if (relativePath === null) continue;
+    if (col.pattern && col.pattern !== "**/*.md" && !matchesCollectionPattern(col.pattern, relativePath)) continue;
+    targets.push({ col, relativePath });
+  }
+  return targets;
 }
 
 /**

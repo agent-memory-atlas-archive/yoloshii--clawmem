@@ -23,6 +23,24 @@ WantedBy=default.target
 EOF
 ```
 
+### Watching large collections (v0.40.1)
+
+The watcher watches at most 500 directories under each collection path. A collection with more logs `WARNING: <path> has N dirs — watching the first 500 …` at startup, and changes in its unwatched directories reach the vault only on the next full index pass. To raise the cap, add it in a drop-in (`systemctl --user edit clawmem-watcher.service`):
+
+```ini
+[Service]
+Environment=CLAWMEM_WATCH_MAX_DIRS=2000
+```
+
+Then restart the watcher and read its startup lines:
+
+```bash
+systemctl --user restart clawmem-watcher.service
+journalctl --user -u clawmem-watcher.service -n 200 --no-pager | grep '\[watcher\]'
+```
+
+Each watched directory is one inotify watch on Linux, counted against the per-user `fs.inotify.max_user_watches` limit — see [configuration](../reference/configuration.md#file-watcher).
+
 ## Embed timer
 
 Daily embedding sweep at 04:00 UTC:

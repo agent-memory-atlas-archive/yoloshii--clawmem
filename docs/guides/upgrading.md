@@ -59,6 +59,26 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.40.1: the watcher re-indexes every collection it watches
+
+**No vault migration.** Restart the watcher (`systemctl --user restart clawmem-watcher.service`,
+or restart `clawmem watch`), then run `clawmem update` once to index anything the old pre-check
+skipped.
+
+- **Collections that never re-indexed on change now do.** The watcher's pre-check dropped every
+  event for a pattern with a wildcard directory (`*/memory/**/*.md`) or a brace list followed by
+  a suffix (`{README,guide}.md`), and an event reached only the collection with the longest
+  matching path, so an overlapping outer collection missed files the inner one's pattern
+  rejected. If you have either, its next changes trigger index passes (and A-MEM enrichment of
+  the changed documents) that did not happen before — see [troubleshooting](../troubleshooting.md).
+- **The directory cap is a setting.** The watcher watches at most 500 directories under each
+  collection path; its startup log says `WARNING: <path> has N dirs — watching the first 500`
+  when a collection has more. Set `CLAWMEM_WATCH_MAX_DIRS` on the watcher to raise it — see
+  [configuration](../reference/configuration.md#file-watcher) and
+  [systemd services](systemd-services.md#watching-large-collections-v0401).
+
+---
+
 ## v0.40.0: the post-compaction block carries only this session's pre-compaction state
 
 **Nothing has to be run; three things are worth doing.** Through v0.39.1 the

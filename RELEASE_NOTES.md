@@ -4,6 +4,94 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.40.1 — the watcher re-indexes every collection it watches, and its directory cap is a setting
+
+`clawmem watch` checks each changed `.md` file against its collection's pattern before it opens
+the database, so a broad collection path with a narrow pattern does not start an index pass on
+every edit under the tree. That pre-check read the directory part of a pattern as literal text
+(`relativePath.startsWith("*/memory/**/")`) and split a brace list by stripping only a leading
+`{` and a trailing `}`. Two pattern shapes could never pass it:
+
+- a wildcard in a directory part, such as `*/memory/**/*.md` (a Claude Code auto-memory
+  collection rooted at `~/.claude/projects`);
+- a brace list followed by a suffix, such as `{README,guide}.md`, which split into `README`
+  and `guide}.md`.
+
+The watcher dropped every change event for those collections without a log line, so edits and
+deletions reached the vault only when something ran a full pass (`clawmem update`, the `reindex`
+tool). On the host where this was found, 774 indexed documents in five collections were never
+re-indexed on change.
+
+Routing had a gap of its own. An event went only to the collection with the longest matching
+path, found by a string-prefix test. An overlapping outer collection (`**/*.md` around an inner
+`notes.md` collection) therefore missed every file the inner pattern rejected, a sibling that
+shares a name prefix (`notes-archive/` beside `notes/`) was routed to the wrong collection, a
+collection rooted at `/` lost the first character of every path, and a collection whose configured
+path was not normalised (`/notes/./x`) received no events at all.
+
+The pre-check now matches the way an index pass scans: `matchesCollectionPattern` in
+`src/indexer.ts` uses the indexer's own brace expansion and `Bun.Glob`, so the watcher never skips
+a file `indexCollection` would take. Files the pattern cannot match are still skipped before any
+database access. An event now reaches every collection whose path contains the file and whose
+pattern can match it (`watchTargets`), with each relative path computed by `path.relative`.
+
+The release also documents the watcher's directory cap and makes it a setting. At startup the
+watcher walks each collection path and watches every non-excluded directory, one OS watch each,
+up to 500 per collection path. The cap was a constant that only a startup warning mentioned, and
+the warning blamed file-descriptor exhaustion. On Linux, Bun keeps every watch on one inotify
+descriptor; the limit that matters is the kernel's per-user `fs.inotify.max_user_watches`, which
+every process shares. `CLAWMEM_WATCH_MAX_DIRS` now sets the cap. The default stays 500, so nothing
+changes unless you set it. Past the cap the warning says how many directories it watches, that
+changes in the others wait for the next full index pass, and which setting raises the cap.
+
+### What changed
+
+- `src/indexer.ts`: `matchesCollectionPattern(pattern, relativePath)`, built from the indexer's
+  `expandBraces` and `Bun.Glob` (each alternative is normalised, so `./` and `//` segments and a
+  trailing `/` match like the normal form; a pattern that is not relative to the collection root defers to the index pass);
+  `pathWithin(root, fullPath)`; and `watchTargets(collections, fullPath)`.
+- `src/clawmem.ts`: `cmdWatch` re-indexes each collection `watchTargets` returns; no string-prefix
+  gate runs before it, and the beads branch finds its collection with `pathWithin`. A pattern naming a single file
+  (`notes.md`) now passes only that file at the collection root, as the index pass does; the old
+  check also passed a same-named file in any subdirectory, which started a pass that indexed
+  nothing.
+- `src/watcher.ts`: `DEFAULT_MAX_WATCH_DIRS` (500) and `resolveMaxWatchDirs()` read
+  `CLAWMEM_WATCH_MAX_DIRS`. Unset or empty means 500; any other value that is not a positive
+  integer falls back to 500 with a warning line. The cap warning names the setting.
+- Docs: `docs/reference/configuration.md` (a new File watcher section), `docs/troubleshooting.md`
+  (the pre-check and directory-cap entries), `docs/guides/systemd-services.md` (a drop-in example),
+  `docs/guides/upgrading.md`, `AGENTS.md`, `SKILL.md`.
+
+### Verification
+
+`tests/unit/watcher.test.ts` (16 tests) covers the pre-check (both broken shapes, unnormalised and
+out-of-root patterns, non-matching paths still skipped, the shapes that already worked), the routing
+(an overlapping outer collection, a name-prefix sibling, a `/` root, unnormalised collection paths,
+a collection without a pattern) and the cap
+setting (the default, valid, empty and invalid values, and a watcher capped at 3 that names the
+setting in its warning). Against the v0.40.0 pre-check logic, the two broken-shape tests fail and
+the others pass. `tests/integration/cmdwatch-precheck.integration.test.ts` runs the real
+`clawmem watch` against a temp vault with the three collection shapes (one configured with an
+unnormalised path) and checks the log lines and the indexed rows; against the v0.40.0 `cmdWatch` it
+fails. On the host where the
+bug was found, the new pre-check passes every indexed document; the old one dropped 774. Full suite:
+3064 pass / 0 fail; tsc unchanged.
+Cross-model adversarial review (codex / GPT-6, one pinned session) took five turns and fourteen
+findings, seven Medium and seven Low, all fixed. They included the untested call site, an event
+reaching only the longest matching collection path, a string-prefix gate ahead of the routing,
+unnormalised patterns and collection paths that still lost events, and a file-descriptor diagnosis
+that could miss watch exhaustion. It cleared at turn 5 with zero remaining findings.
+
+### What didn't change
+
+- The default cap (500), and which directories the watcher walks and excludes.
+- Index passes: a collection indexes the same files as before. Only which change events reach a
+  pass is different.
+- Nothing to migrate. Restart the watcher to pick up the fix; one `clawmem update` indexes anything
+  the old pre-check skipped.
+
+---
+
 ## v0.40.0 — after a compaction, a session gets back its own pre-compaction state and nobody else's
 
 Through v0.39.1 the pre-compaction state was one file per project directory. `precompact-extract`
