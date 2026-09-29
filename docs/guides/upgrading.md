@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.40.2**.
+Guide for upgrading between released versions. Current: **v0.40.3**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,25 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.40.3: the watcher watches directories made after it starts
+
+**No vault migration.** Restart the watcher (`systemctl --user restart clawmem-watcher.service`,
+or restart `clawmem watch`), then run `clawmem update` once to index the files the old watcher
+missed in directories made while it ran.
+
+- **New directories are watched.** A directory made under a watched collection after the watcher
+  started (a new Claude Code project and its `memory/`, a copied or moved-in folder) went unwatched
+  until a restart. The watcher now takes it on at its parent's next rescan, with the directories
+  under it, and re-indexes the files it already holds. A directory deleted and made again at the
+  same path is watched anew. See [troubleshooting](../troubleshooting.md#indexing).
+- **New directories count against the cap.** `CLAWMEM_WATCH_MAX_DIRS` (default 500) now bounds the
+  directories a collection path watches over the watcher's whole run, not only at start. If the log
+  shows `WARNING: <path> is at its cap of <cap> watched dirs`, raise the cap; see
+  [configuration](../reference/configuration.md#file-watcher). A collection path already over the
+  cap at start watches no new directory.
 
 ---
 

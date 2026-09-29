@@ -4,6 +4,106 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.40.3 — the watcher watches directories made after it starts
+
+`clawmem watch` walked each collection path once, when it started, and watched the directories it
+found. Nothing added a watch later, so a directory made afterwards went unwatched until the watcher
+restarted, and the `.md` files in it reached the vault only on a full pass (`clawmem update`). On a
+Claude Code host a new project directory, and later its `memory/` directory, appears several times
+a day, so the auto-memory collection missed the first memories of every new project. A watched
+directory deleted and made again at the same path fared no better: its old watch received nothing
+for the new directory, and on ext4 the new directory even gets the old inode number back.
+
+The rescan every event schedules (v0.40.2) now also looks at the directory's subdirectories, with
+the startup walk's rules: excluded names (`gits`, `node_modules`, …) and `.`-prefixed names are
+skipped. A symlink is not followed, as the index pass does not follow one, unless it is a collection
+path itself, which the pass scans from. A subdirectory nobody watches is watched from then on. It is
+watched before it is listed, so a file made in between reaches the listing or the watch; each `.md`
+file it already holds is re-indexed; and the directories under it are taken on the same way,
+breadth-first, so a tree made in one go (`mkdir -p`, a copy, a move into the collection) is watched
+to its depth. Each directory of such a tree is decided on its own, so a collection path nested
+inside it is taken on for its own collection. A watched subdirectory that is gone stops being
+watched, with the watched directories under it, and each file it held is re-indexed once more, so
+the removal reaches the vault. A directory is known by its device, inode and birth time, so one
+deleted and made again at the same path is watched anew instead of staying on its dead watch.
+
+### What changed
+
+- `src/watcher.ts`: the subdirectory pass in the rescan; `adopt` (watch, then list, breadth-first);
+  `retire` (a gone or replaced directory and the watched directories under it); the directory
+  identity; the rescan checks its own directory first, so a watched directory that is gone or was
+  replaced is handled even when its parent is not watched. Each collection path counts the
+  directories it watches, new ones included, against `CLAWMEM_WATCH_MAX_DIRS`. A new directory
+  counts for every collection path that watches its parent other than through a symlink, and for
+  one whose own path it is. When none of them has room, the directory is skipped with the tree under
+  it, the log prints `WARNING: <path> is at its cap of <cap> watched dirs` once per collection path,
+  and directories made while it stays at the cap go unwatched (a watched directory that is removed
+  frees its place). A collection path whose startup walk was over the cap watches no new directory,
+  so the directories the cap left out at the start never slip in later. Taking on a tree yields to
+  the event loop every 256 entries, as a rescan does, so a large tree copied into a collection does
+  not hold up the watcher's other work (the vector daemon among it). A new directory that cannot be
+  watched yet (its permissions, the kernel's watch limit) is tried again at each rescan of its parent
+  and reported once. A replaced directory is watched again, path by path, by the collection paths
+  that watched it and the directories under it before; one over the cap at the start takes on nothing
+  its walk left out. The log names each directory the watcher takes on
+  (`[watcher] new directory <path>: watching N dirs`, or `replaced directory`).
+- Docs: `docs/troubleshooting.md` (a new *Indexing* entry), `docs/reference/configuration.md` (the
+  cap counts new directories), `docs/guides/upgrading.md`, `AGENTS.md`, `SKILL.md`.
+
+### Verification
+
+`tests/unit/watcher.test.ts` adds twenty-three tests that drive the real watcher: a directory made
+after the start (a file written in it later is delivered), the files a new directory already holds
+(once each), a new directory holding more files than one batch (each once), a tree made with
+`mkdir -p` (watched to its depth), a new directory whose event Bun < 1.4.0 folds into a file's,
+excluded and hidden directories (never watched), a new symlink to a directory (not followed), a
+symlinked directory the startup walk watched (keeps its watch; a directory made inside it is not
+taken on, since the index pass never reaches it; replaced by a real directory, it is watched as
+one), a collection path made after the start as a symlink (watched through a parent another path
+watches), a collection path nested in a new tree (taken on for its own collection, even with the
+outer one at its cap, and when it is a symlink), a new directory that cannot be watched yet
+(reported once, watched once it can be), a watched directory deleted and made again (the same inode
+on ext4), one another directory is renamed over, a replaced directory holding another collection
+path (re-watched for it, even when that path was over the cap at the start, but never the
+directories its startup walk left out), a watched directory removed with its files (each delivered
+once, and its path made again is watched as new), the cap (new directories past it stay unwatched,
+with one warning), a collection path over the cap at the start (watches no new directory),
+overlapping collection paths (one watch, one delivery) and `close()`. Seventeen of them fail against
+the v0.40.2 watcher under both Bun 1.3.14 and 1.4.2; the other six guard behaviour v0.40.2 already
+had.
+`tests/integration/cmdwatch-new-dirs.integration.test.ts` runs the real `clawmem watch` with a
+Claude Code auto-memory collection: a project and its `memory/` made in one go, a file written later
+in that `memory/`, and a project made first with its `memory/` added later (then an atomic save in
+it) all reach the index; against the v0.40.2 watcher the first step never indexes. Full suite: 3103
+pass / 0 fail on Bun 1.3.14 and on Bun 1.4.2; tsc unchanged. Cross-model adversarial review (codex /
+GPT-6, one pinned session) took seven turns and thirteen findings, ten Medium and three Low, all
+fixed. They included a failed watch that was never tried again, an adoption that held the event loop
+on a large tree, symlinked directories the index pass never reads (taken on, and able to shadow a
+real path), collection paths nested in a new tree, and replacements that re-watched too little, or
+too much for a collection path over the cap at the start. It cleared at turn 7 with zero remaining
+findings.
+
+### What didn't change
+
+- What the watcher watches at start, the per-file debounce, the rescan's comparison of files, the
+  pre-check and routing (`watchTargets`).
+- Each delivered file still starts an index pass of its collection, so a new directory that holds
+  N files costs N passes, as a burst of N changed files already did.
+- New directories count against the cap. On a Claude Code host each session that saves tool results
+  adds a directory or two under its project, so a watcher that runs for weeks on the default cap
+  (500) can reach it; raise `CLAWMEM_WATCH_MAX_DIRS` when the at-cap warning appears.
+- A collection path that does not exist when the watcher starts is watched once it appears only if
+  its parent directory is watched under another collection path.
+- The startup walk still follows a symlink to a directory and watches it, although the index pass
+  does not look inside one. A symlink made after the start is taken on only when it is a collection
+  path itself, and a directory made inside a symlinked one is not taken on.
+- On a filesystem without birth times, a directory deleted and made again with the same inode number
+  is not told apart from the old one, and keeps the old, dead watch until the watcher restarts.
+- Nothing to migrate. Restart the watcher, then run `clawmem update` once to index what the old
+  watcher missed in directories made while it ran.
+
+---
+
 ## v0.40.2 — the watcher re-indexes files saved atomically and files changed together
 
 `clawmem watch` acts on the file name each change event carries. Bun before 1.4.0 folds the events
