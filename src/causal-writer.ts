@@ -323,7 +323,7 @@ export function pruneCausalRuns(db: Database, opts: {
 // =============================================================================
 
 /** Minimal generate() surface — satisfied by LlamaCpp. */
-type CausalLlm = {
+export type CausalLlm = {
   generate(
     prompt: string,
     options: { maxTokens?: number; temperature?: number; signal?: AbortSignal },
@@ -508,11 +508,17 @@ export async function runCausalStep(
      *  audited as document-scope `phase_skipped_budget` events — the causal run
      *  is the invocation's durable audit surface. */
     phaseSkipNotes?: string[];
+    /** 62.1 D3: the run's stable key (`stop:<session>:<transcript key>:<range key>`) — a second start for the same
+     *  committed range fails at the run-row insert below, before any inference. Default: a fresh UUID. */
+    runKey?: string;
+    /** 62.1 D3 (rev 8): the window as it stood when the range committed — only documents created, modified and
+     *  authored (effective time) at or before this instant are admitted. Default: unbounded. */
+    windowAt?: string;
   },
 ): Promise<CausalStepResult> {
   const db = store.db;
   const startedAt = monoNow();
-  const runKey = randomUUID();
+  const runKey = opts.runKey ?? randomUUID();
   // UNIQUE NOT NULL on causal_runs.run_key: a collision fails LOUDLY here, before
   // any inference result exists — never as a silent write_noop downstream.
   const runId = insertCausalRun(db, {
@@ -612,15 +618,17 @@ export async function runCausalStep(
   // tie-break — imported/backfilled observations window by when they were
   // WRITTEN, not when they were filed.
   const placeholders = newIds.size > 0 ? [...newIds].map(() => "?").join(",") : "-1";
+  const windowAt = opts.windowAt ?? null;
   const windowRows = db.prepare(
     `SELECT d.id, d.facts FROM documents d
      WHERE d.collection = '_clawmem' AND d.path LIKE 'observations/%'
        AND d.observation_type IS NOT NULL
        AND d.active = 1 AND d.invalidated_at IS NULL
        AND d.id NOT IN (${placeholders})
+       ${windowAt ? "AND d.created_at <= ? AND d.modified_at <= ? AND COALESCE(d.authored_at, d.modified_at) <= ?" : ""}
      ORDER BY COALESCE(d.authored_at, d.modified_at) DESC, d.id DESC
      LIMIT ?`,
-  ).all(...[...newIds], windowCfg.window) as { id: number; facts: string | null }[];
+  ).all(...[...newIds], ...(windowAt ? [windowAt, windowAt, windowAt] : []), windowCfg.window) as { id: number; facts: string | null }[];
 
   // --- Fact assembly under hard input bounds (new-first) ---------------------
   const facts: FactEntry[] = [];

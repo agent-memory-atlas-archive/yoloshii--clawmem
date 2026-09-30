@@ -16,15 +16,21 @@ This installs hooks into `~/.claude/settings.json`:
 | `curator-nudge` | SessionStart | 5s | Surface maintenance suggestions |
 | `postcompact-inject` | SessionStart (matcher `compact`) | 5s | Re-inject this session's state after compaction |
 | `precompact-extract` | PreCompact | 5s | Preserve state before compaction |
-| `decision-extractor` | Stop | 30s | Extract observations from conversation |
-| `handoff-generator` | Stop | 30s | Summarize session for continuity |
-| `feedback-loop` | Stop | 30s | Track referenced notes, boost confidence |
+| `decision-extractor` | Stop | 30s | Extract observations from the turns not yet processed |
+| `handoff-generator` | Stop | 30s | Digest each new turn; update the session summary |
+| `feedback-loop` | Stop | 30s | Credit the surfaced notes each turn verifiably referenced |
+| `handoff-generator` | SessionEnd | 2s | Render the handoff's latest turns (no transcript read, no model) |
 
-`decision-extractor` runs its model-bearing phases under an internal whole-handler
-budget, `CLAWMEM_STOP_BUDGET_MS` (default 25000 ms), so it finishes and persists
-before the host's 30s Stop timeout kills it. If you raise the budget, raise the
-installed hook `timeout` too — the host timeout must always exceed the budget
-plus a safety margin ([configuration](../reference/configuration.md)).
+Claude Code runs the Stop hooks after every response. Since v0.41.0 `decision-extractor` and
+`handoff-generator` keep a cursor per transcript and process only what they have not processed, and
+`feedback-loop` decides each surfaced turn once, so a turn is extracted, digested and credited once
+however many Stops follow it (see [What the Stop hooks write](#what-the-stop-hooks-write)).
+
+The three Stop hooks run their model-bearing and transcript-reading phases under an internal
+budget, `CLAWMEM_STOP_BUDGET_MS` (default 25000 ms), so they finish and persist before the host's
+30s Stop timeout kills them. If you raise the budget, raise the installed hook `timeout` too — the
+host timeout must always exceed the budget plus a safety margin
+([configuration](../reference/configuration.md)).
 
 ## Manual install (full reference)
 
@@ -70,6 +76,14 @@ If you prefer to configure hooks manually instead of running `setup hooks`, add 
           { "type": "command", "command": "/path/to/clawmem hook decision-extractor", "timeout": 30 },
           { "type": "command", "command": "/path/to/clawmem hook handoff-generator", "timeout": 30 },
           { "type": "command", "command": "/path/to/clawmem hook feedback-loop", "timeout": 30 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/path/to/clawmem hook handoff-generator", "timeout": 2 }
         ]
       }
     ]
@@ -152,7 +166,7 @@ Four steps:
 
 ## Timeouts
 
-All hooks use Claude Code's native `timeout` property (in seconds). Stop hooks use 30s to allow LLM inference to complete; other hooks use 5-8s.
+All hooks use Claude Code's native `timeout` property (in seconds). Stop hooks use 30s to allow LLM inference to complete; other hooks use 5-8s. The SessionEnd flush uses 2s: Claude Code gives SessionEnd hooks 1.5s in all (more only when `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` raises it), and the flush stops itself after 1s, waiting at most 250 ms for a busy vault.
 
 The `context-surfacing` host timeout is derived, not fixed (v0.38.0): `clawmem setup hooks` writes `timeout ≥ ceil((1.5s startup allowance + CLAWMEM_HOOK_BUDGET_MS) / 1000)` and pins the budget into the installed hook command's env prefix, so the installed hook always runs under the budget its timeout was sized for. An existing larger host timeout is preserved (never reduced). `clawmem doctor` verifies the inequality and shows red when the host would kill the hook before its internal deadlines can act. It checks every installed `context-surfacing` entry, and it can read the budget only in the form `setup hooks` writes — a leading `CLAWMEM_HOOK_BUDGET_MS=<n>` assignment before the executable. Any other form (a quoted or escaped value, a shell expansion, `env`/`export`, an assignment after the executable) is reported red as UNVERIFIED, because the value the shell passes cannot be checked. Entries that pin different budgets are a red CONFLICT, and more than one entry is flagged because each runs on every prompt.
 
@@ -162,15 +176,35 @@ The `context-surfacing` host timeout is derived, not fixed (v0.38.0): `clawmem s
 
 The `context-surfacing` hook suppresses duplicate prompts using SHA-256 hashing with a 600-second window (`hook_dedupe` table). Heartbeat prompts are also detected and skipped.
 
-The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`) use `saveMemory()` which enforces a 30-minute normalized content hash dedup window, preventing duplicate observations across concurrent or rapid sessions.
+The Stop-event hooks do not deduplicate by content window (through v0.40.3 they relied on `saveMemory()`'s 30-minute hash window and on merge policies across sessions). Since v0.41.0 the extractor's and the handoff's cursors process a turn once, and an item is dropped only when the same session emits it again with identical content.
 
 ## What the Stop hooks write
+
+- **`decision-extractor`** sends the turns after its cursor to the observer in batches, with the two
+  turns before them and the session's recorded observation titles as context. A batch with no
+  assistant message of 40 characters or more and no tool call is skipped. A batch whose model call
+  fails is quarantined and retried later (1 minute, 5 minutes, 30 minutes, 2 hours, then every 12
+  hours) by later Stops and the watcher; its turns are never committed as empty.
+- **Session documents.** The session's decisions and antipatterns are items, rendered into its own
+  `_clawmem/decisions/<date>-<sid8>.md` and `_clawmem/antipatterns/<date>-<sid8>.md` at a path fixed
+  when each is first written; a second transcript of the same session id adds `-<tk6>`. They are
+  never merged with another session's.
+- **`handoff-generator`** records a digest of each new turn (request, final answer, files edited)
+  without a model, and folds the digests into the session summary when 3 have gathered, 30 minutes
+  after the last summary, or at the session's first. `_clawmem/handoffs/<date>-<sid8>.md` shows the
+  summary and the turns after it. At SessionEnd it only renders what is stored. A transcript gets a
+  handoff once it holds four messages.
+- **`feedback-loop`** credits a surfaced note when the turn it was injected into names it: its path,
+  its file name as a whole token, or its title as it was rendered. Each note is credited once per
+  turn, when the turn is over (a later prompt, a Stop, the summary entry Claude Code writes after
+  each Stop, or the session's end), and never by the turn's position.
 
 `decision-extractor` does more than persist observations: when a contradiction **judge** is
 configured (`CLAWMEM_JUDGE_*`, v0.29.0 — disabled otherwise), it classifies each session's new
 facts against the memories they resemble, and a `contradiction` verdict lowers the older
 document's confidence by 0.25 (floored at 0.2). That is a ranking signal — the document stays
-retrievable.
+retrievable. A pair it has decided is not judged again, and a verdict whose older document changed
+during the call is re-judged against the new content by the watcher.
 
 When erosion reaches the floor the hook can additionally set `invalidated_at`, which removes the
 document from FTS and vector retrieval outright. **That step is off by default** — it logs

@@ -385,7 +385,9 @@ describe("t62 F61-4: named-vault mirror insert is retry-idempotent", () => {
       vaultStore.insertRecallEvents = () => { throw new Error("crash window (simulated)"); };
       const r1 = applySurfacingBookkeeping(store, j, seam);
       expect(r1.failedUnits).toEqual(["vault:skill"]);
-      expect((vaultStore.db.prepare("SELECT COUNT(*) c FROM context_usage WHERE session_id = 'bk-s1'").get() as { c: number }).c).toBe(1);
+      // 62.1 D6: the mirror, its membership and its events commit in ONE vault transaction, so the crash leaves no
+      // half-written mirror behind (through v0.40 the mirror survived alone: 1 row here).
+      expect((vaultStore.db.prepare("SELECT COUNT(*) c FROM context_usage WHERE session_id = 'bk-s1'").get() as { c: number }).c).toBe(0);
       vaultStore.insertRecallEvents = realInsert;
       // Reclaim/retry — the unit reruns FROM THE TOP (mirror insert included).
       const r2 = applySurfacingBookkeeping(store, { ...j, completedUnits: r1.completedUnits, ...(r1.usageLinked !== undefined ? { usageLinked: r1.usageLinked } : {}) }, seam);

@@ -55,9 +55,10 @@ clawmem doctor                              # full health check (clawmem status 
 | `postcompact-inject` | SessionStart (compact) | re-injects THIS session's pre-compaction state + recent vault decisions, framed as reference data → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
 | `precompact-extract` | PreCompact | extracts the last typed request / decisions / file paths / open questions before compaction → the vault's session-keyed `compaction_state` row |
-| `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples (+ the causal witness writer when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on` — default `off`) |
-| `handoff-generator` | Stop | LLM session summary → handoffs |
-| `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
+| `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples from the turns after its cursor, each turn once (v0.41.0) → the session's own decision/antipattern docs (+ the causal witness writer when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on` — default `off`) |
+| `handoff-generator` | Stop | per-turn digest (no model) + throttled incremental LLM summary → the session's handoff |
+| `handoff-generator` | SessionEnd | render-only flush of the handoff's latest turns (v0.41.0; no transcript read, no model) |
+| `feedback-loop` | Stop | credits each surfaced note once per turn when that turn verifiably names it → access count, utility signal, recall event, same-turn co-activations |
 
 **Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
 **Blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the default-filtered MCP retrieval tools (`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, `find_similar`; `memory_rank` since v0.36.0) exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design. Since v0.32.0, WHY-classified queries on the filtered causal routes additionally reach `_clawmem` *observation* documents (never handoffs/deductions) through a bounded observation lane, so causal answers can surface their reasoning artifacts without `includeInternal`.
@@ -144,7 +145,7 @@ Applied on the composite surfaces: `query` and `memory_retrieve`'s keyword/hybri
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
-- `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× … 1.3×); `coActivationBoost` up to +15%; length-normalized (floor 30%); frequency boost capped +10%; **pinned docs +0.3 additive on composite surfaces** (raw routes — vector + `search` non-recency: pin = exact-tie precedence only).
+- `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× … 1.3×); `coActivationBoost` up to +15% (co-activations = notes verifiably referenced in the same turn, v0.41.0); length-normalized (floor 30%); frequency boost capped +10%; **pinned docs +0.3 additive on composite surfaces** (raw routes — vector + `search` non-recency: pin = exact-tie precedence only).
 - **`query` tool (v0.13.0+):** non-recency queries use **0.70·search + 0.15·recency + 0.15·confidence**. `memory_retrieve`'s composite modes, context-surfacing, and `search`'s recency branch keep the 0.50/0.25/0.25 default. (`vsearch` + `memory_retrieve` semantic/discovery use RAW cosine, and `search` uses the RAW BM25 transform, for non-recency queries — v0.22.0/v0.24.0: no composite weights at all.)
 - **Recency intent** ("latest"/"recent"/"last session") switches all to **0.10·search + 0.70·recency + 0.20·confidence**.
 - **Inspect a live ranking (v0.36.0):** `memory_rank(query)` returns each result's captured per-factor breakdown (weights, recency/confidence inputs, multipliers, signed pinΔ, co-activation) plus raw-vs-composite rank shifts — demoted raw winners stay visible. Diagnose before assuming why something ranked.
@@ -182,6 +183,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Operational gotchas
 
+- **Stop pipeline (v0.41.0)** → `decision-extractor` and `handoff-generator` keep a cursor per transcript and `feedback-loop` decides each surfaced turn once, so a turn is extracted, digested and credited once; `clawmem watch` runs the worker that finishes what a missing Stop left, and its FIRST start recomputes the feedback counters from verified references (access counts start near zero; documents recently accessed get a staggered archive grace). Upgrade EVERY process that shares the vault: the fence skips an older ClawMem's Stop-hook writes and its surfacing hook injects nothing (`clawmem doctor` ✗ for 24 h after the last caught write). Re-run `clawmem setup hooks` for the SessionEnd flush; Hermes: copy the plugin again. Queues older than 24 h → `clawmem repair stop-queue --run`. → [upgrading](docs/guides/upgrading.md), [architecture](docs/concepts/architecture.md#stop-pipeline).
 - **Empty `context-surfacing`** → prompt < 20 chars (short memory-intent queries like "what did I say?" are exempt — they force retrieval), starts with `/`, or nothing scored above threshold. Check `clawmem status` + embedding coverage.
 - **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed`.
 - **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs`. Don't run it after every reindex (A-MEM links per-doc automatically).
@@ -217,7 +219,7 @@ Maintenance agent for Tier-3 work the main agent neglects. Install: `clawmem set
 
 - **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 33 MCP tools = 10%.
 - **OpenClaw** — native memory plugin (`kind: memory`, v0.10.0+): `clawmem setup openclaw`. → [docs/guides/openclaw-plugin.md](docs/guides/openclaw-plugin.md).
-- **Hermes** — `MemoryProvider` plugin: copy `src/hermes/` into `$HERMES_HOME/plugins/clawmem/`. → [docs/guides/hermes-plugin.md](docs/guides/hermes-plugin.md).
+- **Hermes** — `MemoryProvider` plugin: copy the contents of `src/hermes/` into `$HERMES_HOME/plugins/clawmem/` (`cp -r src/hermes/. …/clawmem/`; again at every upgrade). → [docs/guides/hermes-plugin.md](docs/guides/hermes-plugin.md).
 - **REST API** — `clawmem serve [--port 7438]`. → [docs/reference/rest-api.md](docs/reference/rest-api.md).
 
 All integrations share the same SQLite vault — decisions captured in one runtime surface in the others.

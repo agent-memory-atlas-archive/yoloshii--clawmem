@@ -42,11 +42,12 @@ function seedUsage(
   },
 ): void {
   const ts = new Date(Date.now() - (opts.minutesAgo ?? 0) * 60 * 1000).toISOString();
+  // 62.1 D9: rows this version writes carry a writer stamp; an unstamped insert is an older ClawMem's and fails.
   store.db.prepare(
     `INSERT INTO context_usage
        (session_id, timestamp, hook_name, injected_paths, estimated_tokens,
-        was_referenced, turn_index, query_text)
-     VALUES (?, ?, ?, '[]', 0, 0, ?, ?)`,
+        was_referenced, turn_index, query_text, writer_stamp)
+     VALUES (?, ?, ?, '[]', 0, 0, ?, ?, 'fixture')`,
   ).run(
     opts.sessionId,
     ts,

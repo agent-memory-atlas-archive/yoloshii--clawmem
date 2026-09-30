@@ -38,11 +38,11 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Guards the deep rerank lane** — cross-encoder scores apply only under full candidate coverage AND a discriminating score set (degeneracy gate); the reranker joins the final order as a rank-fused lane, and remote rerank scores are cached only under an attested provider identity (`clawmem rerank-health`) (v0.38.0)
 - **Keeps the hook's write path off your prompt latency** — turn alignment is one early fail-closed row; recall attribution, token accounting, and vault mirrors are handed to a detached drainer process through an on-disk spool after the payload is emitted (v0.38.0)
 - **Scores document quality** using structure, keywords, and metadata richness signals
-- **Boosts co-accessed documents** — notes frequently surfaced together get retrieval reinforcement on the composite MCP surfaces (removed from hook ordering in v0.38.0 — the injected order is the channel-aware fusion key alone)
+- **Boosts co-accessed documents** — notes the agent verifiably referenced together in one turn (v0.41.0) get retrieval reinforcement on the composite MCP surfaces (removed from hook ordering in v0.38.0 — the injected order is the channel-aware fusion key alone)
 - **Decomposes complex queries** into typed retrieval clauses (BM25/vector/graph) for multi-topic questions
 - **Cleans stale embeddings** automatically before embed runs, removing orphans from deleted/changed documents
 - **Transaction-safe indexing** — crash mid-index leaves zero partial state (atomic commit with rollback)
-- **Deduplicates hook-generated observations** within a 30-minute window using normalized content hashing, preventing memory bloat from repeated hook output
+- **Processes each turn once** — the extraction and handoff hooks keep a cursor per transcript and the feedback hook decides each surfaced turn once (v0.41.0), so a turn is extracted, summarised and credited once instead of again at every response, and each session's documents are its own
 - **Navigates temporal neighborhoods** around any document via the `timeline` tool — progressive disclosure from search to chronological context to full content
 - **Boosts frequently-revised memories** — documents with higher revision counts get a durability signal in composite scoring (capped at 10%)
 - **Supports pin/snooze lifecycle** for persistent boosts and temporary suppression
@@ -230,11 +230,14 @@ ClawMem integrates as a native MemoryProvider plugin — Hermes's pluggable inte
 ```bash
 # Preferred — user-plugin path (Hermes #10529, v2026.4.13+).
 # Survives `git pull` of hermes-agent and avoids dual-registration with bundled providers.
-cp -r /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
+# Copies the directory's CONTENTS, so the same command installs and upgrades.
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem"
+cp -r /path/to/ClawMem/src/hermes/. "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem/"
 
 # Or, the bundled-style path (always supported, takes precedence on name collisions).
 # Recommended only when you actively work in the hermes-agent source tree.
-cp -r /path/to/ClawMem/src/hermes /path/to/hermes-agent/plugins/memory/clawmem
+mkdir -p /path/to/hermes-agent/plugins/memory/clawmem
+cp -r /path/to/ClawMem/src/hermes/. /path/to/hermes-agent/plugins/memory/clawmem/
 
 # Symlink alternative for in-place development (either path).
 ln -s /path/to/ClawMem/src/hermes ${HERMES_HOME:-~/.hermes}/plugins/clawmem
@@ -253,7 +256,8 @@ Then set `memory.provider: clawmem` in your Hermes `config.yaml`, or run `hermes
 **What the plugin provides:**
 
 - **`prefetch()`** — prompt-aware retrieval via `context-surfacing` hook (automatic every turn)
-- **`on_session_end()`** — decision extraction, handoff generation, feedback loop (parallel)
+- **`sync_turn()`** — appends the turn to the plugin's transcript, then runs decision extraction, handoff generation and the feedback loop over it in the background (v0.41.0: after every turn; each turn is processed once)
+- **`on_session_end()`** — a last pass, then the SessionEnd handoff flush
 - **`on_pre_compress()`** — pre-compaction state preservation
 - **`session-bootstrap`** — session registration + first-turn context injection
 - **5 agent tools** — `clawmem_retrieve`, `clawmem_get`, `clawmem_session_log`, `clawmem_timeline`, `clawmem_similar`
@@ -630,9 +634,10 @@ Hooks installed by `clawmem setup hooks`:
 | `postcompact-inject` | SessionStart (compact) | Re-injects context after compaction, framed as reference data: this session's pre-compaction state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | Extracts the last typed request, decisions, file paths and open questions before compaction → the vault's session-keyed `compaction_state` row, taken once by the same session's `postcompact-inject` |
-| `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries), infers causal links, detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0) |
-| `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
-| `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation + usage relations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
+| `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries) from the turns after its per-transcript cursor, each turn once (v0.41.0), into the session's own decision and antipattern docs; detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0) |
+| `handoff-generator` | Stop | Digests each new turn without a model, then folds the digests into an incremental, throttled observer summary → the session's handoff |
+| `handoff-generator` | SessionEnd | Renders the handoff's latest turns at session end (no transcript read, no model; v0.41.0) |
+| `feedback-loop` | Stop | Silently credits each surfaced note once per turn when that turn verifiably names it (path, file name or rendered title): access count, co-activation + usage relations among the notes that turn referenced, utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
 Additional hooks available but not installed by default:
 
@@ -753,7 +758,7 @@ Empirical tracking of which documents are surfaced by retrieval, which queries s
 - **Per-query diversity**: docs surfaced by multiple distinct queries have proven cross-domain relevance
 - **Multi-day spacing**: docs surfaced across separate calendar days (spaced frequency) are more valuable than binge recalls in one session
 - **Negative signals**: docs surfaced frequently but rarely referenced are noise candidates for snooze
-- **Per-turn attribution**: feedback-loop segments the transcript into turns and attributes references to specific context-surfacing invocations, not the session globally
+- **Per-turn attribution**: feedback-loop pairs each transcript turn with the context-surfacing row that served it (prompt hash + the host's order of events, never position) and tests only that turn's answer against that turn's injected documents (v0.41.0)
 
 Data feeds `lifecycle_status` (pin/snooze candidate reports) and `lifecycle_sweep` (recall-based recommendations). Adapted from [OpenClaw](https://github.com/openclaw/openclaw) dreaming promotion patterns.
 
@@ -779,7 +784,7 @@ Automatically generates context sections in per-folder CLAUDE.md files from rece
 
 ### Feedback Loop
 
-Notes referenced by the agent during a session get boosted (`access_count++`). Unreferenced notes decay via recency. Over time, useful notes rise and noise fades.
+A surfaced note gets `access_count + 1` when a turn it was injected into names it — once per turn, when the turn is over (v0.41.0; earlier versions counted the whole session again at every Stop). Unreferenced notes decay via recency. Over time, useful notes rise and noise fades.
 
 ### Offline Eval Harness
 
@@ -878,7 +883,7 @@ The primary workspace where the agent operates. Path varies by client (e.g., `~/
 ├── _clawmem/                        # Auto-generated — DO NOT EDIT
 │   ├── user/                        #   User memories (persist across agents/sessions)
 │   │   ├── profile.md               #     Static facts + dynamic context
-│   │   ├── preferences/             #     Extracted preferences (update_existing merge policy)
+│   │   ├── preferences/             #     Extracted preferences
 │   │   └── entities/                #     Named entities (people, services, repos)
 │   └── agent/                       #   Agent memories (operational, session-derived)
 │       ├── observations/            #     Decisions + observations from transcripts
@@ -920,11 +925,11 @@ Each project gets its own collection. Same structure, with optional Beads integr
 
 | Principle | Rationale | ClawMem Mechanism |
 |---|---|---|
-| **User/agent separation** | User memories (preferences, entities, profile) are owned by the human and persist indefinitely. Agent memories (observations, handoffs) are operational artifacts with lifecycle management. | `_clawmem/user/` vs `_clawmem/agent/` — different merge policies and decay rules per content type |
+| **User/agent separation** | User memories (preferences, entities, profile) are owned by the human and persist indefinitely. Agent memories (observations, handoffs) are operational artifacts with lifecycle management. | `_clawmem/user/` vs `_clawmem/agent/` — different decay rules per content type |
 | **Resources are first-class** | Static knowledge (runbooks, architecture docs, API refs) should never lose relevance due to recency decay. | `resources/` indexed with `content_type: hub` → ∞ half-life in composite scoring |
 | **Progressive disclosure** | Hook injection (2000 token budget) benefits from tiered loading: compact snippets first, full content on demand. | `compact=true` (L1) → `multi_get` (L2) at query time. Pre-computed abstracts not yet implemented — candidate for future L0 tier. |
 | **Beads as memory edges** | Issue tracker data bridges into the knowledge graph via typed relations, not just as flat documents. | `syncBeadsIssues()` maps deps → `memory_relations`: blocks→causal, discovered-from→supporting, relates-to→semantic |
-| **Merge policies per facet** | Different memory types need different deduplication strategies to prevent bloat. | `saveMemory()` dedup window (30min, normalized hash) + `getMergePolicy()`: decision→dedup_check (cosine>0.92), antipattern→merge_recent (7d), preference→update_existing, handoff→always_new |
+| **Each turn captured once, per session** | Session-derived memory must neither repeat itself at every response nor overwrite another session's. | Transcript cursors for extraction and handoffs, a once-per-turn feedback verdict, items rendered into per-session decision/antipattern/handoff docs (v0.41.0; the cross-session merge policies and hash-window dedup they replaced are gone) |
 
 ### Layer Mapping
 
@@ -935,7 +940,7 @@ Each project gets its own collection. Same structure, with optional Beads integr
 | Static Resources | `resources/**/*.md` | Human | ∞ (hub) | Fragment-embedded, no recency penalty |
 | Research | `research/*.md` | Human | 90 days | Fragment-embedded for granular retrieval |
 | User Profile | `_clawmem/user/profile.md` | Auto | ∞ | Static facts + dynamic context |
-| User Preferences | `_clawmem/user/preferences/*.md` | Auto | ∞ | Extracted preferences (update_existing merge) |
+| User Preferences | `_clawmem/user/preferences/*.md` | Auto | ∞ | Extracted preferences |
 | User Entities | `_clawmem/user/entities/*.md` | Auto | ∞ | Named entities across sessions |
 | Observations | `_clawmem/agent/observations/*.md` | Auto | 180d (decision) | Decisions + observations from transcripts |
 | Handoffs | `_clawmem/agent/handoffs/*.md` | Auto | 30 days | Session summaries with next steps |

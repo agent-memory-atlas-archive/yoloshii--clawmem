@@ -63,6 +63,7 @@ import {
   type BeforeResetEvent,
   type Logger,
   type SessionEndEvent,
+  type SessionEndContext,
   type SessionStartContext,
   type SessionStartEvent,
 } from "./engine.js";
@@ -228,8 +229,9 @@ const clawmemPlugin = {
     });
 
     // ----- Plugin Hook: session_end -----
-    api.on("session_end", async (event: SessionEndEvent, _ctx: unknown) => {
-      handleSessionEnd(logger, event);
+    // 62.1 D5: the handoff's render-only flush is awaited before the per-session state is cleared.
+    api.on("session_end", async (event: SessionEndEvent, ctx: SessionEndContext) => {
+      await handleSessionEnd(cfg, logger, event, ctx);
     });
 
     // ----- Plugin Hook: before_reset -----

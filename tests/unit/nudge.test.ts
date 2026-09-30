@@ -18,9 +18,10 @@ beforeEach(() => {
 });
 
 function insertUsage(store: Store, hookName: string, n: number = 1) {
+  // 62.1 D9: rows this version writes carry a writer stamp; an unstamped insert is an older ClawMem's and fails.
   const stmt = store.db.prepare(`
-    INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced)
-    VALUES ('test-session', datetime('now'), ?, '[]', 0, 0)
+    INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, writer_stamp)
+    VALUES ('test-session', datetime('now'), ?, '[]', 0, 0, 'fixture')
   `);
   for (let i = 0; i < n; i++) {
     stmt.run(hookName);

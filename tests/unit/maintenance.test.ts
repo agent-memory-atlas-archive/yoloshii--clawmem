@@ -97,9 +97,10 @@ function seedObservation(
 function seedContextUsage(store: Store, minutesAgo: number, count: number = 1): void {
   const ts = new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
   for (let i = 0; i < count; i++) {
+    // 62.1 D9: rows this version writes carry a writer stamp; an unstamped insert is an older ClawMem's and fails.
     store.db.prepare(
-      `INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens)
-         VALUES ('s1', ?, 'context-surfacing', '[]', 100)`,
+      `INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, writer_stamp)
+         VALUES ('s1', ?, 'context-surfacing', '[]', 100, 'fixture')`,
     ).run(ts);
   }
 }
@@ -275,7 +276,8 @@ describe("selectStaleObservationBatch", () => {
     });
 
     // Force last_accessed_at to NULL to hit the modified_at fallback
-    store.db.prepare(`UPDATE documents SET last_accessed_at = NULL WHERE id IN (?, ?)`).run(id1, id2);
+    // 62.1 D9: a counter write carries a fresh counter stamp (an unstamped one is an older ClawMem's and is ignored).
+    store.db.prepare(`UPDATE documents SET last_accessed_at = NULL, counter_stamp = lower(hex(randomblob(8))) WHERE id IN (?, ?)`).run(id1, id2);
 
     const ordered = selectStaleObservationBatch(store, 10);
     expect(ordered).toEqual([id1, id2]); // old first

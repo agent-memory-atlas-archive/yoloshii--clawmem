@@ -12,9 +12,11 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 | `postcompact-inject` | SessionStart (`compact` only) | 1200 tokens | Re-injects THIS session's pre-compaction state (claimed once, then deleted) plus recent vault decisions and antipatterns, framed as reference data rather than instructions. Startup, resume, clear and fork starts get nothing. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts the last typed request (never a tool result), decisions and open questions from prose, and file paths, before compaction. Stores it as the session's row in the vault's `compaction_state` table (15-minute lifetime). |
-| `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0). Extracts SPO triples from decision/preference/milestone/problem facts. |
-| `handoff-generator` | Stop | — | LLM summarizes the session for cross-session continuity. |
-| `feedback-loop` | Stop | — | Tracks which notes were referenced. Boosts their confidence. Per-turn recall attribution marks which surfaced docs were actually cited. |
+| `decision-extractor` | Stop | — | LLM extracts observations from the turns after its cursor, each turn once (v0.41.0), into the session's own decision and antipattern documents. Detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0). Extracts SPO triples from decision/preference/milestone/problem facts. The causal witness step runs once per processed range when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on`. |
+| `handoff-generator` | Stop, SessionEnd | — | At a Stop: a digest of each new turn (no model), then an incremental, throttled LLM summary. At SessionEnd: renders the stored summary and latest digests only. One handoff per session and transcript. |
+| `feedback-loop` | Stop | — | Credits each surfaced note once per turn when the turn it was injected into verifiably names it (path, file name, or rendered title): access count, utility signal, recall event, and co-activation and `usage` relations among the notes that turn referenced. |
+
+Since v0.41.0 `decision-extractor` and `handoff-generator` keep a cursor per transcript and `feedback-loop` decides each surfaced turn once, so a turn is processed once whatever number of Stops follow it, and `clawmem watch` finishes what a missing Stop left (see [architecture](architecture.md#stop-pipeline)).
 
 ### How context-surfacing works
 
@@ -146,6 +148,6 @@ The remaining 10% — the MCP tools — covers situations where hooks can't help
 
 ### Making agents more proactive
 
-For the proactive operations agents should be doing (pinning critical decisions, snoozing noisy context, running deeper searches when surfaced context is relevant but thin), instruction redundancy helps. Place the routing rules and escalation gates in your global CLAUDE.md or AGENTS.md so they load on every conversation. The trigger block in the README's [Agent Instructions](../README.md#agent-instructions) section is designed for this — it gives the agent routing rules always loaded, with SKILL.md as on-demand deep reference.
+For the proactive operations agents should be doing (pinning critical decisions, snoozing noisy context, running deeper searches when surfaced context is relevant but thin), instruction redundancy helps. Place the routing rules and escalation gates in your global CLAUDE.md or AGENTS.md so they load on every conversation. The trigger block in the README's [Agent Instructions](../../README.md#agent-instructions) section is designed for this — it gives the agent routing rules always loaded, with SKILL.md as on-demand deep reference.
 
 This stubbornness around proactive memory tool use is unlikely to change until model providers include memory management patterns in their training data. Until then, hooks carry the weight, and instruction redundancy is the best mitigation for the rest.

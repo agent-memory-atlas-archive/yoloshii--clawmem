@@ -49,6 +49,9 @@ import {
 import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
+import { stopPipelineReady } from "../stop-schema.ts";
+import { replayDueRetries, runDecisionExtraction } from "../stop-extract.ts";
+import { drainCausalMarkers } from "../stop-causal.ts";
 import { monoNow, deadlineAfter, deadlineBefore, remainingForTimeout, shorterThan, duration, isExpired, signalAfter, evidenceMs, type MonoDeadline, toDate, epochNow, epochMs } from "../clock.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
@@ -60,100 +63,8 @@ const SPO_ELIGIBLE_OBSERVATION_TYPES = new Set<Observation["type"]>([
   "discovery", "feature",
 ]);
 
-// =============================================================================
-// Facet-Based Merge Policy
-// =============================================================================
-
-export type MergePolicy = 'always_new' | 'merge_recent' | 'update_existing' | 'dedup_check';
-
-/**
- * Content-type-specific merge policy. Controls how new extracted content
- * interacts with existing entries to prevent memory bloat.
- *
- * - always_new: Every entry is unique (handoffs, observations)
- * - merge_recent: Merge with recent same-topic entry if within 7 days
- * - update_existing: Overwrite older entry on same topic
- * - dedup_check: Check embedding similarity before inserting
- */
-export function getMergePolicy(contentType: string): MergePolicy {
-  switch (contentType) {
-    case 'decision': return 'dedup_check';
-    case 'antipattern': return 'merge_recent';
-    case 'preference': return 'update_existing';
-    case 'handoff': return 'always_new';
-    default: return 'always_new';
-  }
-}
-
-const DEDUP_SIMILARITY_THRESHOLD = 0.92;
-const MERGE_RECENT_DAYS = 7;
-
-/**
- * Check if a new document should be merged/skipped based on merge policy.
- * Returns the existing doc ID to merge with, or null to insert new.
- */
-export async function checkMergePolicy(
-  store: Store,
-  contentType: string,
-  body: string,
-  collection: string,
-  /** s342 D2 / O1: monotonic deadline (already net of the persistence reserve)
-   *  that bounds the dedup embedding. Past it, dedup degrades to a plain insert —
-   *  saveMemory's hash dedup still applies — rather than starting a model call
-   *  outside the Stop budget. */
-  deadline?: MonoDeadline,
-): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
-  const policy = getMergePolicy(contentType);
-
-  if (policy === 'always_new') return { action: 'insert' };
-
-  // Get recent entries of same content type
-  const recentDocs = store.getDocumentsByType(contentType, 5);
-  if (recentDocs.length === 0) return { action: 'insert' };
-
-  if (policy === 'dedup_check') {
-    if (deadline !== undefined && isExpired(deadline)) {
-      return { action: 'insert' };
-    }
-    // Vector similarity check against recent entries
-    try {
-      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3, undefined, undefined, undefined, deadline);
-      const sameType = results.filter(r =>
-        r.collectionName === collection &&
-        r.score >= DEDUP_SIMILARITY_THRESHOLD
-      );
-      if (sameType.length > 0) {
-        return { action: 'skip' };
-      }
-    } catch (e) {
-      warnOnceOnVectorModelMismatch(e);
-      // Vector search unavailable — fall through to insert
-    }
-    return { action: 'insert' };
-  }
-
-  if (policy === 'merge_recent') {
-    const cutoff = toDate(epochNow());
-    cutoff.setDate(cutoff.getDate() - MERGE_RECENT_DAYS);
-    const recent = recentDocs.find(d =>
-      d.modifiedAt && new Date(d.modifiedAt) >= cutoff
-    );
-    if (recent) {
-      return { action: 'merge', existingId: recent.id };
-    }
-    return { action: 'insert' };
-  }
-
-  if (policy === 'update_existing') {
-    // Find most recent entry of same type
-    if (recentDocs.length > 0 && recentDocs[0]) {
-      return { action: 'merge', existingId: recentDocs[0].id };
-    }
-    return { action: 'insert' };
-  }
-
-  return { action: 'insert' };
-}
+// 62.1 D4: the merge policies (dedup_check, merge_recent, update_existing) for session documents are gone — a
+// session document is a render of its own items (stop-session-docs.ts); cross-session dedup was the CM-07 defect.
 
 // =============================================================================
 // Decision Patterns
@@ -328,7 +239,7 @@ export type ContradictionBatch = {
  * differing solely in fields that cannot reach the mutation path ARE collapsed — they are the
  * same classification, so this is deliberately not object identity.
  *
- * Exported and pure so the batch contract is testable without an LLM — `detectContradictions`
+ * Exported and pure so the batch contract is testable without an LLM — the judge's Phase B (`stop-judge.ts`)
  * resolves its own model, so an end-to-end test would assert whatever the deployed model
  * returned that day.
  *
@@ -452,7 +363,7 @@ function invalidationEligibility(store: Store, docId: number): InvalidationEligi
 }
 
 /**
- * Applies validated classifier verdicts to the vault. Split out of `detectContradictions` as the
+ * Applies validated classifier verdicts to the vault. Split out of the old whole-window judge as the
  * mutation boundary: everything above it is inference and validation, everything here is a write.
  * Exported so the write path can be driven directly by tests without an LLM — the branches below
  * had no coverage precisely because they were only reachable through a live model call.
@@ -714,9 +625,9 @@ const EMPTY_OUTCOMES = (): ContradictionOutcomes => ({
 /**
  * unwrap -> admit -> apply, as one unit, called by production.
  *
- * The three steps were previously wired together only inside `detectContradictions`, which meant
+ * The three steps were previously wired together only inside the old whole-window judge, which meant
  * the envelope repair could be unwired at the call site without a single test noticing. This is
- * the seam a regression test drives; `detectContradictions` adds only the LLM call and the
+ * the seam a regression test drives; `stop-judge.ts` adds only the LLM call (Phase A) and the
  * operator-facing reporting around it.
  */
 /** Judge identity + response identity for the durable audit (§J7). */
@@ -807,345 +718,6 @@ export function applyContradictionResponse(
   return { parseFailed: false, parsedCategory, outcomes, rejected, duplicates, inconsistent };
 }
 
-async function detectContradictions(
-  store: Store,
-  newObservations: Observation[],
-  sessionId: string,
-  docIdByObservation?: ReadonlyMap<Observation, number>,
-  /** s342 D2 / O1: the Stop handler's whole-handler MONOTONIC deadline. When
-   *  present, the judge call is skipped below the remaining-budget floor
-   *  (audited as `skipped_budget`) and an in-flight call is bounded by the
-   *  remainder. */
-  deadline?: MonoDeadline,
-): Promise<number> {
-  const decisions = newObservations.filter(o => o.type === "decision");
-  if (decisions.length === 0) return 0;
-
-  let contradictionCount = 0;
-
-  // Batch all new decision facts, carrying each fact's source document alongside it so
-  // `invalidated_by` names the document that actually contradicted, not whichever row a
-  // heuristic lookup happened to land on. Null where the observation failed to persist —
-  // an unattributable contradiction is recorded as such rather than mis-attributed.
-  const newFacts: string[] = [];
-  const newFactDocIds: (number | null)[] = [];
-  for (const d of decisions) {
-    const docId = docIdByObservation?.get(d) ?? null;
-    for (const f of d.facts) {
-      newFacts.push(f);
-      newFactDocIds.push(docId);
-    }
-  }
-  if (newFacts.length === 0) return 0;
-
-  // §J1 (v0.29.0): contradiction analysis runs ONLY on a configured judge. The stock
-  // expansion model cannot meet the judge contract (probe-verified: non-array output,
-  // placeholder echo, fabricated relations), and dormancy could not be inferred across
-  // the prompt reshape — so unconfigured means DISABLED: an audited no-op with one loud
-  // line, never a silent attempt on the default model.
-  const resolution = resolveJudge();
-  if (resolution.status !== "ready") {
-    insertJudgeRunBestEffort(store.db, {
-      sessionId,
-      consumer: "decision-extractor",
-      lane: "none",
-      promptVersion: JUDGE_PROMPT_VERSION,
-      newFactCount: newFacts.length,
-      outcome: resolution.status === "unconfigured" ? "no_judge_configured" : "config",
-    });
-    if (resolution.status === "invalid") {
-      console.error(
-        `[decision-extractor] contradiction judge misconfigured: ${resolution.error} — ` +
-        `no contradiction was evaluated.`,
-      );
-    } else {
-      console.error(
-        `[decision-extractor] contradiction analysis disabled: no judge configured. ` +
-        `The stock expansion model cannot meet the judge contract; set CLAWMEM_JUDGE_* ` +
-        `(docs/guides/inference-services.md) to enable. No contradiction was evaluated.`,
-      );
-    }
-    return 0;
-  }
-  const judge = resolution.judge;
-
-  // s342 D2: the floor gates the WHOLE contradiction phase — including the
-  // candidate-retrieval embedding below, which is itself a model call — so a
-  // near-exhausted budget never starts ANY of it. O1: every phase bound is the
-  // whole-handler deadline minus the persistence reserve, on the monotonic clock.
-  const phaseDeadline = deadline !== undefined ? deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)) : undefined;
-  if (phaseDeadline !== undefined) {
-    const remaining = remainingForTimeout(phaseDeadline);
-    if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: judge.descriptor.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: JUDGE_PROMPT_VERSION,
-        newFactCount: newFacts.length,
-        outcome: "skipped_budget",
-      });
-      console.warn(
-        `[decision-extractor] contradiction phase skipped: ${remaining === null ? 0 : evidenceMs(remaining)}ms of the ` +
-        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
-        `no contradiction was evaluated.`,
-      );
-      return 0;
-    }
-  }
-
-  // Vector search for existing decisions on overlapping topics — the embedding
-  // is bounded by the whole-handler deadline minus the persistence reserve.
-  const searchDeadline = phaseDeadline;
-  const queryText = newFacts.join(". ");
-  let existingDocs: SearchResult[];
-  try {
-    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, searchDeadline);
-  } catch (e) {
-    warnOnceOnVectorModelMismatch(e);
-    existingDocs = store.searchFTS(queryText, 5);
-  }
-
-  // Filter to decision/observation docs, exclude same session
-  const sessionPrefix = sessionId.slice(0, 8);
-  const candidates = existingDocs.filter(d =>
-    (d.displayPath.includes("decisions/") || d.displayPath.includes("observations/")) &&
-    !d.displayPath.includes(sessionPrefix)
-  );
-
-  if (candidates.length === 0) return 0;
-
-  // §J5 (v0.29.0): reshaped prompt via the judge module — role-separated instructions,
-  // JSON-encoded data inside CSPRNG nonce fencing, a VALID example row, and the 0.7
-  // erosion threshold stated once. Snippets stay positionally aligned with `candidates`
-  // so old_idx addresses the same document; paths stay OUT of the payload (less egress,
-  // less injection surface).
-  const existingSnippets = candidates.map(c => extractSnippet(c.body || "", queryText, 300).snippet);
-  const prompt = buildContradictionPrompt({ newFacts, existingSnippets, minConfidence: 0.7 });
-
-  // s342 D2: the judge shares the whole-handler deadline — never START a call
-  // near budget exhaustion, and bound an in-flight one by the remainder.
-  let judgeSignal: AbortSignal | undefined;
-  if (phaseDeadline !== undefined) {
-    const remaining = remainingForTimeout(phaseDeadline);
-    if (remaining === null || shorterThan(remaining, duration(CAUSAL_MIN_BUDGET_MS))) {
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: judge.descriptor.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: prompt.promptVersion,
-        newFactCount: newFacts.length,
-        candidateCount: candidates.length,
-        outcome: "skipped_budget",
-      });
-      console.warn(
-        `[decision-extractor] contradiction judge skipped: ${remaining === null ? 0 : evidenceMs(remaining)}ms of the ` +
-        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
-        `no contradiction was evaluated.`,
-      );
-      return 0;
-    }
-    judgeSignal = signalAfter(remaining);
-  }
-
-  try {
-    const result = await judge.judge(
-      { system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA },
-      judgeSignal ? { signal: judgeSignal } : {},
-    );
-    if (!result.ok) {
-      // Typed judge failure — audited standalone (nothing mutated), loud, fail-closed.
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: judge.descriptor.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: prompt.promptVersion,
-        newFactCount: newFacts.length,
-        candidateCount: candidates.length,
-        outcome: result.reason,
-      });
-      console.warn(
-        `[decision-extractor] contradiction judge ${result.reason} ` +
-        `(lane=${judge.descriptor.lane} model=${judge.descriptor.model}): ${result.detail} — ` +
-        `no contradiction was evaluated.`,
-      );
-      return 0;
-    }
-    if (result.truncated) {
-      // §J5b: provider-reported truncation is a typed reject BEFORE extraction — the
-      // repaired-partial-batch class must stay dead.
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: result.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: prompt.promptVersion,
-        newFactCount: newFacts.length,
-        candidateCount: candidates.length,
-        responseSha256: hashContent(result.text),
-        outcome: "truncated",
-      });
-      console.warn(
-        `[decision-extractor] contradiction judge response TRUNCATED ` +
-        `(len=${result.text.length} model=${JSON.stringify(result.model)}) — rejected before ` +
-        `extraction; no contradiction was evaluated.`,
-      );
-      return 0;
-    }
-
-    const audit: ContradictionAuditContext = {
-      sessionId,
-      lane: judge.descriptor.lane,
-      model: result.model,
-      endpoint: judge.descriptor.endpoint,
-      promptVersion: prompt.promptVersion,
-      responseSha256: hashContent(result.text),
-    };
-    let applied: ContradictionResponseResult;
-    try {
-      applied = applyContradictionResponse(
-        store, extractJudgeJson(result.text), candidates, newFacts, newFactDocIds, audit);
-    } catch (e) {
-      // §J7: the run+events+mutations transaction rolled back — nothing mutated. The
-      // in-txn run row died with the transaction; record a standalone write_error run.
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: result.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: prompt.promptVersion,
-        newFactCount: newFacts.length,
-        candidateCount: candidates.length,
-        responseSha256: audit.responseSha256,
-        outcome: "write_error",
-      });
-      console.error(
-        `[decision-extractor] contradiction apply FAILED — transaction rolled back, ` +
-        `no mutation applied: ${e instanceof Error ? e.message : String(e)}`,
-      );
-      return 0;
-    }
-
-    if (applied.parseFailed) {
-      // A silent `return 0` here is indistinguishable from "no contradictions found",
-      // which is how a permanently-failing parse gate stayed invisible. Say which it is.
-      //
-      // Deliberately NOT logging raw model output by default: this model echoes prompt
-      // material, and the prompt carries transcript-derived decisions. A raw head would
-      // be a content-exposure path in ordinary operation. Emit shape + identity only;
-      // raw text is opt-in via CLAWMEM_DEBUG_LLM_RAW and still truncated.
-      const category = applied.parsedCategory;
-      insertJudgeRunBestEffort(store.db, {
-        sessionId,
-        consumer: "decision-extractor",
-        lane: judge.descriptor.lane,
-        model: result.model,
-        endpoint: judge.descriptor.endpoint,
-        promptVersion: prompt.promptVersion,
-        newFactCount: newFacts.length,
-        candidateCount: candidates.length,
-        responseSha256: hashContent(result.text),
-        outcome: "parse_reject",
-      });
-      console.warn(
-        `[decision-extractor] contradiction parse gate REJECTED the model response ` +
-        `(expected JSON array, got ${category}; len=${result.text.length} ` +
-        `sha256=${hashContent(result.text).slice(0, 12)} model=${JSON.stringify(result.model)}) — ` +
-        `no contradiction was evaluated.`,
-      );
-      if (process.env.CLAWMEM_DEBUG_LLM_RAW === "true") {
-        console.warn(
-          `[decision-extractor] raw (debug): ${JSON.stringify(result.text.slice(0, 160))}`,
-        );
-      }
-      return 0;
-    }
-
-    // Per-entry validation AND array-level admission happen inside the seam above, both ahead
-    // of any mutation. The parse gate only proves the ROOT is an array; entries were never
-    // checked at all, so the deployed model's echoed skeleton reached the mutation path.
-    const { outcomes, rejected, duplicates, inconsistent } = applied;
-    contradictionCount += outcomes.contradictions;
-
-    if (rejected > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: rejected ${rejected} entr(ies) failing runtime ` +
-        `validation (unknown relation label, placeholder reasoning, non-finite confidence, ` +
-        `or non-integer index) — the classifier is emitting schema residue, not classifications`,
-      );
-    }
-    if (outcomes.unparseableTarget > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.unparseableTarget} classified pair(s) ` +
-        `named an old document whose virtual path could not be PARSED — this is a URI-contract ` +
-        `regression, not a missing row; the classification was discarded without mutating anything`,
-      );
-    }
-    if (outcomes.missingTarget > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.missingTarget} classified pair(s) parsed ` +
-        `to a valid path with no active row (archived or deleted between search and apply) — ` +
-        `the classification was discarded without mutating anything`,
-      );
-    }
-    if (outcomes.floorIneligible > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.floorIneligible} document(s) reached the ` +
-        `confidence floor but are not invalidation-eligible — either their content_type is not ` +
-        `'${INVALIDATION_ELIGIBLE_CONTENT_TYPE}' (candidates are selected by PATH, which is a ` +
-        `wider set) or they were already invalidated. Confidence was lowered; invalidation is ` +
-        `impossible for these whether or not the writer is armed.`,
-      );
-    }
-    if (outcomes.shadowInvalidations > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.shadowInvalidations} invalidation(s) ` +
-        `suppressed by shadow mode. Confidence was still lowered. Adjudicate these before arming ` +
-        `CLAWMEM_CONTRADICTION_INVALIDATE — invalidation removes a document from FTS and ` +
-        `vector retrieval entirely.`,
-      );
-    }
-    if (outcomes.invalidated > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: INVALIDATED ${outcomes.invalidated} document(s) — ` +
-        `they are now absent from FTS and vector retrieval. Restore procedure: ` +
-        `docs/guides/contradiction-invalidation.md`,
-      );
-    }
-    if (outcomes.invalidationNoOp > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.invalidationNoOp} armed invalidation(s) ` +
-        `matched ZERO rows — the row changed between the eligibility check and the write`,
-      );
-    }
-    if (outcomes.invalidationErrors > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: ${outcomes.invalidationErrors} invalidation(s) threw ` +
-        `and were skipped — see the per-document errors above`,
-      );
-    }
-    if (duplicates > 0 || inconsistent > 0) {
-      console.warn(
-        `[decision-extractor] contradiction: collapsed ${duplicates} identical repeat(s) and ` +
-        `dropped ${inconsistent} pair(s) the classifier answered more than one way, before ` +
-        `mutation — repeats would have compounded the confidence penalty on one document`,
-      );
-    }
-  } catch (err) {
-    console.error(`[decision-extractor] Contradiction classification failed:`, err);
-  }
-
-  return contradictionCount;
-}
-
 // =============================================================================
 // Handler
 // =============================================================================
@@ -1176,29 +748,6 @@ export async function decisionExtractor(
     console.error(`[decision-extractor] ${stopBudget.invalid}`);
   }
 
-  // s342 D5: ONE causal invocation record per Stop invocation in shadow/on —
-  // cardinality includes the early returns below, so the step is a named
-  // closure invoked on EVERY handler exit path. Default OFF; `shadow` audits
-  // without writing; `on` writes. Config anomalies audit durably on the run.
-  const phaseSkipNotes: string[] = [];
-  const runCausalInvocation = async (newObs: ObservationWithDoc[]): Promise<void> => {
-    const causalMode = resolveCausalWriterMode();
-    if (causalMode === "off") return;
-    try {
-      const llm = getDefaultLlamaCpp();
-      await runCausalStep(store, llm, {
-        sessionId,
-        mode: causalMode,
-        newObservations: newObs,
-        deadline,
-        invalidConfigNotes: stopBudget.invalid ? [stopBudget.invalid] : [],
-        phaseSkipNotes,
-      });
-    } catch (err) {
-      console.log(`[decision-extractor] Error in causal inference:`, err);
-    }
-  };
-
   try {
     pruneJudgeRuns(store.db, { excludeSessionId: sessionId });
   } catch { /* retention is best-effort */ }
@@ -1206,192 +755,51 @@ export async function decisionExtractor(
     pruneCausalRuns(store.db, { excludeSessionId: sessionId });
   } catch { /* retention is best-effort */ }
 
-  const transcriptPath = validateTranscriptPath(input.transcriptPath);
-  if (!transcriptPath) {
-    await runCausalInvocation([]);
-    return makeEmptyOutput("decision-extractor");
-  }
+  // 62.1 D10: on a vault whose stop-pipeline migration is not verified, cursor work is skipped (fail closed).
+  if (!stopPipelineReady(store.db) || !validateTranscriptPath(input.transcriptPath)) return makeEmptyOutput("decision-extractor");
 
-  const messages = readTranscript(transcriptPath, 200);
-  if (messages.length === 0) {
-    await runCausalInvocation([]);
-    return makeEmptyOutput("decision-extractor");
-  }
-
-
-  const now = toDate(epochNow());
-  const dateStr = now.toISOString().slice(0, 10);
-  const timestamp = now.toISOString();
-
-  // Try observer first for structured observations. s342 D2: extraction has
-  // the SAME pre-call floor as the judge and the causal step — near budget
-  // exhaustion it is skipped outright, never started with a degenerate timeout.
-  const extractionRemaining = remainingForTimeout(deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
-  let observations: Observation[] = [];
-  if (extractionRemaining === null || shorterThan(extractionRemaining, duration(CAUSAL_MIN_BUDGET_MS))) {
-    const note =
-      `observation extraction skipped: ${extractionRemaining === null ? 0 : evidenceMs(extractionRemaining)}ms of the Stop budget ` +
-      `remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor`;
-    phaseSkipNotes.push(note);
-    console.warn(`[decision-extractor] ${note}.`);
-  } else {
-    observations = await extractObservations(messages, { timeoutMs: extractionRemaining });
-  }
-  const observedDecisions = observations.filter(o => o.type === "decision");
-
-  // Persist ALL observations unconditionally (C2 fix: not gated on decisions existing)
-  const observationsWithDocs: ObservationWithDoc[] = [];
-  // Exact provenance for contradiction attribution. Reconstructing it later from a session-prefix
-  // LIKE + `ORDER BY created_at DESC LIMIT 1` is position-blind: every observation in one
-  // invocation shares a timestamp, so all of them resolve to the same row regardless of which
-  // fact actually did the contradicting.
-  const docIdByObservation = new Map<Observation, number>();
-  if (observations.length > 0) {
-    for (const obs of observations) {
-      const wit = persistObservationDoc(store, obs, sessionId, dateStr, timestamp);
-      if (wit) {
-        observationsWithDocs.push(wit);
-        docIdByObservation.set(obs, wit.docId);
-      }
-    }
-
-    // Extract SPO triples from observation-emitted <triples> blocks (Fix A).
-    // The regex-based extractTripleFromFact is gone — the observer LLM now emits
-    // structured triples alongside facts, parsed and validated in parseObservationXml.
-    // We iterate observationsWithDocs (not raw observations) so every triple gets
-    // real source_doc_id provenance from the persisted observation document (Fix F).
-    insertObservationTriples(store, observations, observationsWithDocs);
-  }
-
-  // s342: the bounded one-hop causal step (C4′) for this invocation —
-  // observation-document nodes, append-only fact-pair witness evidence on the
-  // edge. Replaces the retired first-witness-only writer.
-  await runCausalInvocation(observationsWithDocs);
-
-  // Extract decisions (observer-first, regex fallback)
-  let decisionBody: string;
-  let decisionCount: number;
-  let decisionFacts: string = ""; // Stable semantic payload for dedup hashing
-
-  if (observedDecisions.length > 0) {
-    decisionBody = formatObservedDecisions(observedDecisions, dateStr, sessionId);
-    decisionCount = observedDecisions.length;
-    decisionFacts = observedDecisions.map(d => [d.title, ...d.facts].join(". ")).join("\n");
-
-    // Detect contradictions with existing decisions
-    try {
-      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation, deadline);
-      if (contradictions > 0) {
-        console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
-      }
-    } catch (err) {
-      console.error(`[decision-extractor] Error in contradiction detection:`, err);
-    }
-  } else {
-    // Fallback to regex extraction
-    const decisions = extractDecisions(messages);
-    if (decisions.length === 0 && observations.length === 0) return makeEmptyOutput("decision-extractor");
-
-    if (decisions.length === 0) {
-      decisionBody = `# Session Observations ${dateStr}\n\nNo decisions extracted. ${observations.length} observation(s) persisted separately.\n`;
-      decisionCount = 0;
-    } else {
-      decisionBody = formatDecisionLog(decisions, dateStr, sessionId);
-      decisionCount = decisions.length;
-      decisionFacts = decisions.map(d => d.text).join("\n");
-    }
-  }
-
-  // Save decision via unified saveMemory API (handles dedup + upsert)
-  const semanticPayload = decisionFacts || decisionBody;
-
-  const decisionPath = `decisions/${dateStr}-${sessionId.slice(0, 8)}.md`;
-
-  // Check existing merge policy first (vector-based dedup for decisions),
-  // bounded by the whole-handler deadline minus the persistence reserve.
-  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
-
-  if (mergeResult.action === 'skip') {
-    process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
-  } else if (mergeResult.action === 'merge' && mergeResult.existingId) {
-    // Merge with existing entry (update content)
-    const mergeHash = hashContent(decisionBody);
-    store.insertContent(mergeHash, decisionBody, timestamp);
-    store.db.prepare(
-      "UPDATE documents SET hash = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ? WHERE id = ?"
-    ).run(mergeHash, timestamp, timestamp, mergeResult.existingId);
-  } else {
-    // Use saveMemory for dedup-protected insert
-    const result = store.saveMemory({
-      collection: "_clawmem",
-      path: decisionPath,
-      title: `Decisions ${dateStr}`,
-      body: decisionBody,
-      contentType: "decision",
-      confidence: observedDecisions.length > 0 ? 0.90 : 0.85,
-      semanticPayload,
-    });
-
-    if (result.action === 'deduplicated') {
-      process.stderr.write(`[decision-extractor] Dedup: existing decision within window (doc ${result.docId}, count=${result.duplicateCount})\n`);
-    }
-  }
-
-  // Extract and store antipatterns (E8) via saveMemory
-  try {
-    const antipatterns = extractAntipatterns(messages);
-    if (antipatterns.length > 0) {
-      const antiBody = [
-        `# Antipatterns ${dateStr}`,
-        ``,
-        `_Session: ${sessionId.slice(0, 8)}_`,
-        ``,
-        ...antipatterns.map(a => {
-          const ctx = a.context ? `\n  > Context: ${a.context.slice(0, 150)}` : "";
-          return `- **Avoid:** ${a.text}${ctx}`;
-        }),
-      ].join("\n");
-
-      // Semantic payload: the antipattern texts only (stable across date wrappers)
-      const antiSemanticPayload = antipatterns.map(a => a.text).join("\n");
-      const antiPath = `antipatterns/${dateStr}-${sessionId.slice(0, 8)}.md`;
-
-      // Check existing merge policy first (merge_recent for antipatterns),
-      // under the same whole-handler deadline bound.
-      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineBefore(deadline, duration(PERSIST_RESERVE_MS)));
-
-      if (antiMerge.action === 'skip') {
-        // Near-duplicate — skip
-      } else if (antiMerge.action === 'merge' && antiMerge.existingId) {
-        const antiHash = hashContent(antiBody);
-        store.insertContent(antiHash, antiBody, timestamp);
-        store.db.prepare(
-          "UPDATE documents SET hash = ?, modified_at = ?, revision_count = revision_count + 1, last_seen_at = ? WHERE id = ?"
-        ).run(antiHash, timestamp, timestamp, antiMerge.existingId);
-      } else {
-        const result = store.saveMemory({
-          collection: "_clawmem",
-          path: antiPath,
-          title: `Antipatterns ${dateStr}`,
-          body: antiBody,
-          contentType: "antipattern",
-          confidence: 0.75,
-          semanticPayload: antiSemanticPayload,
+  // 62.1 D2-D4: the delta since this hook's cursor, in batches, each committed once (stop-extract.ts); the judge runs
+  // split around each batch's Phase B (stop-judge.ts). Phase C for a committed batch: the causal step for that range.
+  const phaseSkipNotes: string[] = [];
+  const run = await runDecisionExtraction(store, {
+    sessionId,
+    transcriptPath: input.transcriptPath!,
+    host: input.host,
+    sessionKey: input.sessionKey,
+    deadline,
+    phaseSkipNotes,
+    // Phase C: the causal step owed by the range just committed (its marker, D3).
+    afterCommit: async ({ range }) => {
+      try {
+        await drainCausalMarkers(store, getDefaultLlamaCpp(), {
+          deadline, sessionId, rangeKey: range.key, limit: 1,
+          invalidConfigNotes: stopBudget.invalid ? [stopBudget.invalid] : [], phaseSkipNotes,
         });
-
-        if (result.action === 'deduplicated') {
-          process.stderr.write(`[decision-extractor] Dedup: antipattern within window (doc ${result.docId})\n`);
-        }
+      } catch (err) {
+        console.log(`[decision-extractor] Error in causal inference:`, err);
       }
+    },
+  });
+  // D3: at most one due quarantined range of this session, inside what is left of the budget; its Phase C follows.
+  try {
+    const replay = await replayDueRetries(store, { deadline, sessionId, limit: 1 });
+    for (const r of replay.ranges) {
+      await drainCausalMarkers(store, getDefaultLlamaCpp(), { deadline, sessionId, rangeKey: r.key, limit: 1, phaseSkipNotes });
     }
-  } catch {
-    // Non-fatal
+  } catch (err) {
+    console.error(`[decision-extractor] replay of a quarantined range failed:`, err);
+  }
+  // Markers this session still owes from earlier Stops (a crash between Phase B and Phase C), bounded.
+  try {
+    await drainCausalMarkers(store, getDefaultLlamaCpp(), { deadline, sessionId, limit: 2, phaseSkipNotes });
+  } catch (err) {
+    console.log(`[decision-extractor] Error in causal inference:`, err);
   }
 
   // Trigger directory context update if enabled and observer found files
   const config = loadConfig();
   if (config.directoryContext) {
-    const allModifiedFiles = observations.flatMap(o => o.filesModified);
+    const allModifiedFiles = run.observations.flatMap(o => o.filesModified);
     if (allModifiedFiles.length > 0) {
       try {
         updateDirectoryContext(store, allModifiedFiles);
@@ -1451,63 +859,6 @@ export function extractDecisions(messages: { role: string; content: string }[]):
 // =============================================================================
 // Formatting
 // =============================================================================
-
-function formatDecisionLog(decisions: Decision[], dateStr: string, sessionId: string): string {
-  const lines = [
-    `---`,
-    `content_type: decision`,
-    `tags: [auto-extracted]`,
-    `---`,
-    ``,
-    `# Decisions — ${dateStr}`,
-    ``,
-    `Session: \`${sessionId.slice(0, 8)}\``,
-    ``,
-  ];
-
-  for (const d of decisions) {
-    lines.push(`- ${d.text}`);
-    if (d.context) {
-      lines.push(`  > Context: ${d.context.split("\n")[0]}`);
-    }
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-function formatObservedDecisions(observations: Observation[], dateStr: string, sessionId: string): string {
-  const lines = [
-    `---`,
-    `content_type: decision`,
-    `tags: [auto-extracted, observer]`,
-    `---`,
-    ``,
-    `# Decisions — ${dateStr}`,
-    ``,
-    `Session: \`${sessionId.slice(0, 8)}\``,
-    ``,
-  ];
-
-  for (const obs of observations) {
-    lines.push(`## ${obs.title}`, ``);
-    if (obs.narrative) {
-      lines.push(obs.narrative, ``);
-    }
-    if (obs.facts.length > 0) {
-      lines.push(`**Facts:**`);
-      for (const fact of obs.facts) {
-        lines.push(`- ${fact}`);
-      }
-      lines.push(``);
-    }
-    if (obs.filesModified.length > 0) {
-      lines.push(`**Files:** ${obs.filesModified.map(f => `\`${f}\``).join(", ")}`, ``);
-    }
-  }
-
-  return lines.join("\n");
-}
 
 function formatObservation(obs: Observation, dateStr: string, sessionId: string): string {
   const lines = [
@@ -1641,7 +992,7 @@ export function persistObservationDoc(
  * document. Iterates `observationsWithDocs` directly so triples from observations
  * whose doc insert failed are naturally skipped — no order-matching gymnastics.
  */
-function insertObservationTriples(
+export function insertObservationTriples(
   store: Store,
   _observations: Observation[],
   observationsWithDocs: ObservationWithDoc[]

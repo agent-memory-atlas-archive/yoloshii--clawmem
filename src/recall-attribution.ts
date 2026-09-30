@@ -1,182 +1,96 @@
 /**
- * Recall Attribution — per-turn reference detection for recall tracking.
- *
- * Extracted into a standalone module for testability (per GPT 5.4 High review turn 4).
- *
- * Architecture:
- * 1. Segment the transcript into ordered turns (user → assistant pairs)
- * 2. Zip context_usage rows (by turn_index) with transcript turns (by position)
- * 3. For each pair, detect references in that turn's assistant text only
- * 4. Mark recall_events linked to the usage rows whose turn actually cited the doc
+ * Recall Attribution — the reference test that decides which injected documents a turn's assistant text actually
+ * cites (62.1 D6). Pairing a turn with its usage row is D1's (`stop-pairing.ts`); the counters it credits are applied
+ * once by `stop-feedback.ts`. (Through v0.40 this module zipped usage rows with transcript turns by POSITION, so one
+ * gated or heartbeat turn shifted every later attribution; that path is gone.)
  */
 
-import type { Store, UsageRow } from "./store.ts";
-
 // =============================================================================
-// Types
+// 62.1 D6: the manifest reference test (segment-anchored)
 // =============================================================================
 
-export type TranscriptTurn = {
-  userText: string;
-  assistantText: string;
+/** One injected document as the turn's manifest records it (`feedback_ledger`), keyed uniquely across vaults. */
+export type ReferenceEntry = {
+  key: string;
+  /** '' = the general vault. */
+  vault: string;
+  /** collection/path — unique within its vault. */
+  displayPath: string;
+  /** The title exactly as rendered into the injected context (never the document's current title). */
+  displayedTitle: string | null;
 };
 
-// =============================================================================
-// Transcript Segmentation
-// =============================================================================
+/** Boilerplate file names that identify nothing on their own: credited only with their parent segment. */
+const GENERIC_BASENAMES = new Set([
+  "readme.md", "skill.md", "agents.md", "claude.md", "memory.md", "index.md", "notes.md", "todo.md", "changelog.md",
+  "progress.md", "status.md", "current_status.md", "key_learnings.md", "design.md", "backlog.md", "summary.md",
+  "overview.md", "contributing.md", "license.md",
+]);
+const TITLE_MIN_CHARS = 12;
+const DATE_STAMP_RE = /\b\d{4}-\d{2}-\d{2}\b/;
 
-/**
- * Segment a flat message array into ordered turns.
- * A turn starts on each "user" message and includes all following "assistant"
- * messages until the next "user" message.
- *
- * @param messages - Ordered array of {role, content} from transcript JSONL
- * @returns Ordered array of turns
- */
-export function segmentTranscriptIntoTurns(
-  messages: { role: string; content: string }[]
-): TranscriptTurn[] {
-  const turns: TranscriptTurn[] = [];
-  let currentUser = "";
-  let currentAssistant = "";
-
-  for (const msg of messages) {
-    if (msg.role === "user") {
-      // New turn: flush previous if it has assistant content
-      if (currentUser || currentAssistant) {
-        turns.push({ userText: currentUser, assistantText: currentAssistant });
-      }
-      currentUser = msg.content;
-      currentAssistant = "";
-    } else if (msg.role === "assistant") {
-      currentAssistant += (currentAssistant ? "\n" : "") + msg.content;
-    }
-    // Ignore system/tool messages for attribution purposes
-  }
-
-  // Flush final turn
-  if (currentUser || currentAssistant) {
-    turns.push({ userText: currentUser, assistantText: currentAssistant });
-  }
-
-  return turns;
+function isPathWordChar(c: string | undefined): boolean {
+  return c !== undefined && /[A-Za-z0-9_-]/.test(c);
 }
 
-// =============================================================================
-// Per-Turn Reference Detection
-// =============================================================================
-
-/**
- * Check if a displayPath (collection/path) is referenced in text.
- * Matches by: full path, filename (without extension), or doc title.
- */
-function isPathReferenced(
-  store: Store,
-  displayPath: string,
-  text: string
-): boolean {
-  if (!text || !displayPath) return false;
-
-  // Full path match
-  if (text.includes(displayPath)) return true;
-
-  // Filename match (without extension, min 4 chars)
-  const filename = displayPath.split("/").pop()?.replace(/\.(md|txt)$/i, "");
-  if (filename && filename.length > 3 && text.toLowerCase().includes(filename.toLowerCase())) {
+/** `needle` occurs in `text` as a bounded path token; `strictLeft` also refuses '/' and '.' before it (a whole token). */
+function hasBoundedPath(text: string, needle: string, strictLeft: boolean): boolean {
+  for (let i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1)) {
+    const before = i > 0 ? text[i - 1] : undefined;
+    if (isPathWordChar(before) || (strictLeft && (before === "/" || before === "."))) continue;
+    const after = text[i + needle.length];
+    if (isPathWordChar(after) || after === "/") continue;
+    if (after === "." && /[A-Za-z0-9]/.test(text[i + needle.length + 1] ?? "")) continue;   // plan.md.bak
     return true;
   }
-
-  // Title match from DB
-  const parts = displayPath.split("/");
-  if (parts.length >= 2) {
-    const collection = parts[0]!;
-    const docPath = parts.slice(1).join("/");
-    const doc = store.findActiveDocument(collection, docPath);
-    if (doc?.title && doc.title.length >= 5 && text.toLowerCase().includes(doc.title.toLowerCase())) {
-      return true;
-    }
-  }
-
   return false;
 }
 
-// =============================================================================
-// Attribution Core
-// =============================================================================
+function normalizePhrase(s: string): string {
+  return s.normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function hasBoundedPhrase(text: string, phrase: string): boolean {
+  for (let i = text.indexOf(phrase); i >= 0; i = text.indexOf(phrase, i + 1)) {
+    const before = i > 0 ? text[i - 1]! : "";
+    const after = text[i + phrase.length] ?? "";
+    if (/[\p{L}\p{N}_]/u.test(before) || /[\p{L}\p{N}_]/u.test(after)) continue;
+    return true;
+  }
+  return false;
+}
+
+function titleUsable(title: string | null): title is string {
+  if (!title) return false;
+  const t = title.trim();
+  return t.length >= TITLE_MIN_CHARS && t.split(/\s+/).length >= 2 && !DATE_STAMP_RE.test(t);
+}
 
 /**
- * Attribute recall events to specific turns using per-turn reference detection.
- *
- * For each context_usage row (ordered by turn_index), finds the corresponding
- * transcript turn and checks which of that turn's injected docs were cited in
- * that turn's assistant text. Only marks recall_events linked to turns where
- * the doc was actually referenced.
- *
- * @param store - Store instance for doc resolution and event marking
- * @param sessionId - Session identifier
- * @param usages - context_usage rows for this session, ordered by turn_index
- * @param turns - Transcript turns, ordered by position
+ * The entries a turn's assistant text verifiably references (62.1 D6), run ONCE over the turn's whole manifest:
+ *  (1) a display path, or a path suffix of at least two segments, as a bounded token;
+ *  (2) a basename with its extension as a whole token — never a generic basename (README.md, SKILL.md, …) alone;
+ *  (3) a displayed title of at least 12 characters and two words, not date-stamped, as a word-bounded phrase.
+ * A string credits only when it identifies EXACTLY ONE entry across all vaults; a path, basename or title two
+ * entries share is ambiguous and credits neither. `assistantText` = the turn's assistant text blocks only.
  */
-export function attributeRecallReferences(
-  store: Store,
-  sessionId: string,
-  usages: UsageRow[],
-  turns: TranscriptTurn[]
-): void {
-  // Filter to context-surfacing usages only
-  const surfacingUsages = usages.filter(u => u.hookName === "context-surfacing");
-
-  for (const usage of surfacingUsages) {
-    // Match usage to transcript turn by turn_index
-    const turn = turns[usage.turnIndex];
-    if (!turn || !turn.assistantText) continue;
-
-    // Parse injected paths for this turn
-    let injectedPaths: string[];
-    try { injectedPaths = JSON.parse(usage.injectedPaths) as string[]; }
-    catch { continue; }
-    if (injectedPaths.length === 0) continue;
-
-    // Check which docs from THIS turn were referenced in THIS turn's assistant text
-    const referencedDocIds: number[] = [];
-    for (const path of injectedPaths) {
-      if (!isPathReferenced(store, path, turn.assistantText)) continue;
-
-      const parts = path.split("/");
-      if (parts.length < 2) continue;
-      const collection = parts[0]!;
-      const docPath = parts.slice(1).join("/");
-      const doc = store.findActiveDocument(collection, docPath);
-      if (doc) referencedDocIds.push(doc.id);
-    }
-
-    if (referencedDocIds.length === 0) continue;
-
-    // Mark only recall events linked to THIS usage row
-    for (const docId of referencedDocIds) {
-      // Primary: usage_id-linked events (current schema)
-      const linked = store.db.prepare(`
-        SELECT id FROM recall_events
-        WHERE usage_id = ? AND doc_id = ? AND was_referenced = 0
-      `).all(usage.id, docId) as { id: number }[];
-
-      if (linked.length > 0) {
-        const ids = linked.map(r => r.id);
-        const placeholders = ids.map(() => "?").join(",");
-        store.db.prepare(`
-          UPDATE recall_events SET was_referenced = 1
-          WHERE id IN (${placeholders})
-        `).run(...ids);
-      } else {
-        // Fallback: pre-migration events without usage_id — match by turn_index
-        store.db.prepare(`
-          UPDATE recall_events SET was_referenced = 1
-          WHERE id IN (
-            SELECT id FROM recall_events
-            WHERE session_id = ? AND doc_id = ? AND turn_index = ? AND was_referenced = 0
-          )
-        `).run(sessionId, docId, usage.turnIndex);
-      }
-    }
+export function verifiedReferences(assistantText: string, manifest: readonly ReferenceEntry[]): Set<string> {
+  const credited = new Set<string>();
+  if (!assistantText || manifest.length === 0) return credited;
+  const paths = new Map<string, Set<string>>();
+  const basenames = new Map<string, Set<string>>();
+  const titles = new Map<string, Set<string>>();
+  const add = (m: Map<string, Set<string>>, k: string, key: string) => { if (!m.has(k)) m.set(k, new Set()); m.get(k)!.add(key); };
+  for (const e of manifest) {
+    const segs = e.displayPath.split("/").filter(Boolean);
+    for (let i = 0; i + 2 <= segs.length; i++) add(paths, segs.slice(i).join("/"), e.key);
+    const base = segs.at(-1);
+    if (base && base.includes(".") && !GENERIC_BASENAMES.has(base.toLowerCase())) add(basenames, base, e.key);
+    if (titleUsable(e.displayedTitle)) add(titles, normalizePhrase(e.displayedTitle), e.key);
   }
+  for (const [p, keys] of paths) if (keys.size === 1 && hasBoundedPath(assistantText, p, false)) credited.add([...keys][0]!);
+  for (const [b, keys] of basenames) if (keys.size === 1 && hasBoundedPath(assistantText, b, true)) credited.add([...keys][0]!);
+  const lowered = normalizePhrase(assistantText);
+  for (const [t, keys] of titles) if (keys.size === 1 && hasBoundedPhrase(lowered, t)) credited.add([...keys][0]!);
+  return credited;
 }

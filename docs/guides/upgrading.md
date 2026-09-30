@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.40.3**.
+Guide for upgrading between released versions. Current: **v0.41.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,85 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.41.0: the Stop hooks process each turn once; counters recomputed from verified references
+
+**A vault migration, a one-time recompute, and one hook to install.** `decision-extractor` and
+`handoff-generator` now keep a cursor per transcript and `feedback-loop` decides each surfaced turn
+once, so a turn is extracted, digested and credited once, and a session's decision, antipattern and
+handoff documents are its own. See the [release notes](../../RELEASE_NOTES.md).
+
+In this order:
+
+1. **Stop every ClawMem process that shares the vault** — `clawmem watch`, `clawmem serve`, the
+   systemd units, the MCP server of every open agent session (reconnect or close them), and the
+   OpenClaw and Hermes plugins — then upgrade them all. The first writable open installs a fence:
+   an older ClawMem still running afterwards cannot write feedback counters, co-activations, `usage`
+   relations, utility signals or the Stop hooks' documents (each write is skipped and counted), and
+   its `context-surfacing` hook injects nothing, because its usage-row insert fails. `clawmem doctor`
+   fails while the fence has caught such a write in the last 24 h.
+2. **Re-run `clawmem setup hooks`.** It adds a SessionEnd group running `handoff-generator` (timeout
+   2 s), which renders the handoff's latest turns when a session ends. Without it, the watcher renders
+   them later, and `clawmem doctor` warns. Other tools' hooks in the same groups are kept.
+3. **Hermes:** copy the plugin's contents over the installed one, then restart Hermes:
+   `cp -r /path/to/ClawMem/src/hermes/. "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem/"` (the
+   trailing `/.` copies the contents; `cp -r src/hermes <existing dir>` would nest a `hermes/` inside
+   it and leave the old plugin running). A symlinked install picks it up on its own. The old plugin
+   runs the Stop hooks only at session end, which under v0.41.0 keeps a session's last turn only and
+   writes no handoff.
+4. **Start `clawmem watch`.** At its first start it copies every antipattern body older versions
+   overwrote into `recovered_antipattern_bodies`, then recomputes the counters of the general vault and
+   of every named vault, once. On a large vault this takes minutes, yielding between chunks of 5,000
+   rows, and it writes one before-image per value it changes or deletes into `counter_repair_log`
+   (about 380,000 rows on a vault with 212,037 co-activations and 166,084 `usage` relations). Without a
+   watcher, run `clawmem repair counters` (a dry run that prints what would change), then
+   `clawmem repair counters --apply`. `clawmem doctor` shows "counter recompute pending" until it has
+   run.
+
+What the recompute does:
+
+- `access_count` becomes the number of verified references, and `last_accessed_at` the newest one
+  (else `modified_at`). Right after the upgrade almost nothing is verified yet, so the counts start
+  near zero and the last-access times fall back to `modified_at`, and recency and confidence stop
+  reflecting the inflated counts. Usage rows written before the
+  upgrade are frozen and never credited.
+- Every co-activation row and every `usage` relation is deleted and rebuilt from verified same-turn
+  references (weight 1.0). The utility signals are recomputed: surfaced counts from the pre-upgrade
+  rows' injected paths plus the new manifests, referenced counts from verified references.
+- A document whose old last access fell inside its archive window gets an archive grace of 30 days
+  plus (its id mod 60) days, so the lifecycle sweep does not archive such documents all at once.
+  `clawmem doctor` shows how many grace periods end in each coming week; run
+  `lifecycle_sweep(dry_run=true)` before a real sweep as usual.
+- **Undo:** `clawmem repair counters --restore <op>` (the op id is in the watcher log and in the
+  output of `--apply`) restores each value while it still equals what the recompute wrote, and each
+  deleted row while no row has taken its key, and reports the conflicts it leaves.
+
+What else changes on its own:
+
+- Session documents are rendered from the session's own items at a path fixed when each document is
+  first written (`_clawmem/decisions/<date>-<sid8>.md`, the same under `antipatterns/` and
+  `handoffs/`). A pre-upgrade document at that path stays as it is; the session's new document takes
+  a `-<tk6>` suffix. Nothing is merged or deduplicated across sessions any more.
+- `clawmem watch` runs the stop-pipeline worker every 60 s, even with no collection configured. It
+  drains feedback of quiet or ended transcripts, named-vault slices, handoff digests and renders,
+  quarantined ranges, deferred judge pairs and queued causal steps. Run the watcher: without it these
+  wait for the session's own Stops (and deferred judge pairs for `clawmem repair stop-queue --run`),
+  and `clawmem doctor` warns once a queue is older than 24 h.
+- The antipatterns older versions overwrote can be reviewed with `clawmem recover antipatterns` and
+  written to `_clawmem/antipatterns/recovered-<YYYY-MM>.md` with `--apply` (optionally
+  `--min-occurrences N`). Nothing is recovered automatically.
+- A vault whose migration transaction cannot commit (another process held the write lock too long)
+  still opens: the Stop hooks skip their counter and cursor work, `clawmem doctor` shows "migration
+  incomplete", and the next writable open tries again.
+
+**Downgrading:** run `clawmem repair counters --remove-fence` after stopping every v0.41 process, or
+the older version's Stop-hook writes are ignored and its surfacing hook injects nothing. The next
+v0.41 writable open installs the fence again. The new tables and columns are ignored by older
+versions. `--restore` can put the recomputed counters back first.
+
+Nothing to re-embed or re-index, and no config change.
 
 ---
 

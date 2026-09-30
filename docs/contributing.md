@@ -64,7 +64,10 @@ src/
   validation.ts      Input validation helpers
   normalize.ts       Conversation format normalizer (Claude, ChatGPT, Slack, plain text)
   recall-buffer.ts   Recall event writing (direct SQLite write during context-surfacing)
-  recall-attribution.ts  Per-turn reference attribution (transcript segmentation + usage linkage)
+  recall-attribution.ts  The reference test (`verifiedReferences`: path, file name, displayed title)
+  relation-weight.ts Relation weights clamped to [0, 1] on write and read
+  stop-*.ts          The Stop pipeline (v0.41.0): schema + fence, cursor, pairing, identity, extraction, judge, causal
+                     markers, session docs, handoff, feedback, worker, repair, recovery, health
   limits.ts          Constants (max path length, query length)
   errors.ts          Error types
   promptguard.ts     Prompt injection sanitization
@@ -76,8 +79,8 @@ src/
   hooks/
     context-surfacing.ts   UserPromptSubmit hook
     decision-extractor.ts  Stop hook (observations)
-    handoff-generator.ts   Stop hook (session summary)
-    feedback-loop.ts       Stop hook (reference tracking)
+    handoff-generator.ts   Stop + SessionEnd hook (turn digests, session summary)
+    feedback-loop.ts       Stop hook (verified references)
     precompact-extract.ts  PreCompact hook
     session-bootstrap.ts   SessionStart hook (optional)
     staleness-check.ts     SessionStart hook (optional)

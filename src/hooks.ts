@@ -8,6 +8,7 @@
 import type { Store } from "./store.ts";
 import { isoNow, toDate, epochNow } from "./clock.ts";
 import { createHash } from "node:crypto";
+import type { UsageIdentity } from "./stop-identity.ts";
 
 // =============================================================================
 // Types
@@ -23,6 +24,12 @@ export type HookInput = {
   source?: string;
   /** PreCompact: "manual" | "auto". */
   trigger?: string;
+  /** 62.1 D1: the host that spawned the hook — "openclaw" from the OpenClaw plugin; absent = Claude Code. */
+  host?: string;
+  /** 62.1 D1: OpenClaw's session key, which tells a session's base and topic transcripts apart. */
+  sessionKey?: string;
+  /** 62.1 D1: context-surfacing registers the transcript locator and returns before any gate, row or retrieval. */
+  registerOnly?: boolean;
 };
 
 export type HookOutput = {
@@ -37,6 +44,12 @@ export type HookOutput = {
     hookEventName?: string;
     additionalContext?: string;
   };
+  /**
+   * 62.1 (T29): context-surfacing's usage row, for the Hermes plugin only (`host: "hermes"`). The plugin prefetches
+   * for a later turn, and writes this id on the user line of the turn it hands the context to, so the feedback step
+   * credits that turn by identity. No other host receives it.
+   */
+  clawmemUsageId?: number;
 };
 
 // =============================================================================
@@ -52,10 +65,19 @@ export async function readHookInput(): Promise<HookInput> {
   for await (const chunk of Bun.stdin.stream()) {
     chunks.push(chunk);
   }
-  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  return parseHookInput(Buffer.concat(chunks).toString("utf-8"));
+}
+
+/**
+ * Decode a hook's stdin JSON. Only the fields named here reach a hook (62.1 D1: `host`, `session_key` and
+ * `register_only` are named, so OpenClaw's host identity survives the process boundary).
+ */
+export function parseHookInput(text: string): HookInput {
+  const raw = text.trim();
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw);
+    const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
     return {
       sessionId: parsed.session_id ?? parsed.sessionId,
       prompt: parsed.prompt,
@@ -64,6 +86,9 @@ export async function readHookInput(): Promise<HookInput> {
       toolInput: parsed.tool_input ?? parsed.toolInput,
       source: typeof parsed.source === "string" ? parsed.source : undefined,
       trigger: typeof parsed.trigger === "string" ? parsed.trigger : undefined,
+      host: str(parsed.host),
+      sessionKey: str(parsed.session_key ?? parsed.sessionKey),
+      registerOnly: (parsed.register_only ?? parsed.registerOnly) === true,
     };
   } catch {
     return {};
@@ -322,7 +347,7 @@ function readTranscriptTailLines(transcriptPath: string, lastN: number): string[
  * An entry's content as one string: text blocks verbatim, tool_use / tool_result blocks rendered
  * inline. This is the rendering the Stop hooks consume through `readTranscript`.
  */
-function renderTranscriptContent(content: any): string {
+export function renderTranscriptContent(content: any): string {
   return typeof content === "string"
     ? content
     : Array.isArray(content)
@@ -458,8 +483,8 @@ function transcriptTextBlocks(content: any): string {
     .join("\n");
 }
 
-/** The entry's kind, and for human turns the typed text (injected context blocks stripped). */
-function classifyTranscriptEntry(entry: any, msg: any): { kind: TranscriptTurnKind; text: string; command?: true } {
+/** The entry's kind, and for human turns the typed text (injected context blocks stripped). Shared with the 62.1 cursor reader. */
+export function classifyTranscriptEntry(entry: any, msg: any): { kind: TranscriptTurnKind; text: string; command?: true } {
   if (msg.role === "assistant") return { kind: "assistant", text: transcriptTextBlocks(msg.content) };
   if (msg.role === "toolResult" || msg.role === "tool") return { kind: "tool_result", text: "" }; // OpenClaw / generic
   if (msg.role !== "user") return { kind: "meta", text: "" };
@@ -479,7 +504,7 @@ function classifyTranscriptEntry(entry: any, msg: any): { kind: TranscriptTurnKi
 }
 
 /** Claude Code follows a LOCAL (built-in) command's record with its output; a prompt command expands instead. */
-const LOCAL_COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
+export const LOCAL_COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
 
 /**
  * Read a transcript as classified turns (62.2, CM-03). The window matches `readTranscript`'s
@@ -580,6 +605,9 @@ export function smartTruncate(text: string, maxChars: number = 300): string {
  * so gated turns (slash commands, heartbeats, noise) cannot leak raw
  * prompt text into `context_usage.query_text`. Pre-migration stores
  * transparently drop the column via `insertUsageFn`'s feature-detect.
+ *
+ * `identity` (62.1 D1): the turn's prompt hash, transcript key, host and session key — context-surfacing passes it
+ * on every row it writes, gated rows included (a hash, never raw text); null/absent writes a row without them.
  */
 export function logInjection(
   store: Store,
@@ -589,8 +617,7 @@ export function logInjection(
   estimatedTokens: number,
   turnIndex?: number,
   queryText?: string,
-  /** BUILD-5 (C5): injection-time co-activation is rich-get-richer trained on the hook's own injections — it left the surfacing path entirely (at t60 surfacing calls logInjection only for empty/alignment rows, whose paths never reach the >=2 branch); other callers keep the default. */
-  recordCoActivations: boolean = true
+  identity?: UsageIdentity | null,
 ): number {
   try {
     const usageId = store.insertUsage({
@@ -602,13 +629,16 @@ export function logInjection(
       wasReferenced: 0,
       turnIndex,
       queryText,
+      ...(identity ? {
+        promptSha: identity.promptSha,
+        transcriptKey: identity.transcriptKey,
+        host: identity.host,
+        sessionKey: identity.sessionKey,
+      } : {}),
     });
 
-    // Record co-activation for all injected paths (E3) — unless the caller
-    // opted out (BUILD-5: the surfacing hook's injection-time writes).
-    if (recordCoActivations && injectedPaths.length >= 2) {
-      store.recordCoActivation(injectedPaths);
-    }
+    // 62.1 D9: no injection-time co-activations for any hook (BUILD-5 extended). Being shown together is not
+    // evidence of use; co_activations holds only verified same-turn co-references (feedback-loop).
 
     return usageId;
   } catch {

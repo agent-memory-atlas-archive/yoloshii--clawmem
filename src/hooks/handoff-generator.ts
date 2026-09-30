@@ -1,346 +1,93 @@
 /**
- * Handoff Generator Hook - Stop
+ * Handoff Generator Hook - Stop, SessionEnd
  *
- * Fires when a Claude Code session ends. Analyzes the transcript
- * to generate a handoff note summarizing: what was done, current state,
- * decisions made, and next steps. Stored in _clawmem collection.
+ * 62.1 D5 (stop-handoff.ts): at a Stop, the digest step records every new turn of the transcript (no model), then the
+ * throttled summary step folds the digests past its watermark into the session's summary (the observer, incremental)
+ * and renders the transcript's handoff document in `_clawmem/handoffs/`. At SessionEnd it only renders what is
+ * stored — no transcript read, no model call — under a 1,000 ms deadline.
  */
 
 import type { Store } from "../store.ts";
-import { toDate, epochNow, epochMs } from "../clock.ts";
+import { epochNow, epochMs, isoNow, monoNow, deadlineAfter, duration, type MonoDeadline } from "../clock.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
-import {
-  makeContextOutput,
-  makeEmptyOutput,
-  readTranscript,
-  validateTranscriptPath,
-  type TranscriptMessage,
-} from "../hooks.ts";
-import { extractSummary, type SessionSummary } from "../observer.ts";
+import { makeContextOutput, makeEmptyOutput, validateTranscriptPath } from "../hooks.ts";
 import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
-
-// =============================================================================
-// Config
-// =============================================================================
-
-const MIN_MESSAGES_FOR_HANDOFF = 4;
-
-// =============================================================================
-// Handler
-// =============================================================================
+import { resolveStopBudgetMs } from "../causal-writer.ts";
+import { stopPipelineReady } from "../stop-schema.ts";
+import { readSessionDoc } from "../stop-session-docs.ts";
+import {
+  runHandoffDigests, runHandoffSummary, flushHandoffAtSessionEnd, handoffSessionLine, SESSION_END_DEADLINE_MS,
+  type SummaryRun,
+} from "../stop-handoff.ts";
 
 export async function handoffGenerator(
   store: Store,
-  input: HookInput
+  input: HookInput,
+  opts?: { sessionEndDeadline?: MonoDeadline },
 ): Promise<HookOutput> {
-  const transcriptPath = validateTranscriptPath(input.transcriptPath);
-  if (!transcriptPath) return makeEmptyOutput("handoff-generator");
-
-  const messages = readTranscript(transcriptPath, 200);
-  if (messages.length < MIN_MESSAGES_FOR_HANDOFF) return makeEmptyOutput("handoff-generator");
-
   const sessionId = input.sessionId || `session-${epochMs(epochNow())}`;
-  const now = toDate(epochNow());
-  const timestamp = now.toISOString();
-  const dateStr = timestamp.slice(0, 10);
 
-  // Try observer for rich summary, fall back to regex
-  const summary = await extractSummary(messages);
-  const handoff = summary
-    ? buildHandoffFromSummary(summary, messages, sessionId, dateStr)
-    : buildHandoff(messages, sessionId, dateStr);
-
-  // Use saveMemory API with dedup protection.
-  // semanticPayload = session ID + core summary fields.
-  // Include sessionId so different sessions never dedup even if content is similar.
-  // SessionSummary fields: request, investigated, learned, completed, nextSteps (all strings)
-  const semanticPayload = summary
-    ? [sessionId, summary.request, summary.investigated, summary.learned, summary.completed, summary.nextSteps].filter(Boolean).join("\n")
-    : [sessionId, extractSummaryLine(messages) || handoff].join("\n");
-
-  const handoffPath = `handoffs/${dateStr}-${sessionId.slice(0, 8)}.md`;
-  const result = store.saveMemory({
-    collection: "_clawmem",
-    path: handoffPath,
-    title: `Handoff ${dateStr}`,
-    body: handoff,
-    contentType: "handoff",
-    confidence: 0.60,
-    semanticPayload,
-  });
-
-  if (result.action === 'deduplicated') {
-    process.stderr.write(`[handoff-generator] Dedup: existing handoff within window (doc ${result.docId}, count=${result.duplicateCount})\n`);
-  }
-
-  // Update session record with handoff path
-  try {
-    store.updateSession(sessionId, {
-      endedAt: timestamp,
-      handoffPath,
-      summary: extractSummaryLine(messages),
-    });
-  } catch {
-    // Non-fatal
-  }
-
-  // Extract files changed from transcript
-  const filesChanged = extractFilesChanged(messages);
-  if (filesChanged.length > 0) {
+  // SessionEnd: render only, inside the host's cap. Pending feedback and any catch-up are left to the worker.
+  if (input.hookEventName === "SessionEnd") {
     try {
-      store.updateSession(sessionId, { filesChanged });
-    } catch { /* non-fatal */ }
+      flushHandoffAtSessionEnd(store, {
+        sessionId, transcriptPath: input.transcriptPath, host: input.host, sessionKey: input.sessionKey,
+        deadline: opts?.sessionEndDeadline ?? deadlineAfter(monoNow(), duration(SESSION_END_DEADLINE_MS)),
+      });
+    } catch (err) {
+      console.error(`[handoff-generator] SessionEnd flush failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return makeEmptyOutput("handoff-generator");
+  }
 
-    // Trigger directory context update if enabled
+  // 62.1 D10: on a vault whose stop-pipeline migration is not verified, cursor work is skipped (fail closed).
+  if (!stopPipelineReady(store.db) || !validateTranscriptPath(input.transcriptPath)) return makeEmptyOutput("handoff-generator");
+  const stopBudget = resolveStopBudgetMs();
+  if (stopBudget.invalid) console.error(`[handoff-generator] ${stopBudget.invalid}`);
+  const deadline = deadlineAfter(monoNow(), duration(stopBudget.budgetMs));
+
+  // Digest step first (its own Phase B): the turns are recorded whatever the summary step does. A vault busy past the
+  // wait commits nothing; the next Stop or the worker redoes it from the same cursor.
+  let digest: ReturnType<typeof runHandoffDigests>;
+  try {
+    digest = runHandoffDigests(store, {
+      sessionId, transcriptPath: input.transcriptPath!, host: input.host, sessionKey: input.sessionKey, atStop: true,
+    });
+  } catch (err) {
+    console.error(`[handoff-generator] digest step not committed: ${err instanceof Error ? err.message : String(err)}`);
+    return makeEmptyOutput("handoff-generator");
+  }
+  const key = digest.transcriptKey;
+  if (!key) return makeEmptyOutput("handoff-generator");
+
+  let summary: SummaryRun | null = null;
+  try {
+    summary = await runHandoffSummary(store, { sessionId, transcriptKey: key, deadline });
+  } catch (err) {
+    console.error(`[handoff-generator] summary step failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // The session record: its handoff path, opening request and changed files.
+  const doc = readSessionDoc(store.db, sessionId, key, "handoff");
+  const line = doc ? handoffSessionLine(store.db, sessionId, key) : null;
+  if (doc && line) {
+    try {
+      store.updateSession(sessionId, { endedAt: isoNow(), handoffPath: doc.path, summary: line.summary, filesChanged: line.files });
+    } catch { /* non-fatal */ }
+  }
+
+  // Directory context for the files the new turns changed.
+  if (digest.files.length > 0) {
     const config = loadConfig();
     if (config.directoryContext) {
       try {
-        updateDirectoryContext(store, filesChanged);
+        updateDirectoryContext(store, digest.files);
       } catch { /* non-fatal */ }
     }
   }
 
-  return makeContextOutput(
-    "handoff-generator",
-    `<vault-handoff>Handoff note saved: ${handoffPath}</vault-handoff>`
-  );
-}
-
-// =============================================================================
-// Observer-based Handoff Builder
-// =============================================================================
-
-function buildHandoffFromSummary(
-  summary: SessionSummary,
-  messages: TranscriptMessage[],
-  sessionId: string,
-  dateStr: string
-): string {
-  const filesChanged = extractFilesChanged(messages);
-
-  const lines = [
-    `---`,
-    `content_type: handoff`,
-    `tags: [auto-generated, observer]`,
-    `---`,
-    ``,
-    `# Session Handoff — ${dateStr}`,
-    ``,
-    `Session: \`${sessionId.slice(0, 8)}\``,
-    ``,
-  ];
-
-  if (summary.request !== "None") {
-    lines.push(`## Request`, ``, summary.request, ``);
-  }
-
-  if (summary.investigated !== "None") {
-    lines.push(`## What Was Investigated`, ``, summary.investigated, ``);
-  }
-
-  if (summary.learned !== "None") {
-    lines.push(`## What Was Learned`, ``, summary.learned, ``);
-  }
-
-  if (summary.completed !== "None") {
-    lines.push(`## What Was Done`, ``, summary.completed, ``);
-  }
-
-  if (filesChanged.length > 0) {
-    lines.push(`## Files Changed`, ``);
-    for (const f of filesChanged.slice(0, 20)) {
-      lines.push(`- \`${f}\``);
-    }
-    lines.push(``);
-  }
-
-  if (summary.nextSteps !== "None") {
-    lines.push(`## Next Session Should`, ``, summary.nextSteps, ``);
-  }
-
-  return lines.join("\n");
-}
-
-// =============================================================================
-// Regex-based Handoff Builder (Fallback)
-// =============================================================================
-
-function buildHandoff(
-  messages: TranscriptMessage[],
-  sessionId: string,
-  dateStr: string
-): string {
-  const topics = extractTopics(messages);
-  const actions = extractActions(messages);
-  const nextSteps = extractNextSteps(messages);
-  const filesChanged = extractFilesChanged(messages);
-
-  const lines = [
-    `---`,
-    `content_type: handoff`,
-    `tags: [auto-generated]`,
-    `---`,
-    ``,
-    `# Session Handoff — ${dateStr}`,
-    ``,
-    `Session: \`${sessionId.slice(0, 8)}\``,
-    ``,
-  ];
-
-  if (topics.length > 0) {
-    lines.push(`## Current State`, ``);
-    for (const topic of topics) {
-      lines.push(`- ${topic}`);
-    }
-    lines.push(``);
-  }
-
-  if (actions.length > 0) {
-    lines.push(`## What Was Done`, ``);
-    for (const action of actions) {
-      lines.push(`- ${action}`);
-    }
-    lines.push(``);
-  }
-
-  if (filesChanged.length > 0) {
-    lines.push(`## Files Changed`, ``);
-    for (const f of filesChanged.slice(0, 20)) {
-      lines.push(`- \`${f}\``);
-    }
-    lines.push(``);
-  }
-
-  if (nextSteps.length > 0) {
-    lines.push(`## Next Session Should`, ``);
-    for (const step of nextSteps) {
-      lines.push(`- ${step}`);
-    }
-    lines.push(``);
-  }
-
-  return lines.join("\n");
-}
-
-// =============================================================================
-// Content Extraction
-// =============================================================================
-
-function extractTopics(messages: TranscriptMessage[]): string[] {
-  const topics: string[] = [];
-  const seen = new Set<string>();
-
-  // Get themes from user messages
-  for (const msg of messages) {
-    if (msg.role !== "user") continue;
-    const first = msg.content.split("\n")[0]?.trim();
-    if (!first || first.length < 10 || first.length > 200) continue;
-    if (first.startsWith("/")) continue; // slash commands
-
-    const key = first.slice(0, 50).toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    topics.push(first);
-  }
-
-  return topics.slice(0, 5);
-}
-
-function extractActions(messages: TranscriptMessage[]): string[] {
-  const actions: string[] = [];
-  const seen = new Set<string>();
-
-  const actionPatterns = [
-    /\b(?:created|wrote|added|implemented|built|set up|configured|installed|fixed|updated|modified|refactored|deleted|removed)\b/i,
-  ];
-
-  for (const msg of messages) {
-    if (msg.role !== "assistant") continue;
-
-    const sentences = msg.content.split(/(?<=[.!?])\s+/);
-    for (const sentence of sentences) {
-      if (sentence.length < 15 || sentence.length > 300) continue;
-      if (!actionPatterns.some(p => p.test(sentence))) continue;
-
-      const key = sentence.slice(0, 60).toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      actions.push(sentence.trim());
-    }
-  }
-
-  return actions.slice(0, 10);
-}
-
-function extractNextSteps(messages: TranscriptMessage[]): string[] {
-  const nextSteps: string[] = [];
-  const seen = new Set<string>();
-
-  const nextPatterns = [
-    /\bnext\s+(?:step|task|we\s+(?:need|should|can)|up|thing)\b/i,
-    /\btodo\b/i,
-    /\bremaining\b/i,
-    /\blater\b.*\b(?:we|you)\s+(?:can|should|need)\b/i,
-    /\bstill\s+need\s+to\b/i,
-    /\bnot\s+yet\s+(?:done|implemented|completed)\b/i,
-  ];
-
-  // Scan last 30 messages (most relevant for next steps)
-  const tail = messages.slice(-30);
-  for (const msg of tail) {
-    if (msg.role !== "assistant") continue;
-
-    const sentences = msg.content.split(/(?<=[.!?])\s+/);
-    for (const sentence of sentences) {
-      if (sentence.length < 15 || sentence.length > 300) continue;
-      if (!nextPatterns.some(p => p.test(sentence))) continue;
-
-      const key = sentence.slice(0, 60).toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      nextSteps.push(sentence.trim());
-    }
-  }
-
-  return nextSteps.slice(0, 5);
-}
-
-const MAX_FILES_EXTRACTED = 200;
-
-function extractFilesChanged(messages: TranscriptMessage[]): string[] {
-  const files = new Set<string>();
-
-  const filePatterns = [
-    /(?:created|wrote|edited|modified|updated|deleted)\s+(?:file\s+)?[`"]?([^\s`"]+\.\w{1,10})[`"]?/gi,
-    /(?:Write|Edit|Read)\s+tool.*?[`"]([^\s`"]+\.\w{1,10})[`"]?/gi,
-    /^\s*(?:[-+]){3}\s+(a|b)\/(.+\.\w{1,10})/gm,
-  ];
-
-  for (const msg of messages) {
-    if (msg.role !== "assistant") continue;
-    if (files.size >= MAX_FILES_EXTRACTED) break;
-    for (const pattern of filePatterns) {
-      pattern.lastIndex = 0;
-      let match;
-      while ((match = pattern.exec(msg.content)) !== null) {
-        if (files.size >= MAX_FILES_EXTRACTED) break;
-        const file = match[2] || match[1];
-        if (file && !file.includes("*") && file.length < 200) {
-          files.add(file);
-        }
-      }
-    }
-  }
-
-  return [...files];
-}
-
-function extractSummaryLine(messages: TranscriptMessage[]): string {
-  // Get first user message as summary theme
-  const firstUser = messages.find(m => m.role === "user");
-  if (!firstUser) return "Unknown session";
-
-  const first = firstUser.content.split("\n")[0]?.trim() || "";
-  return first.length > 100 ? first.slice(0, 100) + "..." : first;
+  return summary && summary.committed > 0 && doc
+    ? makeContextOutput("handoff-generator", `<vault-handoff>Handoff note saved: ${doc.path}</vault-handoff>`)
+    : makeEmptyOutput("handoff-generator");
 }

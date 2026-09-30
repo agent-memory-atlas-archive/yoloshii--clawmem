@@ -12,6 +12,7 @@ import { withRetryAndFeedback } from "./llm-retry.ts";
 import type { Store } from "./store.ts";
 import { enrichDocumentEntities } from "./entity.ts";
 import { EVOLUTION_WRITER, notLegacyArtifactSql, notLegacyTaintedNoteSql } from "./compaction-state.ts";
+import { relWeightSql } from "./relation-weight.ts";
 
 export interface MemoryNote {
   keywords: string[];
@@ -880,7 +881,7 @@ export async function evolveMemories(
         d.title,
         d.amem_context,
         mr.relation_type,
-        mr.weight
+        ${relWeightSql("mr")} AS weight
       FROM memory_relations mr
       JOIN documents d ON d.id = mr.target_id
       WHERE mr.source_id = ?
@@ -888,7 +889,7 @@ export async function evolveMemories(
         AND d.amem_context IS NOT NULL
         AND ${notLegacyArtifactSql("d")}
         AND ${notLegacyTaintedNoteSql("d")}
-      ORDER BY mr.weight DESC
+      ORDER BY ${relWeightSql("mr")} DESC
       LIMIT 5
     `).all(memoryId) as Array<{
       id: number;

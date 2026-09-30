@@ -46,14 +46,14 @@ Exponential decay based on document age and content type half-life. **Age is mea
 | conversation, progress | 45 days | Faster decay |
 | handoff | 30 days | Fast decay — recent matters most |
 
-Half-lives extend up to 3x for frequently-accessed memories (access reinforcement decays over 90 days).
+Half-lives extend up to 3x for frequently-accessed memories (access reinforcement decays over 90 days). An access is a verified reference (v0.41.0): `feedback-loop` counts one when a turn the document was injected into names it, once per turn. Through v0.40.3 every Stop counted every mention in the session again, and v0.41.0 recomputed the counts once from verified references (see [upgrading](../guides/upgrading.md)).
 
 ### Confidence score (0.0 - 1.0)
 
 Starts at 0.5 for new documents. Adjusted by:
 
 - **Contradiction detection** (judge-gated since v0.29.0 — requires `CLAWMEM_JUDGE_*`) — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via the configured judge (deterministic heuristic only, `link`-constrained, without one). Contradictory merges are blocked and either linked via the old row's `invalidated_by` backlink (default) or supersede the old row with `status='inactive'` (judge required; see [consolidation safety](architecture.md#consolidation-safety-v071)).
-- **Feedback loop** — referenced notes get confidence boosts
+- **Feedback loop** — verified references raise the access count, which boosts confidence (`1 + 0.1·log2(1 + access_count)`, capped at 1.5×)
 - **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, deductive, preference, hub, research, and antipattern types are exempt.
 
 ### Quality multiplier (0.7 - 1.3)
@@ -93,7 +93,7 @@ This is not about gaming the scoring system. Documents that score well are also 
 coActivationBoost = 1 + min(coCount / 10, 0.15)
 ```
 
-Documents frequently surfaced together in the same session get up to 15% boost.
+Documents the agent verifiably referenced together in one turn get up to 15% boost. Since v0.41.0 a co-activation is recorded only by `feedback-loop`, once per pair of documents referenced in the same turn; injection records none (through v0.40.3 `session-bootstrap` and `staleness-check` recorded one for every pair they injected), and v0.41.0 rebuilt the table from verified references.
 
 **Where co-activation is applied depends on the caller.** The composite MCP surfaces (`query`, plus `search` and `vsearch` on recency-intent queries only) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and — on `vsearch` and `search`, the tools that expose `minScore` — for `minScore` filtering. On the non-recency (raw) regimes of `vsearch` (v0.22.0) and `search` (v0.24.0), co-activation contributes only to the exact-tie key, never to ranking or filtering. The context-surfacing hook does not use co-activation at all since v0.38.0 — the injected order and the admission decision both run on the channel-aware fusion key, and the former post-threshold spreading-activation step was removed (an injection-time rich-get-richer signal trained on the hook's own injections). In the hook, composite scores size the injection tiers (HOT/WARM/COLD) only, so co-activation, pins, and every other composite modifier on this page affect hook output presentation at most — never which documents surface or in what order.
 

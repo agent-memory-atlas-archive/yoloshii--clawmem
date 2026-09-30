@@ -14,6 +14,9 @@
 
 import { monoNow, deadlineAfter, earliest, isExpired, timeoutSignal, type DurationMs, type MonoDeadline, isoNow, toDate, epochNow, epochMs } from "./clock.ts";
 import { COMPACTION_STATE_DDL, fenceEvolutionWriters, notLegacyArtifactSql, notLegacyTaintedEvolutionSql, resetLegacyDerivedNotes } from "./compaction-state.ts";
+import { clampRelationWeight } from "./relation-weight.ts";
+import { freshStamp, hasStopStamps, installStopPipelineSchema, stampAssign, stampInsert } from "./stop-schema.ts";
+import { reconcileRestoredSessionDocs } from "./stop-session-docs.ts";
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
@@ -555,7 +558,9 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   try {
     const needsBackfill = db.prepare(`SELECT 1 FROM documents WHERE last_accessed_at IS NULL LIMIT 1`).get();
     if (needsBackfill) {
-      db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+      // 62.1 D9: on a fenced vault the backfill is a counter write like any other, so it carries a fresh stamp.
+      const st = stampAssign(db, "counter_stamp");
+      db.prepare(`UPDATE documents SET last_accessed_at = modified_at${st.sql} WHERE last_accessed_at IS NULL`).run(...st.args);
     }
   } catch { /* ignore if already backfilled */ }
 
@@ -1405,6 +1410,10 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // ClawMem evolved again after its reset) is cleared for a rebuild from its own document, and marked in its
   // evolution history (compaction-state.ts). Read-guarded and fail-open: nothing to reset means no write.
   resetLegacyDerivedNotes(db);
+
+  // 62.1 D10: the stop-pipeline tables and the writer fence (stop-schema.ts), LAST, so every table it alters or
+  // fences exists. Read-guarded; a failure leaves the store open with Stop work disabled for this connection.
+  installStopPipelineSchema(db);
 }
 
 
@@ -2391,12 +2400,14 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     recordCoActivation: (paths: string[]) => {
       if (paths.length < 2) return;
       const now = isoNow();
+      // 62.1 D9: a fenced write — the stamp tells this version's rows from an older ClawMem's.
+      const st = stampInsert(db, "stamp");
       const stmt = db.prepare(`
-        INSERT INTO co_activations (doc_a, doc_b, count, last_seen)
-        VALUES (?, ?, 1, ?)
+        INSERT INTO co_activations (doc_a, doc_b, count, last_seen${st.cols})
+        VALUES (?, ?, 1, ?${st.vals})
         ON CONFLICT(doc_a, doc_b) DO UPDATE SET
           count = count + 1,
-          last_seen = excluded.last_seen
+          last_seen = excluded.last_seen${st.cols ? ", stamp = excluded.stamp" : ""}
       `);
       // Record all pairs (order-independent: always store sorted).
       // ONE transaction, not N*(N-1)/2 autocommit upserts: the per-pair
@@ -2408,7 +2419,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         for (let i = 0; i < paths.length; i++) {
           for (let j = i + 1; j < paths.length; j++) {
             const sorted = [paths[i]!, paths[j]!].sort();
-            stmt.run(sorted[0]!, sorted[1]!, now);
+            stmt.run(sorted[0]!, sorted[1]!, now, ...st.args);
           }
         }
       });
@@ -2432,13 +2443,17 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       // relating to itself has no informational value for graph traversal
       // and would pollute intent_search/find_similar neighborhoods.
       if (fromDoc === toDoc) return;
+      // 62.1 D7 (CM-19): the weight is bounded to [0, 1] — the input is clamped and an upsert keeps the larger of
+      // the stored and the new weight. It used to add them, so a pair re-recorded on every Stop grew without bound.
+      // 62.1 D9: stamped, so a `usage` relation passes the fence (every type carries it; only `usage` is fenced).
+      const st = stampInsert(db, "stamp");
       db.prepare(`
-        INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at${st.cols})
+        VALUES (?, ?, ?, ?, ?${st.vals})
         ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
-          weight = weight + excluded.weight,
-          created_at = excluded.created_at
-      `).run(fromDoc, toDoc, relType, weight, isoNow());
+          weight = MIN(1.0, MAX(COALESCE(weight, 0.0), excluded.weight)),
+          created_at = excluded.created_at${st.cols ? ", stamp = excluded.stamp" : ""}
+      `).run(fromDoc, toDoc, relType, clampRelationWeight(weight), isoNow(), ...st.args);
     },
 
     // Engram integration: unified save API for hook-generated memories
@@ -2653,6 +2668,13 @@ export type UsageRecord = {
    * `context_usage` (pre-migration stores degrade to "no prior query").
    */
   queryText?: string;
+  /** 62.1 D1: the turn's identity (context-surfacing rows and their mirrors). Written only where the columns exist. */
+  promptSha?: string | null;
+  transcriptKey?: string | null;
+  host?: string | null;
+  sessionKey?: string | null;
+  /** 62.1 D6 (rev 15): a named-vault mirror's general-vault alignment row. */
+  sourceUsageId?: number | null;
 };
 
 export type UsageRow = {
@@ -2938,10 +2960,12 @@ export function insertDocument(
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
   // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
+  // 62.1 D9: every document this version writes carries a doc stamp (the fence checks it on the Stop hooks' paths).
+  const st = stampInsert(db, "doc_stamp");
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, origin)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, origin);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, origin${st.cols})
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?${st.vals})
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, origin, ...st.args);
 }
 
 // =============================================================================
@@ -3126,14 +3150,15 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
       .run(bodyHash, params.body, now);
 
-    // Insert document row
+    // Insert document row (62.1 D9: doc-stamped, like every document write of this version)
+    const st = stampInsert(db, "doc_stamp");
     try {
       db.prepare(`
         INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
                                content_type, confidence, quality_score, normalized_hash,
                                duplicate_count, revision_count, last_seen_at, topic_key, authored_at,
-                               origin)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, 'api')
+                               origin${st.cols})
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, 'api'${st.vals})
       `).run(
         params.collection,
         params.path,
@@ -3148,6 +3173,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
         now,
         params.topicKey ?? null,
         authoredAt,
+        ...st.args,
       );
     } catch (err: any) {
       // UNIQUE(collection, path) conflict — update existing row
@@ -3174,18 +3200,20 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
           const authoredSet = authoredAt
             ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
             : "";
+          const stu = stampAssign(db, "doc_stamp");
           const updateVals: (string | number | null)[] = [
             bodyHash, params.title, now, params.contentType,
             params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
             now,
           ];
           if (authoredAt) updateVals.push(authoredAt, authoredAt);
+          updateVals.push(...stu.args);
           updateVals.push(existing.id);
           db.prepare(`
             UPDATE documents
             SET hash = ?, title = ?, modified_at = ?, content_type = ?,
                 confidence = ?, quality_score = ?, normalized_hash = ?,
-                revision_count = revision_count + 1, last_seen_at = ?, origin = 'api'${authoredSet}
+                revision_count = revision_count + 1, last_seen_at = ?, origin = 'api'${authoredSet}${stu.sql}
             WHERE id = ?
           `).run(...updateVals);
 
@@ -3386,10 +3414,11 @@ export function reactivateDocument(
   // predicate a forgotten profile came back on the next index — and an archived one came back
   // still carrying `archived_at`, recreating the exact inconsistent state the migration repairs.
   // Restoring an archived document is `restoreArchivedDocuments`' job, not this function's.
+  const st = stampAssign(db, "doc_stamp");   // 62.1 D9
   const result = db.prepare(
-    `UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ?, deactivated_reason = NULL
+    `UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ?, deactivated_reason = NULL${st.sql}
      WHERE id = ? AND (deactivated_reason IS NULL OR deactivated_reason = 'absent')`,
-  ).run(safeTitle, hash, modifiedAt, documentId);
+  ).run(safeTitle, hash, modifiedAt, ...st.args, documentId);
   return result.changes > 0;
 }
 
@@ -3420,8 +3449,9 @@ export function updateDocument(
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error when the
   // hash actually changes, so this only needs to set the content fields.
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(safeTitle, hash, modifiedAt, documentId);
+  const st = stampAssign(db, "doc_stamp");   // 62.1 D9
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ?${st.sql} WHERE id = ?`)
+    .run(safeTitle, hash, modifiedAt, ...st.args, documentId);
 }
 
 /**
@@ -6268,50 +6298,30 @@ function insertUsageFn(db: Database, usage: UsageRecord): number {
   // and the conflict path returns the EXISTING row's id so recall events
   // link to the one true mirror.
   const hasDedupe = contextUsageHasDedupeKeyCache.get(db) ?? false;
-  if (usage.dedupeKey && hasDedupe) {
-    db.prepare(`
-      INSERT OR IGNORE INTO context_usage
-        (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index, query_text, dedupe_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      usage.sessionId,
-      usage.timestamp,
-      usage.hookName,
-      JSON.stringify(usage.injectedPaths),
-      usage.estimatedTokens,
-      usage.wasReferenced,
-      usage.turnIndex ?? 0,
-      usage.queryText ?? null,
-      usage.dedupeKey,
-    );
-    const changed = (db.prepare("SELECT changes() AS c").get() as { c: number }).c;
-    if (changed === 1) {
-      const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
-      return row.id;
-    }
-    const existing = db.prepare("SELECT id FROM context_usage WHERE dedupe_key = ?").get(usage.dedupeKey) as { id: number } | undefined;
-    return existing?.id ?? -1;
+  const keyed = !!usage.dedupeKey && hasDedupe;
+  const cols = ["session_id", "timestamp", "hook_name", "injected_paths", "estimated_tokens", "was_referenced", "turn_index"];
+  const vals: (string | number | null)[] = [
+    usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths),
+    usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0,
+  ];
+  if (hasQueryText || keyed) { cols.push("query_text"); vals.push(usage.queryText ?? null); }
+  if (keyed) { cols.push("dedupe_key"); vals.push(usage.dedupeKey!); }
+  // 62.1 D9 (rev 21/22): every row this version writes carries a writer stamp — on a fenced vault an unstamped insert
+  // (an older ClawMem's) fails — and D1's identity columns, which arrive in the same migration.
+  if (hasStopStamps(db)) {
+    cols.push("writer_stamp", "prompt_sha", "transcript_key", "host", "session_key", "source_usage_id");
+    vals.push(freshStamp(), usage.promptSha ?? null, usage.transcriptKey ?? null, usage.host ?? null,
+      usage.sessionKey ?? null, usage.sourceUsageId ?? null);
   }
-  if (hasQueryText) {
-    db.prepare(`
-      INSERT INTO context_usage
-        (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index, query_text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      usage.sessionId,
-      usage.timestamp,
-      usage.hookName,
-      JSON.stringify(usage.injectedPaths),
-      usage.estimatedTokens,
-      usage.wasReferenced,
-      usage.turnIndex ?? 0,
-      usage.queryText ?? null,
-    );
-  } else {
-    db.prepare(`
-      INSERT INTO context_usage (session_id, timestamp, hook_name, injected_paths, estimated_tokens, was_referenced, turn_index)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(usage.sessionId, usage.timestamp, usage.hookName, JSON.stringify(usage.injectedPaths), usage.estimatedTokens, usage.wasReferenced, usage.turnIndex ?? 0);
+  db.prepare(
+    `INSERT ${keyed ? "OR IGNORE " : ""}INTO context_usage (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`
+  ).run(...vals);
+  if (keyed) {
+    const changed = (db.prepare("SELECT changes() AS c").get() as { c: number }).c;
+    if (changed !== 1) {
+      const existing = db.prepare("SELECT id FROM context_usage WHERE dedupe_key = ?").get(usage.dedupeKey!) as { id: number } | undefined;
+      return existing?.id ?? -1;
+    }
   }
   // Return the rowid of the just-inserted row for recall event linkage
   const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
@@ -6385,10 +6395,11 @@ function incrementAccessCountFn(db: Database, paths: string[]): void {
   if (paths.length === 0) return;
   const now = isoNow();
   const placeholders = paths.map(() => "?").join(",");
+  const st = stampAssign(db, "counter_stamp");   // 62.1 D9: a fenced counter write
   db.prepare(`
-    UPDATE documents SET access_count = access_count + 1, last_accessed_at = ?
+    UPDATE documents SET access_count = access_count + 1, last_accessed_at = ?${st.sql}
     WHERE active = 1 AND (collection || '/' || path) IN (${placeholders})
-  `).run(now, ...paths);
+  `).run(now, ...st.args, ...paths);
 }
 
 function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10, opts?: { orderBy?: "operational" | "effective" }): DocumentRow[] {
@@ -7155,9 +7166,12 @@ function getArchiveCandidatesFn(
 ): { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[] {
   const now = toDate(epochNow());
   const defaultDays = policy.archive_after_days;
+  // 62.1 D9: the recompute's staggered grace — a document whose access_grace_until is still ahead is not access-stale
+  // (the recompute reset access to verified references only; the grace keeps recently used documents from archiving).
+  const graced = hasStopStamps(db);
 
   const rows = db.prepare(`
-    SELECT id, collection, path, title, modified_at, last_accessed_at, content_type
+    SELECT id, collection, path, title, modified_at, last_accessed_at, content_type${graced ? ", access_grace_until" : ""}
     FROM documents
     WHERE active = 1 AND pinned = 0
       AND (snoozed_until IS NULL OR snoozed_until = '' OR snoozed_until <= ?)
@@ -7176,10 +7190,12 @@ function getArchiveCandidatesFn(
     const cutoffStr = cutoff.toISOString();
 
     const modifiedStale = row.modified_at <= cutoffStr;
-    const accessedStale = !row.last_accessed_at || row.last_accessed_at <= cutoffStr;
+    const inGrace = typeof row.access_grace_until === "string" && row.access_grace_until > now.toISOString();
+    const accessedStale = !inGrace && (!row.last_accessed_at || row.last_accessed_at <= cutoffStr);
 
     if (modifiedStale && accessedStale) {
-      candidates.push(row);
+      const { access_grace_until: _grace, ...candidate } = row;
+      candidates.push(candidate);
     }
   }
 
@@ -7210,10 +7226,11 @@ function restoreArchivedDocumentsFn(
   // Same trigger-inflation problem as archiveDocuments: `.changes` counts the
   // `documents_fts` shadow writes too. Count the matching rows explicitly instead.
   return db.transaction(() => {
-    const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
-      .get(...params) as { n: number } | undefined;
+    const ids = (db.prepare(`SELECT id FROM documents ${where}`).all(...params) as { id: number }[]).map(r => r.id);
     db.prepare(`UPDATE documents SET active = 1, archived_at = NULL, deactivated_reason = NULL ${where}`).run(...params);
-    return row?.n ?? 0;
+    // 62.1 D4: a restored session document is brought up to date from its items (a handoff is marked render_needed).
+    if (ids.length > 0 && hasStopStamps(db)) reconcileRestoredSessionDocs(db, ids);
+    return ids.length;
   })();
 }
 

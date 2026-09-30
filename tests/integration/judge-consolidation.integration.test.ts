@@ -33,11 +33,12 @@ function seedObservationDoc(store: Store, path: string, title: string, facts: st
   const modifiedAt = new Date().toISOString();
   store.db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
     .run(hash, `# ${title}\n${facts}`, modifiedAt);
+  // 62.1 D9: a Stop-hook document this version writes carries a doc stamp (an unstamped one is an older ClawMem's).
   store.db.prepare(
     `INSERT INTO documents
         (collection, path, title, hash, created_at, modified_at, active,
-         content_type, observation_type, facts, narrative, last_accessed_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, 'observation', 'decision', ?, ?, ?)`,
+         content_type, observation_type, facts, narrative, last_accessed_at, doc_stamp)
+      VALUES (?, ?, ?, ?, ?, ?, 1, 'observation', 'decision', ?, ?, ?, 'fixture')`,
   ).run(TEST_COLLECTION, path, title, hash, modifiedAt, modifiedAt, facts, `${title} narrative`, modifiedAt);
   return (store.db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`)
     .get(TEST_COLLECTION, path) as { id: number }).id;

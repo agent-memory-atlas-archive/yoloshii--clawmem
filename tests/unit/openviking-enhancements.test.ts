@@ -22,10 +22,6 @@ import {
   type CoActivationFn,
   type EnrichedResult,
 } from "../../src/memory.ts";
-import {
-  getMergePolicy,
-  type MergePolicy,
-} from "../../src/hooks/decision-extractor.ts";
 
 let store: Store;
 
@@ -343,7 +339,9 @@ describe("insertRelation", () => {
     expect(rel!.weight).toBe(1.0);
   });
 
-  it("increments weight on conflict", () => {
+  // 62.1 D7 (CM-19): a re-inserted pair keeps a bounded weight. This test asserted 3.0 — the unbounded sum that let
+  // usage edges re-recorded on every Stop reach ~9,000 in a live vault.
+  it("keeps a bounded weight on conflict (never a sum)", () => {
     store.insertContent("rh3", "doc3", new Date().toISOString());
     store.insertDocument("col", "doc3.md", "D3", "rh3", new Date().toISOString(), new Date().toISOString());
     store.insertContent("rh4", "doc4", new Date().toISOString());
@@ -359,7 +357,7 @@ describe("insertRelation", () => {
     const rel = store.db.prepare(
       "SELECT weight FROM memory_relations WHERE source_id = ? AND target_id = ?"
     ).get(d3.id, d4.id) as { weight: number };
-    expect(rel.weight).toBe(3.0);
+    expect(rel.weight).toBe(1.0);
   });
 
   // v0.8.3 §1.3 — self-loop guard at the API boundary.
@@ -424,8 +422,8 @@ describe("insertRelation", () => {
     const u1 = store.findActiveDocument("col", "up1.md")!;
     const u2 = store.findActiveDocument("col", "up2.md")!;
 
-    // Interleave self-loops with repeated valid inserts — weight must still
-    // accumulate on the valid pair.
+    // Interleave self-loops with repeated valid inserts — the valid pair keeps its (bounded, 62.1 D7) weight and
+    // the self-loops never land.
     store.insertRelation(u1.id, u1.id, "usage", 5.0); // dropped
     store.insertRelation(u1.id, u2.id, "usage", 1.0);
     store.insertRelation(u1.id, u2.id, "usage", 1.0);
@@ -435,30 +433,12 @@ describe("insertRelation", () => {
     const rel = store.db.prepare(
       "SELECT weight FROM memory_relations WHERE source_id = ? AND target_id = ? AND relation_type = 'usage'"
     ).get(u1.id, u2.id) as { weight: number };
-    expect(rel.weight).toBe(3.0);
+    expect(rel.weight).toBe(1.0);
+    const selfLoops = store.db.prepare(
+      "SELECT COUNT(*) AS cnt FROM memory_relations WHERE source_id = target_id AND source_id IN (?, ?)"
+    ).get(u1.id, u2.id) as { cnt: number };
+    expect(selfLoops.cnt).toBe(0);
   });
 });
 
-// ─── Facet-based merge policy ───────────────────────────────────────
-
-describe("getMergePolicy", () => {
-  it("returns dedup_check for decisions", () => {
-    expect(getMergePolicy("decision")).toBe("dedup_check");
-  });
-
-  it("returns merge_recent for antipatterns", () => {
-    expect(getMergePolicy("antipattern")).toBe("merge_recent");
-  });
-
-  it("returns update_existing for preferences", () => {
-    expect(getMergePolicy("preference")).toBe("update_existing");
-  });
-
-  it("returns always_new for handoffs", () => {
-    expect(getMergePolicy("handoff")).toBe("always_new");
-  });
-
-  it("returns always_new for unknown types", () => {
-    expect(getMergePolicy("something_else")).toBe("always_new");
-  });
-});
+// ─── Facet-based merge policy: deleted in 62.1 D4 (session documents render their own items) ───

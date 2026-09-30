@@ -94,10 +94,12 @@ clawmem bootstrap <path> --name <name>   # One-command setup: init + collection 
 clawmem watch                   # Start file watcher (indexes on .md changes)
 ```
 
+Since v0.41.0 the watcher also runs the stop-pipeline worker every 60 s (feedback of quiet or ended transcripts, named-vault slices, handoff digests and renders, quarantined ranges, deferred judge pairs, queued causal steps), and it keeps running with no collection configured. Its first start preserves the antipattern bodies older versions overwrote and recomputes the feedback counters once (see [`repair counters`](#stop-pipeline-v0410)).
+
 ## Setup
 
 ```bash
-clawmem setup hooks             # Install Claude Code hooks
+clawmem setup hooks             # Install Claude Code hooks (v0.41.0+: also the SessionEnd handoff flush)
 clawmem setup hooks --remove    # Remove installed hooks
 clawmem setup mcp               # Register MCP server
 clawmem setup openclaw                   # Install the OpenClaw memory plugin. With the openclaw CLI on PATH: stages a compiled copy (dist/index.js), delegates to `openclaw plugins install --force`, then sets and reads back clawmemBin, hooks.allowConversationAccess=true and plugins.slots.memory=clawmem (v0.39.0+). Falls back to a direct copy honoring OPENCLAW_STATE_DIR when the CLI is absent.
@@ -139,7 +141,7 @@ clawmem serve --host 0.0.0.0             # Listen on all interfaces
 ```bash
 clawmem hook context-surfacing    # Execute a hook (reads JSON from stdin)
 clawmem hook decision-extractor
-clawmem hook handoff-generator
+clawmem hook handoff-generator    # Stop; with "hook_event_name": "SessionEnd", the render-only flush
 clawmem hook feedback-loop
 clawmem hook precompact-extract
 clawmem hook postcompact-inject
@@ -184,6 +186,35 @@ clawmem lifecycle restore --query <term> | --collection <name> | --all
 on any path** (v0.30.0) — `purge_after_days` is inert, and a sweep that sees it configured
 says so. To reclaim disk space, act on the SQLite file out-of-band; that is deliberately
 outside ClawMem's mutation contract.
+
+## Stop pipeline (v0.41.0)
+
+```bash
+clawmem repair counters                     # Dry run: what the recompute would change, per vault
+clawmem repair counters --apply             # Recompute from verified references (once; --force to run it again)
+clawmem repair counters --restore <op>      # Put back what op <op> changed, where nothing changed it since
+clawmem repair counters --remove-fence      # Drop the fence triggers (before a downgrade)
+clawmem repair stop-queue                   # Queue depths: quarantined ranges, pending/provisional feedback, judge, handoffs, causal
+clawmem repair stop-queue --run             # Drain every queue now (no quiet period; up to 20 passes)
+clawmem repair stop-queue --dismiss <id>    # Dismiss one quarantined range for good
+clawmem repair stop-queue --dismiss-causal  # Drop the causal steps waiting while every consumer keeps CLAWMEM_CAUSAL_WRITER=off
+clawmem recover antipatterns                # List the distinct lines of the antipattern bodies older versions overwrote
+clawmem recover antipatterns --apply [--min-occurrences N]   # Write them to _clawmem/antipatterns/recovered-<YYYY-MM>.md
+```
+
+`repair counters` runs on the general vault and every configured named vault. The recompute sets
+`access_count` and `last_accessed_at` from verified references, recomputes the utility signals,
+deletes and rebuilds co-activations and `usage` relations from verified same-turn references, and
+gives a staggered archive grace to documents whose old last access fell inside their archive
+window. Every value it changes or deletes is kept in `counter_repair_log` under the op id it prints;
+`--restore` puts a value back only while it still equals what that op wrote, and a deleted row only
+while its key is free, and reports the rest as conflicts. `--apply` first preserves the overwritten
+antipattern bodies (as `recover antipatterns` does). `clawmem watch` runs `--apply` once at its first
+start. `--remove-fence` lasts until the next writable open by v0.41 or later, which installs the fence
+again; run it after every v0.41 process has stopped. `--dismiss-causal` deletes, in one write transaction, every causal step queued up to that moment. It
+refuses while this shell's `CLAWMEM_CAUSAL_WRITER` is not `off`, and while the vault shows the writer in use
+elsewhere (a causal step queued or run in the last hour). It cannot see a consumer that runs the writer but has
+been idle: set the writer to `off` for the watcher and every hook before you use it.
 
 ## Causal witness migration (s342)
 

@@ -14,10 +14,6 @@ import { describe, it, expect, beforeEach } from "bun:test";
 
 import { hashQuery, writeRecallEvents } from "../../src/recall-buffer.ts";
 import { createStore, type RecallStatsRow } from "../../src/store.ts";
-import {
-  segmentTranscriptIntoTurns,
-  attributeRecallReferences,
-} from "../../src/recall-attribution.ts";
 
 // ─── Test Helpers ───────────────────────────────────────────────────
 
@@ -345,51 +341,9 @@ describe("diversity and spacing scores", () => {
   });
 });
 
-// ─── Transcript Segmentation ────────────────────────────────────────
+// ─── Linkage columns (62.1 D6 replaced positional attribution: see stop-feedback.test.ts) ───
 
-describe("segmentTranscriptIntoTurns", () => {
-  it("segments user-assistant pairs into turns", () => {
-    const turns = segmentTranscriptIntoTurns([
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "hi there" },
-      { role: "user", content: "what is doc1?" },
-      { role: "assistant", content: "doc1.md is about testing" },
-    ]);
-    expect(turns).toHaveLength(2);
-    expect(turns[0]!.userText).toBe("hello");
-    expect(turns[0]!.assistantText).toBe("hi there");
-    expect(turns[1]!.userText).toBe("what is doc1?");
-    expect(turns[1]!.assistantText).toBe("doc1.md is about testing");
-  });
-
-  it("concatenates multiple assistant messages in one turn", () => {
-    const turns = segmentTranscriptIntoTurns([
-      { role: "user", content: "query" },
-      { role: "assistant", content: "part 1" },
-      { role: "assistant", content: "part 2" },
-    ]);
-    expect(turns).toHaveLength(1);
-    expect(turns[0]!.assistantText).toBe("part 1\npart 2");
-  });
-
-  it("ignores system messages", () => {
-    const turns = segmentTranscriptIntoTurns([
-      { role: "system", content: "you are helpful" },
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "hi" },
-    ]);
-    expect(turns).toHaveLength(1);
-    expect(turns[0]!.userText).toBe("hello");
-  });
-
-  it("handles empty input", () => {
-    expect(segmentTranscriptIntoTurns([])).toHaveLength(0);
-  });
-});
-
-// ─── Per-turn Attribution via attributeRecallReferences ─────────────
-
-describe("attributeRecallReferences (per-turn)", () => {
+describe("recall linkage columns", () => {
   let store: ReturnType<typeof createStore>;
 
   beforeEach(() => {
@@ -407,152 +361,5 @@ describe("attributeRecallReferences (per-turn)", () => {
   it("turn_index column exists on context_usage", () => {
     const cols = store.db.prepare("PRAGMA table_info(context_usage)").all() as { name: string }[];
     expect(cols.map(c => c.name)).toContain("turn_index");
-  });
-
-  it("doc cited in turn 1 only — turn 1 marked, turn 2 not", () => {
-    // Turn 0: doc1 injected, assistant cites it
-    const u0 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:00:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 0,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q0", searchScore: 0.8, sessionId: "s1", usageId: u0, turnIndex: 0 },
-    ]);
-
-    // Turn 1: doc1 injected again, assistant does NOT cite it
-    const u1 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:05:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 1,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q1", searchScore: 0.6, sessionId: "s1", usageId: u1, turnIndex: 1 },
-    ]);
-
-    // Transcript: turn 0 cites doc1.md, turn 1 does not
-    const turns = [
-      { userText: "tell me about doc1", assistantText: "notes/doc1.md contains testing info" },
-      { userText: "what about doc2?", assistantText: "I don't have info on doc2" },
-    ];
-
-    const usages = store.getUsageForSession("s1");
-    attributeRecallReferences(store, "s1", usages, turns);
-
-    const events = store.db.prepare(
-      "SELECT turn_index, was_referenced FROM recall_events WHERE doc_id = 1 ORDER BY turn_index"
-    ).all() as any[];
-
-    expect(events).toHaveLength(2);
-    expect(events[0].turn_index).toBe(0);
-    expect(events[0].was_referenced).toBe(1); // turn 0 — cited
-    expect(events[1].turn_index).toBe(1);
-    expect(events[1].was_referenced).toBe(0); // turn 1 — NOT cited
-  });
-
-  it("doc cited in turn 2 only — turn 1 not marked, turn 2 marked", () => {
-    const u0 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:00:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 0,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q0", searchScore: 0.8, sessionId: "s1", usageId: u0, turnIndex: 0 },
-    ]);
-
-    const u1 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:05:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 1,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q1", searchScore: 0.6, sessionId: "s1", usageId: u1, turnIndex: 1 },
-    ]);
-
-    const turns = [
-      { userText: "hello", assistantText: "how can I help?" },
-      { userText: "tell me about doc1", assistantText: "doc1.md contains testing info" },
-    ];
-
-    attributeRecallReferences(store, "s1", store.getUsageForSession("s1"), turns);
-
-    const events = store.db.prepare(
-      "SELECT turn_index, was_referenced FROM recall_events WHERE doc_id = 1 ORDER BY turn_index"
-    ).all() as any[];
-
-    expect(events[0].was_referenced).toBe(0); // turn 0 — NOT cited
-    expect(events[1].was_referenced).toBe(1); // turn 1 — cited
-  });
-
-  it("two docs in one turn, only one referenced", () => {
-    const u0 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:00:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md", "notes/doc2.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 0,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q0", searchScore: 0.8, sessionId: "s1", usageId: u0, turnIndex: 0 },
-      { docId: 2, queryHash: "q0", searchScore: 0.6, sessionId: "s1", usageId: u0, turnIndex: 0 },
-    ]);
-
-    const turns = [
-      { userText: "what do I know?", assistantText: "Based on doc1.md, you have testing notes" },
-    ];
-
-    attributeRecallReferences(store, "s1", store.getUsageForSession("s1"), turns);
-
-    const e1 = store.db.prepare("SELECT was_referenced FROM recall_events WHERE doc_id = 1").get() as any;
-    const e2 = store.db.prepare("SELECT was_referenced FROM recall_events WHERE doc_id = 2").get() as any;
-
-    expect(e1.was_referenced).toBe(1); // doc1 cited
-    expect(e2.was_referenced).toBe(0); // doc2 NOT cited
-  });
-
-  it("empty injected_paths turn does not crash", () => {
-    store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:00:00Z",
-      hookName: "context-surfacing", injectedPaths: [],
-      estimatedTokens: 0, wasReferenced: 0, turnIndex: 0,
-    });
-
-    const turns = [{ userText: "hello", assistantText: "hi" }];
-
-    // Should not throw
-    attributeRecallReferences(store, "s1", store.getUsageForSession("s1"), turns);
-  });
-
-  it("turn_index drift: empty turn 0, injected turn 1 — correct alignment", () => {
-    // Turn 0: no context injected (empty paths, logged for alignment)
-    store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:00:00Z",
-      hookName: "context-surfacing", injectedPaths: [],
-      estimatedTokens: 0, wasReferenced: 0, turnIndex: 0,
-    });
-
-    // Turn 1: doc1 injected and cited
-    const u1 = store.insertUsage({
-      sessionId: "s1", timestamp: "2026-04-08T10:05:00Z",
-      hookName: "context-surfacing", injectedPaths: ["notes/doc1.md"],
-      estimatedTokens: 100, wasReferenced: 0, turnIndex: 1,
-    });
-    store.insertRecallEvents([
-      { docId: 1, queryHash: "q1", searchScore: 0.8, sessionId: "s1", usageId: u1, turnIndex: 1 },
-    ]);
-
-    // Transcript: turn 0 is a greeting (no context), turn 1 cites doc1
-    const turns = [
-      { userText: "hello", assistantText: "hi there" },
-      { userText: "tell me about doc1", assistantText: "notes/doc1.md has the info" },
-    ];
-
-    attributeRecallReferences(store, "s1", store.getUsageForSession("s1"), turns);
-
-    const events = store.db.prepare(
-      "SELECT turn_index, was_referenced FROM recall_events WHERE doc_id = 1"
-    ).all() as any[];
-
-    expect(events).toHaveLength(1);
-    expect(events[0].turn_index).toBe(1);
-    expect(events[0].was_referenced).toBe(1); // correctly attributed to turn 1
   });
 });

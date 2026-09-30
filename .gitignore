@@ -20,6 +20,10 @@ node_modules/
 # Secrets
 .env
 
+# Python bytecode (the Hermes plugin's tests import it)
+__pycache__/
+*.pyc
+
 # Internal dev artifacts
 eval-queries*.json
 eval-bypass-cases*.json

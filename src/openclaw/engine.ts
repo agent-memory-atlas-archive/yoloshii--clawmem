@@ -138,6 +138,7 @@ import {
   type CompactionThresholdConfig,
 } from "./compaction-threshold.js";
 import { resolveOpenClawSessionFile, SAFE_SESSION_ID_RE } from "./transcript-resolver.js";
+import { cleanPromptForSearch } from "./prompt-clean.js";
 import { basename } from "node:path";
 
 // =============================================================================
@@ -155,30 +156,9 @@ export type Logger = {
 // Prompt cleaning (strips OpenClaw noise from the user prompt before search)
 // =============================================================================
 
-/**
- * Strip OpenClaw-specific noise from the user prompt before using it as a
- * search query. Gateway prompts contain metadata, system events, timestamps,
- * and previously injected context that degrade embedding/BM25 quality.
- */
-export function cleanPromptForSearch(prompt: string): string {
-  let cleaned = prompt;
-  // Strip previously injected vault-context (avoid re-searching our own output)
-  cleaned = cleaned.replace(/<vault-context>[\s\S]*?<\/vault-context>/g, "");
-  cleaned = cleaned.replace(/<vault-routing>[\s\S]*?<\/vault-routing>/g, "");
-  cleaned = cleaned.replace(/<vault-session>[\s\S]*?<\/vault-session>/g, "");
-  // Strip OpenClaw sender metadata block
-  cleaned = cleaned.replace(/Sender\s*\(untrusted metadata\)\s*:\s*```json\n[\s\S]*?```/g, "");
-  cleaned = cleaned.replace(/Sender\s*\(untrusted metadata\)\s*:\s*\{[\s\S]*?\}\s*/g, "");
-  // Strip OpenClaw runtime context blocks
-  cleaned = cleaned.replace(/OpenClaw runtime context \(internal\):[\s\S]*?(?=\n\n|\n?$)/g, "");
-  // Strip "System: ..." single-line event entries
-  cleaned = cleaned.replace(/^System:.*$/gm, "");
-  // Strip timestamp prefixes e.g. "[Sat 2026-03-14 16:19 GMT+8] "
-  cleaned = cleaned.replace(/^\[.*?GMT[+-]\d+\]\s*/gm, "");
-  // Collapse excessive whitespace
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
-  return cleaned || prompt;
-}
+// 62.1 D1: the definition lives in prompt-clean.ts (dependency-free, shared with the Stop-side pairing); re-exported
+// here for existing importers.
+export { cleanPromptForSearch } from "./prompt-clean.js";
 
 // =============================================================================
 // Event payload shapes (mirror PluginHookName event types from OpenClaw core)
@@ -256,6 +236,11 @@ export type SessionEndEvent = {
   sessionFile?: string;
 };
 
+export type SessionEndContext = {
+  agentId?: string;
+  sessionKey?: string;
+};
+
 export type BeforeResetEvent = {
   sessionFile?: string;
   messages?: unknown[];
@@ -267,6 +252,19 @@ export type BeforeResetContext = {
   sessionKey?: string;
   agentId?: string;
 };
+
+/**
+ * 62.1 D1 (rev 11): the fields every hook OpenClaw spawns carries — `host` (absent means Claude Code to the hook),
+ * the session key OpenClaw's resolver tells a session's base and topic transcripts apart by, and the transcript
+ * path when one resolved.
+ */
+function openclawHookIdentity(sessionKey: string | undefined, sessionFile: string | undefined): Record<string, string> {
+  return {
+    host: "openclaw",
+    ...(sessionKey ? { session_key: sessionKey } : {}),
+    ...(sessionFile ? { transcript_path: sessionFile } : {}),
+  };
+}
 
 // =============================================================================
 // Handler implementations
@@ -298,9 +296,35 @@ export async function handleBeforePromptBuild(
   event: BeforePromptBuildEvent,
   ctx: BeforePromptBuildContext,
 ): Promise<BeforePromptBuildResult | undefined> {
-  if (!event.prompt || event.prompt.length < 5) return undefined;
-
   const sessionId = ctx.sessionId || "unknown";
+
+  // 62.1 D1 (rev 10/11/13): resolve the transcript FIRST (the resolver unchanged, existence checks kept — the same
+  // call the precompact check below always made). context-surfacing registers it as this session's locator, so the
+  // stop-pipeline worker can reach the transcript even if no agent_end ever commits. An unresolvable file is passed
+  // as nothing: no guessed path (a transcript no invocation resolves is the ruled limit, operator 2026-09-30).
+  const sessionFile = activeResolveSessionFile({
+    sessionId,
+    agentId: ctx.agentId,
+    sessionKey: ctx.sessionKey,
+  });
+  const identity = openclawHookIdentity(ctx.sessionKey, sessionFile);
+
+  if (!event.prompt || event.prompt.length < 5) {
+    // Today's early return for an empty or short prompt stays BEFORE the one-shot bootstrap consumption, and returns
+    // no context. When the transcript resolved, context-surfacing runs register_only first: it registers the locator
+    // and returns before any gate, usage row, spool job or retrieval (rev 11).
+    if (sessionFile && ctx.sessionId) {
+      const reg = await activeHookRunner.execHook(
+        cfg,
+        "context-surfacing",
+        { session_id: sessionId, prompt: event.prompt ?? "", register_only: true, ...identity },
+        contextSurfacingKillTimeoutMs(cfg),
+      );
+      if (reg.exitCode !== 0) logger.debug?.(`clawmem: context-surfacing register_only failed: ${reg.stderr}`);
+    }
+    return undefined;
+  }
+
   const isFirstTurn = !isSessionSurfaced(sessionId);
 
   let context = "";
@@ -319,7 +343,7 @@ export async function handleBeforePromptBuild(
   const surfacingResult = await activeHookRunner.execHook(
     cfg,
     "context-surfacing",
-    { session_id: sessionId, prompt: searchPrompt },
+    { session_id: sessionId, prompt: searchPrompt, ...identity },
     contextSurfacingKillTimeoutMs(cfg),
   );
 
@@ -335,15 +359,9 @@ export async function handleBeforePromptBuild(
 
   // PRE-EMPTIVE PRECOMPACT (synchronous, awaited)
   // This is the load-bearing correctness path — must run BEFORE the LLM call
-  // that could trigger compaction on this turn. Resolve the transcript path
-  // via the resolver, which consults sessions.json (authoritative) and falls
-  // back to filesystem probing. Pass sessionKey so the resolver can do exact
-  // store lookups when available.
-  const sessionFile = activeResolveSessionFile({
-    sessionId,
-    agentId: ctx.agentId,
-    sessionKey: ctx.sessionKey,
-  });
+  // that could trigger compaction on this turn. The transcript path was
+  // resolved at the top of this handler (sessions.json authoritative, then
+  // filesystem probing, with sessionKey for exact store lookups).
   await maybeRunPrecompactExtract(cfg, thresholdCfg, logger, {
     sessionId,
     sessionFile,
@@ -400,6 +418,7 @@ export async function maybeRunPrecompactExtract(
   const result = await activeHookRunner.execHook(cfg, "precompact-extract", {
     session_id: params.sessionId,
     transcript_path: params.sessionFile,
+    host: "openclaw",
   });
 
   if (result.exitCode !== 0) {
@@ -447,7 +466,7 @@ export async function handleAgentEnd(
 
   const hookInput: Record<string, unknown> = {
     session_id: ctx.sessionId,
-    transcript_path: sessionFile,
+    ...openclawHookIdentity(ctx.sessionKey, sessionFile),
   };
 
   const [decisionResult, handoffResult, feedbackResult] = await Promise.allSettled([
@@ -522,6 +541,7 @@ export async function handleSessionStart(
 ): Promise<void> {
   const result = await activeHookRunner.execHook(cfg, "session-bootstrap", {
     session_id: event.sessionId,
+    ...openclawHookIdentity(event.sessionKey, undefined),
   });
 
   if (result.exitCode === 0) {
@@ -537,13 +557,34 @@ export async function handleSessionStart(
   logger.info(`clawmem: session started ${event.sessionId}`);
 }
 
+/** The session_end flush's child timeout: its own deadline is 1 s; the rest covers the process start. */
+const SESSION_END_HOOK_TIMEOUT_MS = 5_000;
+
 /**
- * session_end handler — clears per-session state.
+ * session_end handler — 62.1 D5: awaits the handoff's render-only flush (`hook_event_name: "SessionEnd"`: no
+ * transcript read, no model call) BEFORE clearing per-session state. The flush also registers the transcript once
+ * its file exists (D1 rev 13). A failed flush leaves the render to the stop-pipeline worker.
  */
-export function handleSessionEnd(
+export async function handleSessionEnd(
+  cfg: ClawMemConfig,
   logger: Logger,
   event: SessionEndEvent,
-): void {
+  ctx?: SessionEndContext,
+): Promise<void> {
+  if (event.sessionId) {
+    const sessionKey = event.sessionKey ?? ctx?.sessionKey;
+    const sessionFile = event.sessionFile ?? activeResolveSessionFile({ sessionId: event.sessionId, agentId: ctx?.agentId, sessionKey });
+    try {
+      const result = await activeHookRunner.execHook(cfg, "handoff-generator", {
+        session_id: event.sessionId,
+        hook_event_name: "SessionEnd",
+        ...openclawHookIdentity(sessionKey, sessionFile),
+      }, SESSION_END_HOOK_TIMEOUT_MS);
+      if (result.exitCode !== 0) logger.warn(`clawmem: session_end handoff flush error: ${result.stderr}`);
+    } catch (err) {
+      logger.warn(`clawmem: session_end handoff flush failed: ${String(err)}`);
+    }
+  }
   clearSessionState(event.sessionId);
   logger.info(`clawmem: session ended ${event.sessionId} (${event.messageCount} messages)`);
 }
@@ -583,7 +624,7 @@ export async function handleBeforeReset(
 
   const hookInput: Record<string, unknown> = {
     session_id: ctx.sessionId,
-    transcript_path: sessionFile,
+    ...openclawHookIdentity(ctx.sessionKey, sessionFile),
   };
 
   await Promise.allSettled([

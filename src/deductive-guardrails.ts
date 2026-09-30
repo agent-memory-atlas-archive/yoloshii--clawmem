@@ -36,6 +36,7 @@ import type { Store } from "./store.ts";
 import type { LLM } from "./llm.ts";
 import { extractJsonFromLLM } from "./amem.ts";
 import { extractSubjectAnchorsLexical } from "./text-similarity.ts";
+import { relWeightSql } from "./relation-weight.ts";
 
 // =============================================================================
 // Types
@@ -171,11 +172,11 @@ export function buildSourceRelationContext(
   try {
     rows = store.db
       .prepare(
-        `SELECT source_id, target_id, relation_type, weight
-         FROM memory_relations
-         WHERE source_id IN (${placeholders})
-           AND target_id IN (${placeholders})
-         ORDER BY weight DESC
+        `SELECT mr.source_id, mr.target_id, mr.relation_type, ${relWeightSql("mr")} AS weight
+         FROM memory_relations mr
+         WHERE mr.source_id IN (${placeholders})
+           AND mr.target_id IN (${placeholders})
+         ORDER BY ${relWeightSql("mr")} DESC
          LIMIT ?`
       )
       .all(...sourceDocIds, ...sourceDocIds, maxEdges) as typeof rows;

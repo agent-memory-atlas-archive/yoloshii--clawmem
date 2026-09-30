@@ -57,8 +57,10 @@ function seedDoc(
   const created = opts.createdAt ?? iso(0);
   store.insertContent(hash, body, created);
   store.insertDocument(col, path, path, hash, created, created);
+  // 62.1 D9: a counter write carries a fresh counter stamp (an unstamped one is an older ClawMem's and is ignored).
   store.db.prepare(
-    `UPDATE documents SET origin = ?, active = ?, deactivated_reason = ?, access_count = ?, pinned = ? WHERE collection = ? AND path = ?`
+    `UPDATE documents SET origin = ?, active = ?, deactivated_reason = ?, access_count = ?, pinned = ?,
+       counter_stamp = lower(hex(randomblob(8))) WHERE collection = ? AND path = ?`
   ).run(opts.origin ?? null, opts.active ?? 1, opts.reason ?? null, opts.access ?? 0, opts.pinned ?? 0, col, path);
 }
 

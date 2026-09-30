@@ -193,6 +193,26 @@ builders operate on — so archiving documents legitimately lowers the total.
 - "Legacy pre-compaction state: N precompact-state.md file(s) left by ClawMem ≤ v0.39.x": delete the files. In red ("written after this vault was upgraded"), an older ClawMem process is still running against the vault: upgrade it.
 - "… indexed cop(y|ies) of an old snapshot … still active": `clawmem update` deactivates each one whose file is on disk or was deleted; one from before v0.34 whose file is gone stays until you forget it by its exact path.
 
+**`clawmem doctor` stop-pipeline lines (v0.41.0)**
+- "✗ Stop pipeline: migration incomplete (…)": the migration transaction did not commit, usually because another process held the vault's write lock longer than the open waited. The store still opens, but the Stop hooks skip their counter and cursor work. Any writable open retries it; run `clawmem doctor` again after stopping the busy process.
+- "✗ Stop pipeline: an older ClawMem still writes to this vault …": the fence caught writes from a ClawMem older than v0.41.0 (each surface with its count and last time). Those writes were skipped, and that version's `context-surfacing` injects nothing. Upgrade or stop every ClawMem process that shares the vault — the watcher, `clawmem serve`, MCP servers in open sessions, the OpenClaw and Hermes plugins. Once nothing has been caught for 24 h, doctor reports the log as past instead of failing.
+- "! counter recompute pending": `clawmem watch` runs it once at its next start; without a watcher, run `clawmem repair counters --apply`.
+- "! Stop pipeline queues: … older than 24 h": nothing drained them — `clawmem watch` is not running, or its worker cannot reach the vault. Start the watcher, or drain by hand with `clawmem repair stop-queue --run`. A quarantined range whose bytes changed is listed as unavailable; dismiss it with `clawmem repair stop-queue --dismiss <id>`.
+- "N feedback verdict(s) provisional": an OpenClaw or Hermes turn credited on a quiet transcript; it becomes final at the next turn, Stop or session end. Informational.
+- "N feedback turn(s) wait for their OpenClaw transcript to be bound": surfacing rows written before OpenClaw could resolve the session's file. They are bound by the session's next prompt, `agent_end` or `session_end` that resolves it.
+- "! … causal step(s) wait while CLAWMEM_CAUSAL_WRITER=off": ranges committed while the writer was `shadow`/`on`. They run when it is on again; to keep the lane off for good, set `CLAWMEM_CAUSAL_WRITER=off` for the watcher and the hooks, then `clawmem repair stop-queue --dismiss-causal` drops them. It refuses while this shell's writer is not `off`, and while the vault shows a causal step queued or run in the last hour, since those steps are runnable. It cannot see an idle consumer, so switch the writer off everywhere first.
+- "N overwritten antipattern bodies preserved": review them with `clawmem recover antipatterns`.
+- "! Claude Code hooks: the SessionEnd handoff flush is not installed": re-run `clawmem setup hooks`.
+
+**Access counts and co-activations dropped after upgrading to v0.41.0**
+- Expected. The one-time recompute set each document's `access_count` to its verified references since the upgrade (near zero at first) and rebuilt co-activations and `usage` relations the same way; through v0.40.3 every Stop counted the whole session again. Documents whose old access fell inside their archive window got a staggered archive grace (`clawmem doctor` projects the expiries per week). `clawmem repair counters --restore <op>` reverses the recompute; the op id is in the watcher log.
+
+**A session's handoff lacks its last turns**
+- The handoff document renders at the summary step, at SessionEnd and in the watcher. Without the SessionEnd hook (`clawmem setup hooks` installs it since v0.41.0), or when the flush found the vault busy, the watcher renders it once the session has ended or its digests have been quiet for 10 minutes. `clawmem repair stop-queue --run` renders it at once.
+
+**Hermes sessions keep only their last turn and write no handoff (v0.41.0)**
+- The Hermes plugin copied before v0.41.0 runs the Stop hooks only at session end, and a transcript's first Stop starts at its current turn. Copy the plugin's contents over it and restart Hermes: `cp -r /path/to/ClawMem/src/hermes/. "${HERMES_HOME:-$HOME/.hermes}/plugins/clawmem/"` (with the trailing `/.` — `cp -r src/hermes` into an existing directory nests a copy inside it and leaves the old plugin running). The v0.41 plugin runs them after every synced turn.
+
 **"UserPromptSubmit hook error" (intermittent)**
 - SQLite contention between the watcher and the context-surfacing hook. During active conversations, Claude Code writes rapidly to session transcript `.jsonl` files. Prior to v0.1.6, the watcher processed all `.jsonl` file changes (not just Beads `.beads/*.jsonl`), triggering database opens and brief write locks on every transcript update. If the context-surfacing hook fired during a lock, it exceeded its timeout.
 - Fixed in v0.1.6: The watcher now only processes `.jsonl` files within `.beads/` directories (Dolt backend). Claude Code transcript `.jsonl` files are ignored entirely, eliminating the main source of lock contention and memory bloat.
@@ -338,8 +358,11 @@ builders operate on — so archiving documents legitimately lowers the total.
 - A persistently growing set of retained files means a unit keeps failing (e.g. a secondary-vault DB is unwritable) — run `clawmem spool-drain` in a terminal and read its stderr summary (`applied= discarded= retained=`).
 
 **Duplicate observations after every session**
-- The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
-- If duplicates still appear: check that the dedup window hasn't been bypassed by large time gaps or content variations.
+- Since v0.41.0 `decision-extractor` keeps a cursor per transcript, so a turn is extracted once; an item is dropped as a duplicate only when the same session emits it again with identical content. The same decision stated in other words is a second item, by design — the usual source of near-duplicates.
+- Two documents for one session: a second transcript of the same session id (OpenClaw's base and topic transcripts) has its own documents, with a `-<tk6>` suffix. So does a session whose canonical path a pre-upgrade document already held.
+- A turn extracted twice: a transcript that was replaced, truncated or rewritten starts a new generation at its current turn, so that turn can be read again (its identical items are still dropped). `SELECT hook, anchor_epoch, byte_offset FROM stop_cursors WHERE session_id = '<id>'` shows each hook's cursor and generation.
+- An older ClawMem cannot add such duplicates: the fence skips its writes under `_clawmem/decisions/`, `antipatterns/`, `handoffs/` and `observations/`. `clawmem doctor` names it when it tries.
+- Through v0.40.3 every Stop re-extracted the last 200 transcript entries, and `saveMemory()`'s 30-minute hash window and the cross-session merge policies were what held the repeats back.
 
 **`[decision-extractor] contradiction: N invalidation(s) suppressed by shadow mode`**
 - Not an error. Contradiction invalidation ships unarmed (v0.28.0+): the hook eroded a document's confidence to the `0.2` floor, which is the point at which it *would* set `invalidated_at` and drop the document out of FTS and vector retrieval. It logged the intent and wrote nothing.

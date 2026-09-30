@@ -771,8 +771,10 @@ describe("repository state", () => {
   });
   it("ROUND 2, finding 7: the Stop-hook deadline seam codex named is inside the closure (migrated: `deadline`)", () => {
     expect(has("src/causal-writer.ts", "runCausalStep", "deadline")).toBe(true);
-    expect(has("src/hooks/decision-extractor.ts", "detectContradictions", "deadline")).toBe(true);
-    expect(has("src/hooks/decision-extractor.ts", "checkMergePolicy", "deadline")).toBe(true);
+    // 62.1: the contradiction judge moved to stop-judge.ts (Phase A carries the Stop deadline).
+    expect(has("src/stop-judge.ts", "judgePhaseA", "deadline")).toBe(true);
+    // 62.1: checkMergePolicy was deleted (D4); the batched extraction carries the Stop deadline instead.
+    expect(has("src/stop-extract.ts", "ExtractionArgs", "deadline")).toBe(true);
     expect(has("src/hooks/decision-extractor.ts", "decisionExtractor", "deadline")).toBe(true);
   });
   it("every deadline seam is MonoDeadline and the relative seam is DurationMs — the legacy brand is gone from the closure", () => {

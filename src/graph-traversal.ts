@@ -9,6 +9,7 @@ import type { Database } from "bun:sqlite";
 import type { IntentType } from "./intent.ts";
 import { getIntentWeights } from "./intent.ts";
 import { notLegacyArtifactSql } from "./compaction-state.ts";
+import { relWeightSql } from "./relation-weight.ts";
 
 // =============================================================================
 // Types
@@ -167,14 +168,14 @@ export function adaptiveTraversal(
   // normalization skew).
   const elig = eligibilitySql("d", eligibility);
   const neighborStmt = db.prepare(`
-        SELECT r.target_id as docId, r.relation_type, r.weight
+        SELECT r.target_id as docId, r.relation_type, ${relWeightSql("r")} AS weight
         FROM memory_relations r
         JOIN documents d ON d.id = r.target_id
         WHERE r.source_id = ? AND ${elig.sql}
 
         UNION
 
-        SELECT r.source_id as docId, r.relation_type, r.weight
+        SELECT r.source_id as docId, r.relation_type, ${relWeightSql("r")} AS weight
         FROM memory_relations r
         JOIN documents d ON d.id = r.source_id
         WHERE r.target_id = ? AND r.relation_type IN ('semantic', 'entity') AND ${elig.sql}
@@ -322,22 +323,22 @@ function batchLoadEdges(
   // Outbound edges (source → target) — destination must be eligible, checked here so
   // ineligible rows never receive propagated mass or occupy a top-k slot
   const outbound = db.prepare(`
-    SELECT r.source_id, r.target_id as docId, r.weight
+    SELECT r.source_id, r.target_id as docId, ${relWeightSql("r")} AS weight
     FROM memory_relations r
     JOIN documents d ON d.id = r.target_id
     WHERE r.source_id IN (${placeholders}) AND r.relation_type = ? AND ${elig.sql}
-    ORDER BY r.weight DESC
+    ORDER BY ${relWeightSql("r")} DESC
   `).all(...uncached, edgeType, ...elig.params) as { source_id: number; docId: number; weight: number }[];
 
   // Inbound edges for symmetric types (semantic, entity)
   let inbound: { source_id: number; docId: number; weight: number }[] = [];
   if (edgeType === 'semantic' || edgeType === 'entity') {
     inbound = db.prepare(`
-      SELECT r.target_id as source_id, r.source_id as docId, r.weight
+      SELECT r.target_id as source_id, r.source_id as docId, ${relWeightSql("r")} AS weight
       FROM memory_relations r
       JOIN documents d ON d.id = r.source_id
       WHERE r.target_id IN (${placeholders}) AND r.relation_type = ? AND ${elig.sql}
-      ORDER BY r.weight DESC
+      ORDER BY ${relWeightSql("r")} DESC
     `).all(...uncached, edgeType, ...elig.params) as typeof inbound;
   }
 

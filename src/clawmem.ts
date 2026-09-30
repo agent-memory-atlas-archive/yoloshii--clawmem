@@ -90,12 +90,13 @@ import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT
 import { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } from "./merge-guards.ts";
 import { judgeAuditCounts } from "./judge-audit.ts";
 import { handoffGenerator } from "./hooks/handoff-generator.ts";
+import { SESSION_END_BUSY_TIMEOUT_MS, SESSION_END_DEADLINE_MS } from "./stop-handoff.ts";
 import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
 import { precompactExtract } from "./hooks/precompact-extract.ts";
 import { postcompactInject } from "./hooks/postcompact-inject.ts";
 import { isLegacyPrecompactState, legacyPrecompactStateFiles, notLegacyArtifactSql, registerCompaction } from "./compaction-state.ts";
-import { postcompactMatcherIssues, stripClawmemHooks } from "./hook-settings.ts";
+import { clawmemHookName, postcompactMatcherIssues, stripClawmemHooks } from "./hook-settings.ts";
 import { pretoolInject } from "./hooks/pretool-inject.ts";
 import { curatorNudge } from "./hooks/curator-nudge.ts";
 import {
@@ -1128,6 +1129,13 @@ async function cmdStatus() {
     console.log();
     console.log(`${c.bold}Sessions:${c.reset} ${sessions.cnt} tracked`);
   }
+
+  // 62.1 D10: one line for the stop pipeline (doctor has the detail).
+  try {
+    const { stopPipelineHealth, stopHealthLine } = await import("./stop-health.ts");
+    console.log();
+    console.log(stopHealthLine(stopPipelineHealth(s.db)));
+  } catch { /* status stays readable on a vault the check cannot read */ }
 }
 
 async function cmdList(args: string[]) {
@@ -2011,6 +2019,10 @@ async function cmdHook(args: string[]) {
   }
 
   const input = await readHookInput();
+  // 62.1 D5: the SessionEnd handoff flush renders only, inside Claude Code's 1.5 s cap — its deadline starts here,
+  // before the vault is opened, and the open waits at most 250 ms on a busy vault.
+  const sessionEnd = hookName === "handoff-generator" && input.hookEventName === "SessionEnd";
+  const sessionEndDeadline = sessionEnd ? deadlineAfter(monoNow(), duration(SESSION_END_DEADLINE_MS)) : undefined;
   // 62.2: PreCompact registers its attempt beside the vault BEFORE the vault is opened, so a contended
   // or failing open (or the host's timeout) cannot leave an earlier compaction's state takeable.
   let compactionAttempt: string | null | undefined;
@@ -2027,6 +2039,7 @@ async function cmdHook(args: string[]) {
     s = getStore(
       hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS
         : hookName === "precompact-extract" || hookName === "postcompact-inject" ? 2000
+        : sessionEnd ? SESSION_END_BUSY_TIMEOUT_MS
         : 5000,
     );
   } catch (err) {
@@ -2058,7 +2071,7 @@ async function cmdHook(args: string[]) {
         output = await decisionExtractor(s, input);
         break;
       case "handoff-generator":
-        output = await handoffGenerator(s, input);
+        output = await handoffGenerator(s, input, { sessionEndDeadline });
         break;
       case "feedback-loop":
         output = await feedbackLoop(s, input);
@@ -2415,7 +2428,7 @@ async function cmdSetupHooks(args: string[]) {
   // "clawmem" was deleted whole, taking a user's hook in the same group with it.
   if (remove) {
     // Remove clawmem hooks
-    for (const event of ["UserPromptSubmit", "Stop", "SessionStart", "PreCompact"]) {
+    for (const event of ["UserPromptSubmit", "Stop", "SessionStart", "PreCompact", "SessionEnd"]) {
       if (settings.hooks[event]) {
         settings.hooks[event] = stripClawmemHooks(settings.hooks[event]);
         if (settings.hooks[event].length === 0) delete settings.hooks[event];
@@ -2432,6 +2445,8 @@ async function cmdSetupHooks(args: string[]) {
       { event: "SessionStart", matcher: "", hooks: ["curator-nudge"] },
       { event: "PreCompact", matcher: "", hooks: ["precompact-extract"] },
       { event: "Stop", matcher: "", hooks: ["decision-extractor", "handoff-generator", "feedback-loop"] },
+      // 62.1 D5: the handoff's render-only flush (no transcript read, no model) at session end.
+      { event: "SessionEnd", matcher: "", hooks: ["handoff-generator"] },
     ];
 
     // Use Claude Code's native timeout property instead of shell `timeout` wrapper.
@@ -2471,6 +2486,7 @@ async function cmdSetupHooks(args: string[]) {
       SessionStart: 5,
       PreCompact: 5,
       Stop: 30, // LLM-based extraction hooks need more time
+      SessionEnd: 2, // the flush's own deadline is 1 s; Claude Code caps SessionEnd hooks at 1.5 s
     };
 
     // Remove existing clawmem entries ONCE per event, before any group is added: an event with two
@@ -3378,14 +3394,50 @@ function findClawmemBinary(): string {
 // Watch (File Watcher Daemon)
 // =============================================================================
 
+/**
+ * 62.1 D11: the stop-pipeline worker for `clawmem watch` — the one-time preparation first (overwritten antipattern
+ * bodies preserved, then the counter recompute of each vault whose marker is absent; both yield between chunks), then
+ * a tick every 60 s over the general vault and every configured named vault.
+ */
+async function startStopWorkerForWatch(s: StoreType): Promise<import("./stop-worker.ts").StopWorkerHandle> {
+  const { startStopPipelineWorker } = await import("./stop-worker.ts");
+  const { recomputeCounters, recomputeDone } = await import("./stop-repair.ts");
+  const { preserveAntipatternBodies } = await import("./stop-recover.ts");
+  const { stopPipelineReady } = await import("./stop-schema.ts");
+  const { resolveStore } = await import("./store.ts");
+  const { listVaults, loadVaultConfig } = await import("./config.ts");
+  const log = (msg: string) => console.log(`${c.dim}${msg}${c.reset}`);
+  const opened = new Map<string, StoreType>();
+  const vaults = () => {
+    const names = listVaults();
+    for (const [name, st] of opened) if (!names.includes(name)) { try { st.close(); } catch { /* closed */ } opened.delete(name); }
+    for (const name of names) {
+      if (opened.has(name)) continue;
+      try { opened.set(name, resolveStore(name)); } catch { /* unavailable this tick */ }
+    }
+    return [...opened].map(([name, store]) => ({ name, store }));
+  };
+  const pause = () => new Promise<void>(r => setTimeout(r, 0));
+  const prepare = async () => {
+    if (!stopPipelineReady(s.db)) { log(`[stop-worker] the stop-pipeline schema is not verified on this vault — run 'clawmem doctor'`); return; }
+    const copied = await preserveAntipatternBodies(s.db, { pause });
+    if (copied > 0) log(`[stop-worker] preserved ${copied} overwritten antipattern bodies (see 'clawmem recover antipatterns')`);
+    for (const v of [{ name: "general", store: s }, ...vaults()]) {
+      if (!stopPipelineReady(v.store.db) || recomputeDone(v.store.db)) continue;
+      log(`[stop-worker] ${v.name}: recomputing feedback counters from verified references (one time)`);
+      const r = await recomputeCounters(v.store.db, { apply: true, policy: loadVaultConfig().lifecycle, pause });
+      log(`[stop-worker] ${v.name}: recompute done [op ${r.opId}] — documents ${r.documents} (grace ${r.graced}), utility ${r.utility}, co-activations ${r.coActivationsDeleted} → ${r.coActivationsInserted}, usage relations ${r.relationsDeleted} → ${r.relationsInserted}`);
+    }
+  };
+  return startStopPipelineWorker(s, vaults, getDefaultLlamaCpp(), {
+    prepare, log,
+  });
+}
+
 async function cmdWatch() {
   const { startWatcher } = await import("./watcher.ts");
   const collections = collectionsList()
     .sort((a, b) => b.path.length - a.path.length); // Most specific path first for prefix matching
-
-  if (collections.length === 0) {
-    die("No collections configured. Add one first: clawmem collection add <path> --name <name>");
-  }
 
   const dirs = collections.map(col => col.path);
   const s = getStore();
@@ -3403,6 +3455,7 @@ async function cmdWatch() {
   let checkpointTimerHandle: Timer | null = null;
   let prewarmTimerHandle: ReturnType<typeof setInterval> | null = null;
   let vectorDaemonHandle: VectorDaemonHandle | null = null;
+  let stopWorker: import("./stop-worker.ts").StopWorkerHandle | null = null;
 
   // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
   // handling is critical for systemd `systemctl --user stop` to shut down
@@ -3429,6 +3482,10 @@ async function cmdWatch() {
       stopHeavyLane = null;
     }
     await stopConsolidationWorker();
+    if (stopWorker) {
+      await stopWorker.stop();
+      stopWorker = null;
+    }
     if (checkpointTimerHandle) {
       clearInterval(checkpointTimerHandle);
       checkpointTimerHandle = null;
@@ -3442,6 +3499,31 @@ async function cmdWatch() {
   };
   process.on("SIGINT", () => { void shutdown("SIGINT"); });
   process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+
+  // 62.1 D11: the stop-pipeline worker (and, with no collection to watch, the vector daemon) start before anything that
+  // needs a collection — the worker drains what no later Stop will, on a vault with no collections too.
+  stopWorker = await startStopWorkerForWatch(s);
+  console.log(`${c.dim}[watch] stop-pipeline worker started (every 60s)${c.reset}`);
+
+  // Periodic WAL checkpoint: the watcher holds a long-lived DB connection which
+  // prevents SQLite auto-checkpoint from shrinking the WAL file. Without this,
+  // the WAL grows unbounded (observed 77MB+), slowing every concurrent DB access
+  // (hooks, MCP) and eventually causing UserPromptSubmit hook timeouts.
+  const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  checkpointTimerHandle = setInterval(() => {
+    try {
+      s.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch {
+      // Checkpoint failed (busy) — will retry next interval
+    }
+  }, WAL_CHECKPOINT_INTERVAL);
+
+  if (collections.length === 0) {
+    console.log(`${c.yellow}!${c.reset} No collections configured — nothing to watch; the stop-pipeline worker and the vector daemon keep running. Add one with: clawmem collection add <path> --name <name>`);
+    vectorDaemonHandle = await startVectorDaemon(s, (msg) => console.log(`${c.dim}${msg}${c.reset}`));
+    // Block forever — shutdown is driven by signal handlers registered above.
+    await new Promise(() => {});
+  }
 
   console.log(`${c.bold}Watching ${dirs.length} collection(s) for changes...${c.reset}`);
   for (const col of collections) {
@@ -3541,19 +3623,6 @@ async function cmdWatch() {
       console.error(`${c.red}Watch error: ${err.message}${c.reset}`);
     },
   });
-
-  // Periodic WAL checkpoint: the watcher holds a long-lived DB connection which
-  // prevents SQLite auto-checkpoint from shrinking the WAL file. Without this,
-  // the WAL grows unbounded (observed 77MB+), slowing every concurrent DB access
-  // (hooks, MCP) and eventually causing UserPromptSubmit hook timeouts.
-  const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
-  checkpointTimerHandle = setInterval(() => {
-    try {
-      s.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
-    } catch {
-      // Checkpoint failed (busy) — will retry next interval
-    }
-  }, WAL_CHECKPOINT_INTERVAL);
 
   // Block forever — shutdown is driven by signal handlers registered above.
   await new Promise(() => {});
@@ -3666,6 +3735,53 @@ async function cmdDoctor() {
     console.log(`${c.green}✓${c.reset} Database: ${s.dbPath} (${docCount} documents)`);
   } catch (err) {
     console.log(`${c.red}✗${c.reset} Database: ${err}`);
+    issues++;
+  }
+
+  // 1b. 62.1 D10: the stop pipeline — migration and fence, older writers the fence caught, the one-time counter
+  // recompute, and the queues the watcher drains.
+  try {
+    const s = getStore();
+    const { stopPipelineHealth, isStale } = await import("./stop-health.ts");
+    const h = stopPipelineHealth(s.db);
+    if (h.missing.length > 0) {
+      console.log(`${c.red}✗${c.reset} Stop pipeline: migration incomplete (${h.missing.slice(0, 4).join(", ")}${h.missing.length > 4 ? ", …" : ""}) — Stop hooks skip counter and cursor work until a writable open completes it`);
+      issues++;
+    } else {
+      console.log(`${c.green}✓${c.reset} Stop pipeline: schema and fence installed`);
+    }
+    if (h.legacyWritersRecent.length > 0) {
+      const w = h.legacyWritersRecent.slice(0, 4).map(x => `${x.surface} ×${x.count}, last ${x.lastAt.slice(0, 16)}`).join("; ");
+      console.log(`${c.red}✗${c.reset} Stop pipeline: an older ClawMem still writes to this vault — its Stop-hook writes were ignored and logged (${w}). Upgrade every ClawMem process that shares this vault`);
+      issues++;
+    } else if (h.legacyWriters.length > 0) {
+      console.log(`${c.dim}   an older ClawMem wrote to this vault before (last ${h.legacyWriters[0]!.lastAt.slice(0, 16)}); nothing caught in the last 24 h${c.reset}`);
+    }
+    if (h.missing.length === 0) {
+      if (h.recomputeDone) console.log(`${c.green}✓${c.reset} Stop pipeline: feedback counters recomputed from verified references`);
+      else console.log(`${c.yellow}!${c.reset} Stop pipeline: counter recompute pending — 'clawmem watch' runs it once at start (or run 'clawmem repair counters --apply')`);
+      const queues: [string, import("./stop-health.ts").QueueHealth][] = [
+        ["quarantined ranges", h.stopRetries], ["pending feedback turns", h.feedbackPending],
+        ["deferred judge verdicts", h.judgeDeferred], ["handoff renders", h.handoffRenders],
+      ];
+      const stale = queues.filter(([, q]) => isStale(q));
+      const depths = queues.map(([n, q]) => `${n} ${q.count}`).join(", ");
+      if (stale.length > 0) {
+        console.log(`${c.yellow}!${c.reset} Stop pipeline queues: ${depths} — ${stale.map(([n, q]) => `${n} oldest ${q.oldest!.slice(0, 16)}`).join("; ")} (older than 24 h: is 'clawmem watch' running? Drain by hand: clawmem repair stop-queue --run)`);
+      } else {
+        console.log(`${c.green}✓${c.reset} Stop pipeline queues: ${depths}`);
+      }
+      if (h.unavailableRanges > 0) console.log(`${c.dim}   ${h.unavailableRanges} quarantined range(s) unavailable (their bytes changed) — dismiss with: clawmem repair stop-queue --dismiss <id>${c.reset}`);
+      if (h.feedbackProvisional.count > 0) console.log(`${c.dim}   ${h.feedbackProvisional.count} feedback verdict(s) provisional — credited on a quiet transcript, final at the turn's end (a later turn, a Stop, the session's end); oldest ${h.feedbackProvisional.oldest!.slice(0, 16)}${c.reset}`);
+      if (h.keylessPending > 0) console.log(`${c.dim}   ${h.keylessPending} feedback turn(s) wait for their OpenClaw transcript to be bound${c.reset}`);
+      if (h.causalWaitingOff > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${h.causalWaitingOff} causal step(s) wait while CLAWMEM_CAUSAL_WRITER=off (they run when it is shadow/on; dismiss with: clawmem repair stop-queue --dismiss-causal)`);
+      else if (h.causalRunnable > 0) console.log(`${c.dim}   ${h.causalRunnable} causal step(s) owed — the watcher runs them${c.reset}`);
+      if (h.causalStuck > 0) console.log(`${c.yellow}!${c.reset} Stop pipeline: ${h.causalStuck} causal run(s) still in progress after 1 h (a crash inside the step — at-most-once, not re-run)`);
+      if (h.recoveredBodies > 0) console.log(`${c.dim}   ${h.recoveredBodies} overwritten antipattern bodies preserved — review with: clawmem recover antipatterns${c.reset}`);
+      if (h.graceByWeek.some(n => n > 0)) console.log(`${c.dim}   archive grace expiries per coming week: ${h.graceByWeek.join(", ")}${c.reset}`);
+    }
+  } catch (err) {
+    console.log(`${c.red}✗${c.reset} Stop pipeline: could not check (${err instanceof Error ? err.message : String(err)})`);
     issues++;
   }
 
@@ -3842,6 +3958,12 @@ async function cmdDoctor() {
         const pcMatchers = postcompactMatcherIssues(settings);
         if (pcMatchers.length > 0) {
           console.log(`${c.yellow}!${c.reset} Claude Code hooks: postcompact-inject is installed under SessionStart matcher ${pcMatchers.map(m => `"${m}"`).join(", ")}, so it starts on every session start (it acts only on compactions). Fix: re-run 'clawmem setup hooks' (installs it under matcher "compact")`);
+        }
+        // 62.1 D5: the handoff's SessionEnd flush renders the turns after the last summary when a session ends.
+        const sessionEndFlush = ((settings.hooks?.SessionEnd ?? []) as { hooks?: { command?: unknown }[] }[])
+          .some(g => g.hooks?.some(h => clawmemHookName(h.command) === "handoff-generator"));
+        if (!sessionEndFlush) {
+          console.log(`${c.yellow}!${c.reset} Claude Code hooks: the SessionEnd handoff flush is not installed, so a session's last turns reach its handoff only through the watcher. Fix: re-run 'clawmem setup hooks'`);
         }
       } else {
         console.log(`${c.yellow}!${c.reset} Claude Code hooks: not installed (run 'clawmem setup hooks')`);
@@ -4680,6 +4802,12 @@ async function main() {
         break;
       case "causal-audit":
         await cmdCausalAudit(subArgs);
+        break;
+      case "repair":
+        await cmdRepair(subArgs);
+        break;
+      case "recover":
+        await cmdRecover(subArgs);
         break;
       case "help":
       case "--help":
@@ -5562,6 +5690,129 @@ async function cmdCurate(_args: string[]) {
   }
 }
 
+// =============================================================================
+// 62.1 stop pipeline: repair counters, repair stop-queue, recover antipatterns
+// =============================================================================
+
+/** The general vault and every configured named vault, as stores (a vault that cannot open is reported, skipped). */
+async function stopPipelineVaults(): Promise<{ name: string; store: StoreType; general: boolean }[]> {
+  const { resolveStore } = await import("./store.ts");
+  const { listVaults } = await import("./config.ts");
+  const out: { name: string; store: StoreType; general: boolean }[] = [{ name: "general", store: getStore(), general: true }];
+  for (const name of listVaults()) {
+    try { out.push({ name, store: resolveStore(name), general: false }); }
+    catch (err) { console.log(`${c.yellow}!${c.reset} vault ${name}: cannot open (${err instanceof Error ? err.message : String(err)}) — skipped`); }
+  }
+  return out;
+}
+
+async function cmdRepair(args: string[]) {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub === "counters") {
+    const { values } = parseArgs({
+      args: rest,
+      options: { apply: { type: "boolean" }, restore: { type: "string" }, "remove-fence": { type: "boolean" }, force: { type: "boolean" } },
+      allowPositionals: false,
+    });
+    const { recomputeCounters, restoreCounterRepair, removeStopFence } = await import("./stop-repair.ts");
+    const { preserveAntipatternBodies } = await import("./stop-recover.ts");
+    const { loadVaultConfig } = await import("./config.ts");
+    const policy = loadVaultConfig().lifecycle;
+    for (const v of await stopPipelineVaults()) {
+      const db = v.store.db;
+      if (values["remove-fence"]) {
+        const n = removeStopFence(db);
+        console.log(`${v.name}: dropped ${n} fence trigger(s). An upgraded ClawMem reinstalls them at its next writable open — run this only after every v0.41+ process sharing the vault has stopped.`);
+        continue;
+      }
+      if (values.restore) {
+        try {
+          const r = restoreCounterRepair(db, values.restore);
+          console.log(`${v.name}: restored ${r.restored} value(s) of op ${r.opId}; ${r.conflicts.length} conflict(s)`);
+          for (const cfl of r.conflicts.slice(0, 50)) console.log(`  ${c.yellow}conflict${c.reset} ${cfl}`);
+        } catch (err) {
+          console.log(`${v.name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        continue;
+      }
+      if (values.apply && v.general) {
+        const copied = await preserveAntipatternBodies(db);
+        if (copied > 0) console.log(`${v.name}: preserved ${copied} overwritten antipattern bodies (see 'clawmem recover antipatterns')`);
+      }
+      try {
+        const r = await recomputeCounters(db, { apply: values.apply === true, policy, force: values.force === true });
+        if (values.apply && r.alreadyDone && !values.force) { console.log(`${v.name}: already recomputed (--force to run again)`); continue; }
+        const verb = values.apply ? "recomputed" : "would recompute";
+        console.log(`${v.name}: ${verb} — frozen ${r.frozen} pre-upgrade usage row(s); documents ${r.documents} (grace ${r.graced}); utility signals ${r.utility}; co-activations ${r.coActivationsDeleted} removed / ${r.coActivationsInserted} verified; usage relations ${r.relationsDeleted} removed / ${r.relationsInserted} verified${r.opId ? ` [op ${r.opId}]` : ""}`);
+      } catch (err) {
+        console.log(`${c.red}✗${c.reset} ${v.name}: ${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+      }
+    }
+    if (!values.apply && !values.restore && !values["remove-fence"]) console.log(`${c.dim}Dry run. Re-run with --apply to write (before-images go to counter_repair_log; --restore <op> reverses).${c.reset}`);
+    return;
+  }
+  if (sub === "stop-queue") {
+    const { values } = parseArgs({
+      args: rest,
+      options: { run: { type: "boolean" }, dismiss: { type: "string" }, "dismiss-causal": { type: "boolean" } },
+      allowPositionals: false,
+    });
+    const s = getStore();
+    const { dismissStopRetry, dismissCausalMarkers, causalDismissRefusal, runStopWorkerTick } = await import("./stop-worker.ts");
+    if (values.dismiss) {
+      console.log(dismissStopRetry(s, Number(values.dismiss)) ? `dismissed quarantined range ${values.dismiss}` : `no open quarantined range ${values.dismiss}`);
+      return;
+    }
+    if (values["dismiss-causal"]) {
+      const refusal = causalDismissRefusal(s);
+      const n = refusal === null ? dismissCausalMarkers(s) : null;
+      if (n === null) {
+        console.log(`${c.yellow}!${c.reset} refused: ${refusal ?? "a causal consumer is active"}. --dismiss-causal is for steps waiting while every consumer keeps the writer off: set CLAWMEM_CAUSAL_WRITER=off for the watcher and the hooks, wait an hour without causal activity, then run it again. (It cannot see a consumer that is idle — switching them all off is on you.)`);
+        process.exitCode = 1;
+      } else {
+        console.log(`dismissed ${n} causal marker(s) — those ranges' causal step will not run`);
+      }
+      return;
+    }
+    if (values.run) {
+      const vaults = (await stopPipelineVaults()).filter(v => !v.general).map(v => ({ name: v.name, store: v.store }));
+      for (let i = 0; i < 20; i++) {
+        const r = await runStopWorkerTick(s, vaults, getDefaultLlamaCpp(), { quietMs: 0 });
+        const moved = r.attributed + r.provisional + r.unattributable + r.mirrors + r.digested + r.rendered + r.replayed + r.rejudged + r.causal;
+        console.log(`pass ${i + 1}: attributed ${r.attributed} (+${r.provisional} provisional), unattributable ${r.unattributable}, mirrors ${r.mirrors}, digested ${r.digested}, rendered ${r.rendered}, replayed ${r.replayed}, rejudged ${r.rejudged}, causal ${r.causal}`);
+        for (const e of r.errors) console.log(`  ${c.yellow}!${c.reset} ${e}`);
+        if (moved === 0) break;
+      }
+    }
+    const { stopPipelineHealth } = await import("./stop-health.ts");
+    const h = stopPipelineHealth(s.db);
+    console.log(`quarantined ranges ${h.stopRetries.count} (unavailable ${h.unavailableRanges}) · feedback pending ${h.feedbackPending.count} (keyless ${h.keylessPending}), provisional ${h.feedbackProvisional.count} · judge deferred ${h.judgeDeferred.count} · handoff renders ${h.handoffRenders.count} · causal runnable ${h.causalRunnable}, waiting on mode off ${h.causalWaitingOff}`);
+    return;
+  }
+  die("Usage: clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]\n       clawmem repair stop-queue [--run] [--dismiss <id>] [--dismiss-causal]");
+}
+
+async function cmdRecover(args: string[]) {
+  if (args[0] !== "antipatterns") die("Usage: clawmem recover antipatterns [--apply] [--min-occurrences N]");
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: { apply: { type: "boolean" }, "min-occurrences": { type: "string" } },
+    allowPositionals: false,
+  });
+  const s = getStore();
+  const { preserveAntipatternBodies, listRecoveredAntipatterns, applyRecoveredAntipatterns } = await import("./stop-recover.ts");
+  await preserveAntipatternBodies(s.db);
+  const min = values["min-occurrences"] ? Number(values["min-occurrences"]) : 1;
+  const list = listRecoveredAntipatterns(s.db);
+  console.log(`${list.length} distinct antipattern assertion(s) in overwritten bodies (${list.filter(a => a.occurrences >= min).length} with ≥ ${min} occurrence(s))`);
+  for (const a of list.slice(0, 50)) console.log(`  ${String(a.occurrences).padStart(4)}×  ${a.firstSeen.slice(0, 10)} … ${a.lastSeen.slice(0, 10)}  ${a.text}`);
+  if (!values.apply) { console.log(`${c.dim}Dry run. --apply writes the accepted set as _clawmem/antipatterns/recovered-<YYYY-MM>.md.${c.reset}`); return; }
+  const w = applyRecoveredAntipatterns(s.db, { minOccurrences: min });
+  console.log(`${w.action} _clawmem/${w.path} (${w.assertions} assertion(s))`);
+}
+
 function printHelp() {
   console.log(`
 ${c.bold}ClawMem${c.reset} - Hybrid Agent Memory
@@ -5616,6 +5867,14 @@ ${c.bold}Lifecycle:${c.reset}
   clawmem lifecycle restore --query Q  Restore archived docs by keyword
   clawmem lifecycle restore --collection N  Restore by collection
   clawmem lifecycle restore --all      Restore all archived docs
+
+${c.bold}Stop pipeline:${c.reset}
+  clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]
+                                       Recompute feedback counters from verified references (dry run without --apply)
+  clawmem repair stop-queue [--run] [--dismiss <id>] [--dismiss-causal]
+                                       Show, drain (--run) or dismiss the stop pipeline's queues
+  clawmem recover antipatterns [--apply] [--min-occurrences N]
+                                       List (or write) the antipatterns earlier versions overwrote
 
 ${c.bold}Intelligence:${c.reset}
   clawmem reflect [days]               Cross-session pattern analysis

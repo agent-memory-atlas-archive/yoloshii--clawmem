@@ -616,16 +616,15 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     expect(sightings[0]!.reasoning).toBe("the adoption caused the migration work");
   });
 
-  test("an INVALID transcript path still records the causal invocation in shadow (D5 cardinality includes early returns)", async () => {
+  test("62.1 D3: the causal step runs once per COMMITTED range — an invalid transcript path commits nothing, so no run", async () => {
+    // (s342 D5 recorded one invocation per Stop, early returns included; 62.1 D3's scope ruling replaced that with at
+    // most one run per range Phase B committed.)
     process.env.CLAWMEM_CAUSAL_WRITER = "shadow";
     await decisionExtractor(store, {
       sessionId: "boundary-test-session",
       transcriptPath: "/nonexistent/not-a-transcript.jsonl",
     } as any);
-    const runs = runRows();
-    expect(runs).toHaveLength(1);
-    expect(runs[0]!.outcome).toBe("no_candidates");
-    expect(runs[0]!.mode).toBe("shadow");
+    expect(runRows()).toHaveLength(0);
   });
 
   test("an exhausted budget SKIPS observation extraction outright — no model call with a degenerate timeout", async () => {
@@ -644,14 +643,13 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     await drive();
 
     expect(extractionCalls).toBe(0);
-    // The causal invocation record still exists (no observations → no_candidates)
-    // AND carries the durable audit of the skipped extraction phase.
-    const runs = runRows();
-    expect(runs).toHaveLength(1);
-    expect(runs[0]!.outcome).toBe("no_candidates");
-    const skipEvents = eventRows("phase_skipped_budget");
-    expect(skipEvents).toHaveLength(1);
-    expect(skipEvents[0]!.detail).toContain("observation extraction skipped");
+    // 62.1 D3: a range that could not be extracted is QUARANTINED for a later retry (never committed as empty), so
+    // no causal run starts for it; the reason is durable on the queued range.
+    expect(runRows()).toHaveLength(0);
+    const queued = store.db.prepare(`SELECT state, last_error FROM stop_retries`).all() as { state: string; last_error: string }[];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]!.state).toBe("queued");
+    expect(queued[0]!.last_error).toContain("budget");
   });
 
   test("a near-exhausted Stop budget skips the causal step, the contradiction judge, AND candidate retrieval", async () => {
@@ -716,28 +714,5 @@ describe("decisionExtractor boundary (off / shadow / on)", () => {
     expect(embedTexts.filter(t => t === candidateSignature)).toHaveLength(0);
     expect(embedTexts.length).toBeLessThanOrEqual(1);
   }, 20_000);
-
-  test("checkMergePolicy dedup embedding obeys its MONOTONIC deadline (O1): past it, no embed starts", async () => {
-    (store as any).ensureVecTable(4);
-    // Two recent decision docs so dedup_check has candidates to compare against.
-    mkDoc("decisions/recent-1.md", {});
-    mkDoc("decisions/recent-2.md", {});
-    store.db.prepare(`UPDATE documents SET content_type = 'decision' WHERE path LIKE 'decisions/recent-%'`).run();
-    let embedCalls = 0;
-    setDefaultLlamaCpp({
-      embed: async () => { embedCalls++; return { embedding: new Float32Array([1, 0, 0, 0]), model: DEFAULT_EMBED_MODEL }; },
-      rerank: async () => ({ results: [] }),
-      generate: async () => null,
-    } as any);
-    const { checkMergePolicy } = await import("../../src/hooks/decision-extractor.ts");
-
-    // Past deadline → degrade to a plain insert with ZERO embedding calls.
-    const past = await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", deadlineAfter(monoNow(), duration(0)));
-    expect(past.action).toBe("insert");
-    expect(embedCalls).toBe(0);
-
-    // In-budget → the dedup embedding runs (bounded by the same deadline).
-    await checkMergePolicy(store, "decision", "some new decision body", "_clawmem", deadlineAfter(monoNow(), duration(10_000)));
-    expect(embedCalls).toBe(1);
-  });
+  // (62.1 D4: checkMergePolicy — the session-document dedup whose embedding this bounded — was deleted.)
 });

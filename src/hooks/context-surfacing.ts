@@ -35,6 +35,8 @@ import { selectCandidatePool, dropUnarbitrated, candidateKey, finalOrderingKeys,
 import { assessRerankDegeneracy } from "../health/rerank-health.ts";
 import { vectorDaemonLikelyAvailable, searchVecDaemonRequired, type VecExecStatus, type VecResponseProtocol } from "../vector-daemon.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
+import { registerSurfacingTranscript, surfacingIdentity, type UsageIdentity } from "../stop-identity.ts";
+import type { ManifestItem } from "../stop-feedback.ts";
 import { parseEvalNowTimestamp } from "../eval/run-identity.ts";
 import { hashQuery } from "../recall-buffer.ts";
 import { setPendingSurfacingBookkeeping, type SurfacingBookkeepingVaultGroup } from "./surfacing-bookkeeping.ts";
@@ -56,6 +58,7 @@ import {
 import { PROFILES } from "../config.ts";
 import { monoNow, duration, evidenceMs, deadlineAfter, deadlineBefore, earliest, isExpired, remainingForTimeout, elapsed, allotted, overshoot, raceDeadline, spanStart, spanEvidence, type DurationMs, type MonoDeadline, type MonoInstant, type Span, toDate, epochNow, epochMs, epochBefore } from "../clock.ts";
 import { MAX_LEG_BUDGET_MS } from "../vector-protocol.ts";
+import { relWeightSql } from "../relation-weight.ts";
 
 // =============================================================================
 // Config
@@ -443,6 +446,15 @@ export async function contextSurfacing(
     return out;
   };
 
+  // 62.1 D1 (rev 9/11): the turn's identity, and the transcript locator registered at entry — before every gate,
+  // whether or not this turn writes a row (fail-open; a registered transcript costs no write lock). The hash is of
+  // the prompt as received, before the trim above and the truncation below. On a vault whose stop-pipeline migration
+  // is not verified, identity is null: legacy rows, no locator.
+  const identity = surfacingIdentity(store.db, input);
+  if (identity) registerSurfacingTranscript(store.db, input.sessionId, input.transcriptPath, identity);
+  // register_only (OpenClaw's empty or short prompt, rev 11): the locator only — no gate, row, spool job or retrieval.
+  if (input.registerOnly) return makeEmptyOutput("context-surfacing");
+
   // Compute turn_index FIRST, before any early returns.
   // Every transcript-visible early return must log an empty context_usage row
   // to keep turn_index aligned with transcript turns for per-turn attribution.
@@ -465,7 +477,7 @@ export async function contextSurfacing(
   // take the length early-return. Empty prompts still return unconditionally.
   if (!prompt || (prompt.length < MIN_PROMPT_LENGTH && !hasForceRetrieveIntent(prompt))) {
     const reason: TraceEmptyReason = !prompt ? "gate:empty-prompt" : "gate:short-prompt";
-    logEmptyTurn(store, input);
+    logEmptyTurn(store, input, identity);
     return finish(makeEmptyOutput("context-surfacing"), "empty", reason);
   }
 
@@ -474,13 +486,13 @@ export async function contextSurfacing(
 
   // Skip slash commands — log empty turn for alignment
   if (prompt.startsWith("/")) {
-    logEmptyTurn(store, input);
+    logEmptyTurn(store, input, identity);
     return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:slash-command");
   }
 
   // Adaptive retrieval gate: skip greetings, shell commands, affirmations, etc.
   if (shouldSkipRetrieval(prompt)) {
-    logEmptyTurn(store, input);
+    logEmptyTurn(store, input, identity);
     return finish(makeEmptyOutput("context-surfacing"), "empty", "gate:skip-retrieval");
   }
 
@@ -541,7 +553,7 @@ export async function contextSurfacing(
   // alignment holds by construction: no injection without its row.
   let alignmentUsageId = -1;
   if (input.sessionId) {
-    alignmentUsageId = logInjection(store, input.sessionId, "context-surfacing", [], 0, (input as any)._turnIndex ?? 0, prompt);
+    alignmentUsageId = logInjection(store, input.sessionId, "context-surfacing", [], 0, (input as any)._turnIndex ?? 0, prompt, identity);
     if (alignmentUsageId <= 0) {
       return finish(makeEmptyOutput("context-surfacing"), "empty", "alignment-unavailable");
     }
@@ -1072,6 +1084,9 @@ export async function contextSurfacing(
     const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill", skillStoreOpts); } catch { return store; } })() : store;
     const doc = targetStore.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
+    // 62.1 D6 (T23 #2): the injection manifest pins the document by its id in its own vault, resolved here — before
+    // payload assembly, so the hook adds no SQLite work after it.
+    (r as any)._docId = doc.id;
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
     return true;
   });
@@ -1333,7 +1348,7 @@ export async function contextSurfacing(
   // in afterward using whatever budget remains and are the first thing
   // truncated when the payload would overflow.
   const factsBudget = Math.max(0, tokenBudget - INSTRUCTION_TOKEN_COST);
-  const { context, paths, tokens } = buildContext(scored, prompt, factsBudget, sessionTopic, trace);
+  const { context, paths, tokens, manifest, accepted } = buildContext(scored, prompt, factsBudget, sessionTopic, trace);
   finStamp("buildContext"); // output construction: body reads + tiered entry assembly
 
   if (!context) {
@@ -1425,6 +1440,8 @@ export async function contextSurfacing(
   if (nudge) parts.push(`<vault-nudge>${NUDGE_TEXT}</vault-nudge>`);
 
   const finalOut = makeContextOutput("context-surfacing", parts.join("\n"));
+  // 62.1 (T29): the Hermes plugin carries this row's id to the turn that receives the context (hooks.ts HookOutput).
+  if (identity?.host === "hermes" && alignmentUsageId > 0) finalOut.clawmemUsageId = alignmentUsageId;
   finStamp("facts"); // <relationships> (fetchRelationSnippets) + <vault-facts> KG reads
   finStamp("payload"); // TRUE post-output boundary: the final payload is fully assembled
   if (trace) {
@@ -1448,8 +1465,9 @@ export async function contextSurfacing(
   } else if (input.sessionId) {
     try {
       const turnIndex = (input as any)._turnIndex ?? 0;
-      const injectedSet = new Set(paths);
-      const injectedScored = scored.filter(r => injectedSet.has(r.displayPath));
+      // 62.1 D6 (rev 18): exactly the results the renderer accepted — never re-selected by display path, which would
+      // add a second vault's document at the same path that the budget left out.
+      const injectedScored = accepted;
 
       // Group by vault origin (null = general vault). Recall events cover
       // ONLY docs that made it into the injected context (post-budget) —
@@ -1474,6 +1492,15 @@ export async function contextSurfacing(
         injectedPaths: [...paths],
         estimatedTokens: tokens,
         vaults,
+        // 62.1 D6: the manifest the drainer records (only with a verified identity: legacy rows are never attributed).
+        ...(identity ? { manifest } : {}),
+        // 62.1 D1: the turn's identity, copied onto the named-vault mirror rows.
+        ...(identity ? {
+          promptSha: identity.promptSha ?? undefined,
+          transcriptKey: identity.transcriptKey ?? undefined,
+          host: identity.host,
+          sessionKey: identity.sessionKey ?? undefined,
+        } : {}),
       });
     } catch {
       // Non-critical — never block context surfacing on bookkeeping packaging
@@ -1528,11 +1555,11 @@ function recordCandidateLanes(
  * handler body (codex F59-2), so post-retrieval empty returns no longer
  * call this helper.
  */
-function logEmptyTurn(store: Store, input: HookInput): void {
+function logEmptyTurn(store: Store, input: HookInput, identity: UsageIdentity | null): void {
   if (!input.sessionId) return;
   try {
     const turnIndex = (input as any)._turnIndex ?? 0;
-    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex);
+    logInjection(store, input.sessionId, "context-surfacing", [], 0, turnIndex, undefined, identity);
   } catch { /* non-fatal */ }
 }
 
@@ -1562,15 +1589,19 @@ function detectRoutingHint(prompt: string): string | null {
   return null;
 }
 
-function buildContext(
+export function buildContext(
   scored: ScoredResult[],
   query: string,
   budget: number = DEFAULT_TOKEN_BUDGET,
   intent?: string,
   trace?: SurfacingTrace
-): { context: string; paths: string[]; tokens: number } {
+): { context: string; paths: string[]; tokens: number; manifest: ManifestItem[]; accepted: ScoredResult[] } {
   const lines: string[] = [];
   const paths: string[] = [];
+  // 62.1 D6 (rev 18): the injection manifest — exactly the results accepted into the context, each with its vault
+  // and the title as rendered. Never re-derived from `paths`: two vaults can hold the same display path.
+  const manifest: ManifestItem[] = [];
+  const accepted: ScoredResult[] = [];
   const traceEntries: { candidate: string; displayPath: string; tier: string; tokens: number }[] = [];
   let totalTokens = 0;
 
@@ -1618,6 +1649,12 @@ function buildContext(
 
     lines.push(entry);
     paths.push(r.displayPath);
+    const docId = (r as any)._docId;
+    manifest.push({
+      vault: ((r as any)._fromVault as string | undefined) ?? null, displayPath: r.displayPath, displayedTitle: safeTitle,
+      docId: typeof docId === "number" ? docId : null,
+    });
+    accepted.push(r);
     traceEntries.push({ candidate: candidateKey(r), displayPath: r.displayPath, tier: tier.tier, tokens: entryTokens });
     totalTokens += entryTokens;
   }
@@ -1628,6 +1665,8 @@ function buildContext(
     context: lines.join("\n\n---\n\n"),
     paths,
     tokens: totalTokens,
+    manifest,
+    accepted,
   };
 }
 
@@ -1697,7 +1736,7 @@ export function fetchRelationSnippets(
          WHERE mr.source_id IN (${placeholders})
            AND mr.target_id IN (${placeholders})
            AND mr.source_id != mr.target_id
-         ORDER BY mr.weight DESC, mr.created_at DESC
+         ORDER BY ${relWeightSql("mr")} DESC, mr.created_at DESC
          LIMIT ?`
       )
       .all(...surfacedDocIds, ...surfacedDocIds, limit) as Array<{

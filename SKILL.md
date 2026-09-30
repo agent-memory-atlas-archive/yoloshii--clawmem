@@ -29,9 +29,10 @@ Hooks handle ~90% of retrieval at zero agent effort.
 | `postcompact-inject` | SessionStart (compact) | re-injects THIS session's pre-compaction state + recent vault decisions, framed as reference data → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
 | `precompact-extract` | PreCompact | extracts the last typed request / decisions / file paths / open questions before compaction → the vault's session-keyed `compaction_state` row |
-| `decision-extractor` | Stop | LLM → observations + causal links + contradiction detection + SPO triples |
-| `handoff-generator` | Stop | LLM session summary → handoffs |
-| `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
+| `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples from the turns after its cursor, each turn once (v0.41.0) → the session's own decision/antipattern docs |
+| `handoff-generator` | Stop | per-turn digest (no model) + throttled incremental LLM summary → the session's handoff |
+| `handoff-generator` | SessionEnd | render-only flush of the handoff's latest turns (v0.41.0) |
+| `feedback-loop` | Stop | credits each surfaced note once per turn when that turn verifiably names it → access count, utility signal, same-turn co-activations |
 
 **Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
 
@@ -206,7 +207,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 **Effective time (v0.27.0):** `recencyScore` ages documents by `authored_at ?? modified_at` — mined/synthesized historical content ranks by when it was written, not when it was filed. Result metadata carries `authored_at` (null = unknown); temporal filters and recency-intent queries use the same axis.
 
 - `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× penalty … 1.3× boost).
-- `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs surfaced together get up to +15%).
+- `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs verifiably referenced in the same turn get up to +15%; v0.41.0 — injection records no co-activation).
 - Length normalization penalizes verbose entries (floor 30%); frequency boost capped at +10%.
 - **Pinned docs: +0.3 additive on composite surfaces** (capped at 1.0); on the raw routes (vector + `search` non-recency) pin = exact-tie precedence only.
 - **`query` tool (v0.13.0+):** non-recency queries use retrieval-tuned **0.70·search + 0.15·recency + 0.15·confidence**. `memory_retrieve`'s composite modes, `context-surfacing`, and `search`'s recency branch keep the 0.50/0.25/0.25 default. (`vsearch` + `memory_retrieve` semantic/discovery use RAW cosine, and `search` uses the RAW BM25 transform, for non-recency queries — v0.22.0/v0.24.0: no composite weights at all.)
@@ -241,6 +242,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - **A known document is absent from `search`/`vsearch`/`query` but `get` by path returns it** → it is invalidated (`documents.invalidated_at IS NULL` is a hard predicate on the FTS and both vector joins, with no query-time signal). On `documents` the only writer is contradiction invalidation, and only when armed — the `invalidated_at` in `consolidation.ts` is a different table. Diagnose + restore: [`docs/troubleshooting.md`](docs/troubleshooting.md#hooks).
 - **A file an editor or agent saved never re-indexes until `clawmem update`** → an atomic save (temp file renamed over the target) on Bun < 1.4.0, which reports it under the temp name. **Fixed in v0.40.2** (the watcher rescans a directory after any event); on older versions upgrade Bun to 1.4.0+ and restart the watcher. Detail: [`docs/troubleshooting.md`](docs/troubleshooting.md#indexing).
 - **Files in a directory made after the watcher started never re-index until `clawmem update`** → the watcher walked each collection path once, at start (a new Claude Code project's `memory/` is the common case). **Fixed in v0.40.3** (a rescan watches new directories, within `CLAWMEM_WATCH_MAX_DIRS`); on older versions restart the watcher after new directories appear. Detail: [`docs/troubleshooting.md`](docs/troubleshooting.md#indexing).
+- **Access counts or co-activations look reset after an upgrade to v0.41.0** → expected: the watcher's first start recomputed them from verified references (a turn that names a surfaced note, once per turn), so they start near zero and grow with real use. Through v0.40.3 every Stop counted the whole session again. `clawmem doctor` shows the stop pipeline's state; an ✗ for an older writer means some ClawMem process sharing the vault was not upgraded. Detail: [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 - **Anything setup-shaped** (download blocked, server unreachable, watcher memory bloat or its per-collection directory cap, indexer bugs) → [`docs/troubleshooting.md`](docs/troubleshooting.md). This skill does not duplicate it.
 
 ---

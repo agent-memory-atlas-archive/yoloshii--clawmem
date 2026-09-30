@@ -4,6 +4,218 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.0 — the Stop hooks process each turn once, and feedback counts only verified references
+
+Claude Code runs the Stop hooks after every response, and through v0.40.3 each run started over.
+`decision-extractor` re-read the last 200 transcript entries and ran the observer on all of them,
+`handoff-generator` summarised the same window again, and `feedback-loop` credited every note the
+session had surfaced that the assistant mentioned anywhere in that window. A turn was therefore
+extracted, summarised and counted once per later response:
+
+- `access_count` grew with every Stop, not with every reference (up to 13,213 on one document on
+  the host where this was measured), and co-activation counts and `usage` relations grew with it.
+  Relation weights were summed without a bound (the largest was 8,948), so one relation recorded
+  again at every Stop outweighed every other edge wherever relations are ranked by weight.
+- Recall events were matched to turns by position, so a skipped or deduplicated prompt moved every
+  later turn's attribution onto the wrong context.
+- The session's decision document was rewritten from the last window whenever its decisions
+  changed, so a turn's decisions left it once the turn left the window. A new decision document was
+  not written at all when a vector search found any `_clawmem` document at least 0.92 similar.
+- The antipattern writer replaced the body of the most recent antipattern document of the last 7
+  days, whichever session wrote it, so one session's list overwrote another's. On the measured host
+  that document had 4,253 revisions, and 1,912 of 1,923 earlier bodies were held by no document.
+- A failed summary replaced the session's handoff with a regex fallback.
+
+From v0.41.0 `decision-extractor` and `handoff-generator` keep a cursor per transcript and process
+only what they have not processed yet, and `feedback-loop` decides each surfaced turn once, so every
+turn is extracted, digested and credited once. Pre-upgrade history is not replayed: a transcript's
+first Stop starts at its current turn (a Hermes transcript begun after the upgrade, at its first
+line).
+
+### What changed
+
+- **decision-extractor** reads the complete turns after its cursor and sends them to the observer in
+  batches that fit its bounds. The two turns before a batch and this session's recorded observation
+  titles go with it as context, marked as already recorded. A batch goes to the model only when its
+  new section holds an assistant message of at least 40 characters or a tool call, which replaces
+  the "at least 4 messages" rule. A batch whose model call fails or times out is quarantined instead
+  of committed empty, and so is a Stop's first batch when too little budget is left to start it
+  (later batches wait for the next Stop). The cursor moves past a quarantined range, and later Stops
+  and the watcher retry it after 1 minute, 5 minutes, 30 minutes, 2 hours, then every 12 hours. A
+  quarantined range whose bytes changed in the meantime is marked unavailable and never guessed at.
+- **Per-session documents, rendered from items.** Decisions and antipatterns are stored as items
+  (`stop_items`), one row per item, deduplicated only when the same item comes again with identical
+  content. Each session's decision, antipattern and handoff documents are rendered from its own items
+  at a path fixed when the document is first written: `_clawmem/decisions/<date>-<sid8>.md`, and
+  the same under `antipatterns/` and `handoffs/`, where `<date>` is the first render's date. A second
+  transcript of the same session id gets `-<tk6>` after that, and so does a session whose path is
+  already held by a document this pipeline did not write (a pre-upgrade document stays as it is). The
+  merge policies (`dedup_check`, `merge_recent`, `update_existing`) are gone. A session document is
+  never merged with, skipped for, or overwritten by another session's, and the 30-minute hash window
+  of `saveMemory` no longer applies to it. A forgotten or archived session document is not
+  rewritten; its items stay, and a restore renders them again.
+- **The contradiction judge remembers the pairs it decided**, and a pair whose older document changed
+  after the call is re-judged against the current content (`judge_deferred`) rather than applied.
+- **The causal step** (`CLAWMEM_CAUSAL_WRITER=shadow|on`; the default is still `off`) runs at most
+  once per committed range, under a run key derived from that range. A range committed while the
+  writer is on waits in a queue when the writer is later turned off, and `clawmem doctor` counts it.
+- **handoff-generator** records a digest of every new turn at each Stop, without a model call: the
+  request (at most 200 characters), the last paragraph of the final answer (at most 300), and the
+  files its Edit, Write, MultiEdit and NotebookEdit calls touched. The summary step then runs when at
+  least 3 new digests wait, 30 minutes after the last summary, or when the session has none yet. It
+  is incremental: the previous summary, the new digests and the text of the latest turns that fit.
+  A failed summary changes nothing but its audit, and the digests wait for the next attempt. The
+  regex fallback is gone; without a model, the handoff shows the digests. As before, a transcript
+  gets a handoff once it holds four messages.
+- **SessionEnd flush.** `clawmem setup hooks` now also installs `handoff-generator` under
+  SessionEnd, timeout 2 s. At session end it renders the summary and the latest 20 digests past it
+  (a line counts any earlier ones) into the handoff document, and records that the session ended.
+  It reads no transcript and calls no model, and stops itself after 1 s. Claude Code allows
+  SessionEnd hooks 1.5 s. The OpenClaw plugin's `session_end` waits for the same flush (at most 5 s)
+  before it clears the session's state.
+- **feedback-loop credits each turn once, by verified reference.** When `context-surfacing` injects
+  context, the bookkeeping drainer records the turn's manifest: every document injected, from every
+  vault, with its title as rendered. Each document counts as surfaced once there. A turn is paired
+  with its surfacing row by the prompt's hash and the host's own ordering of events, never by
+  position; zero or several candidates leave the row unattributed. The reference test runs once per
+  turn over the whole manifest: a display path, a path of at least two segments, a file name as a
+  whole token (a generic one such as `SKILL.md` only with its parent directory), or a displayed title
+  of at least 12 characters and two words. Each must name exactly one entry of the manifest. A
+  verified reference then applies once: `access_count` + 1, `last_accessed_at`, the utility signal,
+  the recall event, and co-activation and `usage` relations between the documents that turn
+  referenced. Named vaults apply their own slice of that verdict.
+- **A verdict is final when the turn is over:** a later prompt, a Stop, the session's end, or, on
+  Claude Code, the summary entry Claude Code writes after each Stop (`stop_hook_summary` without a
+  hook label, or `turn_duration`). Where no later entry can change a turn's pairing (OpenClaw,
+  Hermes), the watcher credits a quiet transcript's trailing turn provisionally and makes the verdict
+  final at the next of those. Age alone never makes a verdict final.
+- **Counters recomputed once from verified references.** The first `clawmem watch` start on
+  v0.41.0 (or `clawmem repair counters --apply`) recomputes, for the general vault and every named
+  vault: `access_count` = verified references, `last_accessed_at` = the newest verified reference
+  (else `modified_at`), the utility signals, and the co-activation counts and `usage` relations,
+  whose historical rows are deleted and rebuilt from verified same-turn references (weight 1.0). Right
+  after the upgrade almost nothing is verified yet, so these start near zero. Usage rows written
+  before the upgrade are frozen (`pre-upgrade`) and never credited. Every value the recompute
+  changes or deletes is kept in `counter_repair_log`, and `clawmem repair counters --restore <op>`
+  puts it back while the value still equals what the recompute wrote.
+- **Archive grace.** A document whose old last access fell inside its archive window gets
+  `access_grace_until` = recompute time + 30 days + (document id mod 60) days, and the lifecycle
+  sweep does not treat it as unaccessed before that. The grace ends are spread over 60 days, so the
+  recompute does not make every such document archivable at once. `clawmem doctor` shows how many
+  grace periods end in each coming week.
+- **Injection no longer records co-activations**, for any hook: through v0.40.3, `session-bootstrap`
+  and `staleness-check` still recorded one for every pair of documents they injected.
+- **Relation weights are clamped to [0, 1]**, both when a relation is written and wherever a weight
+  is read: graph traversal, A-MEM evolution neighbours, deductive guardrails, and the surfacing
+  hook's relation snippets.
+- **The fence.** An older ClawMem that still runs against a migrated vault cannot write feedback
+  counters, co-activations, `usage` relations, utility signals, or documents under `_clawmem/`
+  `decisions/`, `antipatterns/`, `handoffs/` or `observations/`. Each such write is skipped and
+  counted in `legacy_writer_log`. Its surfacing hook's usage-row insert fails instead, so that hook
+  injects nothing. `clawmem doctor` fails while the last such write is less than 24 h old. Upgrade
+  every process that shares the vault.
+- **The watcher runs the stop pipeline.** `clawmem watch` runs a worker every 60 s that does the work
+  no later Stop will: feedback of transcripts that have been quiet for 10 minutes or have ended,
+  named-vault slices, handoff digests after a final Stop that never ran, handoff renders,
+  quarantined ranges, deferred judge pairs and queued causal steps. At its first start it preserves
+  the overwritten antipattern bodies, then runs the recompute. It runs even when no collection is
+  configured, where `clawmem watch` used to exit with an error. Without the watcher, each Stop
+  attributes its own transcript and retries at most one due range of its session, deferred judge
+  pairs wait, and `clawmem repair stop-queue --run` drains every queue by hand.
+- **New commands:** `clawmem repair counters [--apply] [--restore <op>] [--remove-fence] [--force]`
+  (a dry run without `--apply`), `clawmem repair stop-queue [--run] [--dismiss <id>]
+  [--dismiss-causal]`, and `clawmem recover antipatterns [--apply] [--min-occurrences N]`, which lists
+  the distinct `- **Avoid:**` lines of the overwritten bodies with counts and dates, and with
+  `--apply` writes them to `_clawmem/antipatterns/recovered-<YYYY-MM>.md`.
+- **`clawmem doctor`** gains a stop-pipeline section: the migration and fence, an older writer
+  caught by the fence, the recompute, queue depths (warning past 24 h), provisional verdicts, causal
+  steps waiting while the writer is off, preserved antipattern bodies and the grace projection. It
+  also warns when the SessionEnd flush is not installed. `clawmem status` gains one line.
+- **Hermes.** The plugin now runs the three Stop hooks after every synced turn, one pass at a time
+  in the background, and at session end runs that transcript's final pass, the SessionEnd flush and
+  a last feedback run. Under v0.41.0's cursors the old plugin, which ran them at session end only,
+  would keep a session's last turn and write no handoff; a Hermes transcript begun after the upgrade
+  is read from its first line, so a late first pass loses nothing. Hermes prefetches context after a
+  turn for a later prompt (or none: trivial prompts skip it, late results are dropped), so
+  `context-surfacing` now hands the plugin its usage row's id, and the plugin records what became of
+  each row: it writes the id on the user line of the turn it handed the context to, or records the row
+  dropped or unresolved. A transcript write that fails is kept and written later, from its next byte;
+  a record is lost only in the cases the Hermes guide lists, and a row whose record is lost is never
+  credited on it (complete lines already on disk are still read). A
+  process holds its transcript locked while it writes it, so a second process on the same session
+  writes a transcript of its own (`<session_id>.2.jsonl`). The feedback step reads each Hermes transcript once, every
+  pass resuming where the last stopped. The row is credited in that turn only, or closed `not-delivered` (`host: "hermes"`). New transcripts open with a small timestamped header, and lines
+  carry millisecond timestamps. **Copy the plugin again** when you upgrade — its contents, over the installed
+  one (`cp -r src/hermes/. <plugin dir>/`, see [upgrading](docs/guides/upgrading.md)).
+- **OpenClaw** passes the host, the session key and the resolved transcript path to the hooks it
+  runs, and registers a short or empty prompt's transcript without running retrieval, so the watcher
+  can reach every transcript OpenClaw resolved.
+- **Schema.** A writable open adds, in one transaction: the stop-pipeline tables (`feedback_ledger`,
+  `feedback_turns`, `stop_cursors`, `stop_retries`, `stop_items`, `session_docs`,
+  `session_transcripts`, `hermes_scan`, `hermes_marks`, `causal_due`, `judge_deferred`, `judge_pair_verdicts`, `legacy_writer_log`,
+  `counter_repair_log`, `recovered_antipattern_bodies`, and `utility_signals`, which only
+  `feedback-loop` used to create), the stamp and identity columns, and the fence. If that transaction
+  cannot commit, the store still opens, the Stop hooks skip their counter and cursor work, `clawmem
+  doctor` fails, and the next writable open tries again.
+- `CLAWMEM_STOP_BUDGET_MS` now bounds all three Stop hooks: the extractor's model phases, the
+  handoff's summary step and the feedback read.
+- Docs: `docs/guides/upgrading.md`, `docs/guides/setup-hooks.md`, `docs/guides/hermes-plugin.md`,
+  `docs/guides/openclaw-plugin.md`, `docs/guides/systemd-services.md`,
+  `docs/concepts/hooks-vs-mcp.md`, `docs/concepts/composite-scoring.md`,
+  `docs/concepts/architecture.md`, `docs/troubleshooting.md`, `docs/reference/cli.md`,
+  `docs/reference/configuration.md`, `docs/contributing.md`, `AGENTS.md`, `SKILL.md`, `README.md`.
+
+### Upgrading
+
+Stop every ClawMem process that shares the vault (the watcher, `clawmem serve`, MCP servers in open
+sessions, the OpenClaw and Hermes plugins), upgrade them all, re-run `clawmem setup hooks` for the
+SessionEnd flush, copy the Hermes plugin again if you use it, then start `clawmem watch`. Its first
+start preserves the overwritten antipattern bodies and recomputes the counters; on a large vault
+this takes minutes and writes one before-image per changed value (about 380,000 rows on the measured
+vault). Details, the restore path and the downgrade path: [upgrading](docs/guides/upgrading.md).
+
+### Verification
+
+Seventeen new test files, `tests/unit/stop-*.test.ts`: 252 tests. They drive the real hooks —
+`decision-extractor`, `handoff-generator`, `feedback-loop`, the bookkeeping drainer, the SessionEnd
+flush through the real `clawmem hook` process, the OpenClaw engine, `clawmem watch` on a vault with
+no collections, and the Hermes plugin under Python with a stub Hermes, a fake `clawmem` binary and
+real partial writes (a file-size limit) — over transcripts in each host's shape, with a fake
+observer, summarizer and judge. Each design test asserts a result v0.40.3 gets wrong; measured on
+v0.40.3 with the same fixtures: two Stops with no new turn made two observer calls and two
+summarizer calls; a turn credited at one Stop was credited again at the next (access, surfaced and
+referenced counts 1 → 2); turn 1's decision was gone from the session document after 120 turns; a
+failed summary replaced the handoff with the regex fallback; and two transcripts of one session id
+shared one handoff. Every fix a review turn asked for has a test that fails with the fix reverted,
+apart from one lock-ordering fix in the Hermes plugin, which rests on its ordering argument. The
+SessionEnd flush took 162–173 ms through the real hook process on an idle vault and 431 ms with the
+vault held by another writer. Full suite: 3340 pass / 0 fail; `tsc` reports the same 85 errors as
+v0.40.3. Cross-model adversarial review (codex / GPT-6, one pinned session): the design took 22
+turns and 83 findings before any code, two of them settled by maintainer rulings; the implementation
+took five more turns and 22 findings (10 High); the docs, and the Hermes and doctor defects found
+while writing them, took 10 more turns and 51 findings. It cleared at turn 37 with zero remaining
+findings.
+
+### What didn't change
+
+- The observer, judge and causal-writer prompts and models; `CLAWMEM_CAUSAL_WRITER` still defaults
+  to `off`, and contradiction analysis still needs a configured judge.
+- What `context-surfacing` retrieves and injects. Its usage rows gain the prompt hash, transcript key,
+  host and session key.
+- The composite formula. Its access and co-activation inputs are recomputed as above, so rankings
+  that leaned on inflated counts move once.
+- Paraphrases are not recognised as duplicates: the same decision stated in other words is a second
+  item, as before.
+- Transcripts are read as append-only. A transcript that is replaced, truncated or rewritten starts a
+  new generation at its current turn; a branch made with `/rewind` is read as the file's lines stand.
+- Pre-upgrade turns are not re-extracted, and the stop pipeline reaches an OpenClaw transcript only
+  once some invocation of its session has resolved the file.
+- **Downgrading** needs `clawmem repair counters --remove-fence` first, or the older version's
+  Stop-hook writes are ignored and its surfacing hook injects nothing. Any v0.41 writable open
+  installs the fence again.
+
+---
+
 ## v0.40.3 — the watcher watches directories made after it starts
 
 `clawmem watch` walked each collection path once, when it started, and watched the directories it

@@ -9,7 +9,7 @@
 import type { TranscriptMessage } from "./hooks.ts";
 import type { DurationMs } from "./clock.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
-import { withRetryAndFeedback } from "./llm-retry.ts";
+import { withRetryAndFeedback, type RetryLlm } from "./llm-retry.ts";
 import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 
 // =============================================================================
@@ -393,26 +393,59 @@ function extractMultiple(xml: string, tag: string, parentTag?: string): string[]
 // Core Extraction Functions
 // =============================================================================
 
-export async function extractObservations(
+/** The observer's outcome for one batch (62.1 D3): only `ok` and `empty` may commit a range's effects. */
+export type ObservationResult =
+  | { status: "ok"; observations: Observation[] }
+  | { status: "empty" }
+  | { status: "retryable"; reason: string };
+
+/** What the batch must not re-extract (62.1 D4): the turns just before it and this session's recorded titles. */
+export type ObservationContext = { priorMessages: TranscriptMessage[]; recordedTitles: string[] };
+
+/** A valid empty completion ("If no significant observations, output nothing"), passed through the retry helper. */
+const EMPTY_COMPLETION = "\u0000observer:empty-completion\u0000";
+/** A reply with no observation blocks and no markup, short enough to be a plain "nothing" rather than lost output. */
+const PLAIN_NOTHING_MAX_CHARS = 300;
+
+function renderContextSection(ctx: ObservationContext | undefined): string {
+  if (!ctx || (ctx.priorMessages.length === 0 && ctx.recordedTitles.length === 0)) return "";
+  const lines = ["--- CONTEXT (already recorded — do not extract) ---"];
+  if (ctx.priorMessages.length > 0) lines.push(prepareTranscript(ctx.priorMessages));
+  if (ctx.recordedTitles.length > 0) lines.push("Already recorded observations:", ...ctx.recordedTitles.map(t => `- ${t}`));
+  lines.push("--- END CONTEXT ---", "");
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Extract observations from one batch, reporting WHY it has none (62.1 D3): `empty` is a valid model answer with
+ * nothing to record; `retryable` is a failure (model unavailable, timeout, output that never parses) that must not
+ * commit the batch. Admission (enough assistant content) is the caller's; there is no minimum message count here.
+ */
+export async function extractObservationsResult(
   messages: TranscriptMessage[],
-  /** s342 D2: the Stop handler threads its remaining whole-handler budget here
-   *  so extraction cannot outlive `CLAWMEM_STOP_BUDGET_MS`. Omitted → the
-   *  retry helper's default wall-clock cap applies (non-hook callers). */
-  opts?: { timeoutMs?: DurationMs }
-): Promise<Observation[]> {
-  if (messages.length < 4) return [];
-
+  opts?: { timeoutMs?: DurationMs; context?: ObservationContext },
+): Promise<ObservationResult> {
   const transcript = prepareTranscript(messages);
-  const prompt = `${OBSERVATION_SYSTEM_PROMPT}\n\n--- TRANSCRIPT ---\n${transcript}\n--- END TRANSCRIPT ---\n\nExtract observations:`;
+  const prompt = `${OBSERVATION_SYSTEM_PROMPT}\n\n${renderContextSection(opts?.context)}--- TRANSCRIPT ---\n${transcript}\n--- END TRANSCRIPT ---\n\nExtract observations:`;
 
+  const inner = getDefaultLlamaCpp();
+  let unavailable = false;
+  const llm: RetryLlm = {
+    async generate(p, o) {
+      const r = await inner.generate(p, o);
+      if (r === null) { unavailable = true; return null; }
+      return r.text.trim() === "" ? { ...r, text: EMPTY_COMPLETION } : r;
+    },
+  };
   const parsed = await withRetryAndFeedback<Observation[]>({
     initialPrompt: prompt,
-    llm: getDefaultLlamaCpp(),
+    llm,
     maxTokens: GENERATION_MAX_TOKENS,
     temperature: GENERATION_TEMPERATURE,
     timeoutMs: opts?.timeoutMs,
     label: "observer.extractObservations",
     parse: (text) => {
+      if (text === EMPTY_COMPLETION) return { ok: true, value: [] };
       // Parse all <observation>...</observation> blocks
       const observations: Observation[] = [];
       let blocks = 0;
@@ -423,20 +456,122 @@ export async function extractObservations(
         const obs = parseObservationXml(match[1]!);
         if (obs) observations.push(obs);
       }
-      if (observations.length === 0) {
-        return {
-          ok: false,
-          error:
-            blocks === 0
-              ? "No <observation>...</observation> blocks found in the response. Wrap each observation in <observation> tags."
-              : `Found ${blocks} <observation> block(s) but none contained the required fields. Each block needs valid <type>, <content>, and the documented child tags.`,
-        };
-      }
-      return { ok: true, value: observations };
+      if (observations.length > 0) return { ok: true, value: observations };
+      if (blocks === 0 && !/[<>]/.test(text) && text.trim().length <= PLAIN_NOTHING_MAX_CHARS) return { ok: true, value: [] };
+      return {
+        ok: false,
+        error:
+          blocks === 0
+            ? "No <observation>...</observation> blocks found in the response. Wrap each observation in <observation> tags."
+            : `Found ${blocks} <observation> block(s) but none contained the required fields. Each block needs valid <type>, <content>, and the documented child tags.`,
+      };
     },
   });
+  if (parsed === null) return { status: "retryable", reason: unavailable ? "model unavailable" : "no parseable response within the budget" };
+  return parsed.length === 0 ? { status: "empty" } : { status: "ok", observations: parsed };
+}
 
-  return parsed ?? [];
+/** The pre-62.1 form: observations, or [] for anything else (below 4 messages, empty, or failed). */
+export async function extractObservations(
+  messages: TranscriptMessage[],
+  /** s342 D2: the Stop handler threads its remaining whole-handler budget here
+   *  so extraction cannot outlive `CLAWMEM_STOP_BUDGET_MS`. Omitted → the
+   *  retry helper's default wall-clock cap applies (non-hook callers). */
+  opts?: { timeoutMs?: DurationMs }
+): Promise<Observation[]> {
+  if (messages.length < 4) return [];
+  const r = await extractObservationsResult(messages, opts);
+  return r.status === "ok" ? r.observations : [];
+}
+
+/**
+ * The characters `prepareTranscript` would render for these messages before its overall budget applies (62.1 D4
+ * batch packing): each message capped as the observer caps it, one line each.
+ */
+export function observerRenderChars(messages: TranscriptMessage[]): number {
+  let total = 0;
+  for (const m of classifyMessages(messages.slice(-MAX_TRANSCRIPT_MESSAGES))) {
+    const cap = m.priority <= P_FINAL_RESPONSE
+      ? (m.role === "user" ? MAX_USER_MSG_CHARS * 2 : MAX_ASSISTANT_MSG_CHARS * 2)
+      : m.priority === P_TOOL_ACTIVITY ? 500 : (m.role === "user" ? MAX_USER_MSG_CHARS : MAX_ASSISTANT_MSG_CHARS);
+    const content = m.content.length > cap ? m.content.slice(0, cap) + "..." : m.content;
+    total += `[${m.role}]: ${content}`.length + 1;
+  }
+  return total;
+}
+
+/** The observer's input bounds a batch must fit (62.1 D4). */
+export const OBSERVER_MAX_MESSAGES = MAX_TRANSCRIPT_MESSAGES;
+export const OBSERVER_MAX_RENDER_CHARS = MAX_TRANSCRIPT_TOKENS * 4;
+
+/** One turn as the summary step sees it (62.1 D5 digests). */
+export type TurnDigestText = { request: string; outcome: string; files: string[] };
+
+/** The summary's outcome for one batch (62.1 D5): `retryable` changes nothing but the audit. */
+export type SummaryResult = { status: "ok"; summary: SessionSummary } | { status: "retryable"; reason: string };
+
+/** A digest as one prompt line (also the unit the summary batches are packed by). */
+export function renderDigestLine(d: TurnDigestText, n: number): string {
+  return `${n}. Request: ${d.request || "(continued turn)"} | Outcome: ${d.outcome || "(none)"}${d.files.length > 0 ? ` | Files: ${d.files.join(", ")}` : ""}`;
+}
+
+/** A summary as prompt text (the previous summary an incremental call carries). */
+export function renderSummaryText(s: SessionSummary): string {
+  return [
+    `Request: ${s.request}`, `Investigated: ${s.investigated}`, `Learned: ${s.learned}`,
+    `Completed: ${s.completed}`, `Next steps: ${s.nextSteps}`,
+  ].join("\n");
+}
+
+const INCREMENTAL_SUMMARY_NOTE = `You are given the summary of the session so far (when there is one), the turns since it (oldest first), and the text of the latest of those turns. Output the updated summary of the WHOLE session so far, in the same format.`;
+
+function parseSummaryResponse(text: string): { ok: true; value: SessionSummary } | { ok: false; error: string } {
+  const summaryMatch = text.match(/<summary>([\s\S]*?)<\/summary>/);
+  if (!summaryMatch?.[1]) {
+    return { ok: false, error: "No <summary>...</summary> block found in the response. Wrap the summary in <summary> tags." };
+  }
+  const summary = parseSummaryXml(summaryMatch[1]);
+  if (!summary) return { ok: false, error: "A <summary> block was found but its child tags were missing or invalid." };
+  return { ok: true, value: summary };
+}
+
+/**
+ * 62.1 D5 (honcho's incremental summarizer, `summarizer.py:390-433`): the previous summary + the digests of the turns
+ * since it + the recent text → the updated summary. The opening request survives in `previous.request`.
+ */
+export async function extractSummaryIncremental(
+  previous: SessionSummary | null,
+  digests: readonly TurnDigestText[],
+  recentText: string,
+  opts?: { timeoutMs?: DurationMs },
+): Promise<SummaryResult> {
+  const parts = [SUMMARY_SYSTEM_PROMPT, "", INCREMENTAL_SUMMARY_NOTE, ""];
+  if (previous) parts.push("--- PREVIOUS SUMMARY ---", renderSummaryText(previous), "--- END PREVIOUS SUMMARY ---", "");
+  parts.push("--- NEW TURNS (oldest first) ---", ...digests.map((d, i) => renderDigestLine(d, i + 1)), "--- END NEW TURNS ---", "");
+  if (recentText) parts.push("--- RECENT TRANSCRIPT ---", recentText, "--- END RECENT TRANSCRIPT ---", "");
+  parts.push("Generate the updated summary:");
+
+  const inner = getDefaultLlamaCpp();
+  let unavailable = false;
+  const llm: RetryLlm = {
+    async generate(p, o) {
+      const r = await inner.generate(p, o);
+      if (r === null) unavailable = true;
+      return r;
+    },
+  };
+  const parsed = await withRetryAndFeedback<SessionSummary>({
+    initialPrompt: parts.join("\n"),
+    llm,
+    maxTokens: 500,
+    temperature: GENERATION_TEMPERATURE,
+    timeoutMs: opts?.timeoutMs,
+    label: "observer.extractSummaryIncremental",
+    parse: parseSummaryResponse,
+  });
+  if (parsed === null) return { status: "retryable", reason: unavailable ? "model unavailable" : "no parseable response within the budget" };
+  const keep = previous && previous.request !== "Unknown" && previous.request !== "None" ? previous.request : null;
+  return { status: "ok", summary: keep ? { ...parsed, request: keep } : parsed };
 }
 
 export async function extractSummary(
@@ -453,22 +588,6 @@ export async function extractSummary(
     maxTokens: 500,
     temperature: GENERATION_TEMPERATURE,
     label: "observer.extractSummary",
-    parse: (text) => {
-      const summaryMatch = text.match(/<summary>([\s\S]*?)<\/summary>/);
-      if (!summaryMatch?.[1]) {
-        return {
-          ok: false,
-          error: "No <summary>...</summary> block found in the response. Wrap the summary in <summary> tags.",
-        };
-      }
-      const summary = parseSummaryXml(summaryMatch[1]);
-      if (!summary) {
-        return {
-          ok: false,
-          error: "A <summary> block was found but its child tags were missing or invalid.",
-        };
-      }
-      return { ok: true, value: summary };
-    },
+    parse: parseSummaryResponse,
   });
 }

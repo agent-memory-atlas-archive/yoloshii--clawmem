@@ -1,255 +1,67 @@
 /**
- * Feedback Loop Hook - Stop
+ * Feedback Loop Hook - Stop (Claude Code) / agent_end (OpenClaw)
  *
- * Fires when a session ends. Detects which surfaced notes were actually
- * referenced by the assistant, and boosts their access counts.
- * This closes the learning loop: notes that prove useful rise in confidence,
- * unused notes gradually decay.
+ * Detects which surfaced notes the assistant actually referenced and credits them. 62.1 D6: each turn is credited
+ * ONCE — its injection manifest was recorded by the bookkeeping drainer, the turn is paired with its usage row by
+ * identity (D1, never by position), the reference test runs once over the whole manifest, and only the first
+ * verified reference of an entry moves counters (access_count, last_accessed_at, utility signals, same-turn
+ * co-activations and usage relations). Named vaults then apply their slice of the verdict.
  *
  * Silent — does not inject context back to Claude.
  */
 
 import type { Store } from "../store.ts";
-import { isoNow } from "../clock.ts";
 import { resolveStore } from "../store.ts";
 import { listVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
-import {
-  makeEmptyOutput,
-  readTranscript,
-  validateTranscriptPath,
-} from "../hooks.ts";
-import {
-  segmentTranscriptIntoTurns,
-  attributeRecallReferences,
-} from "../recall-attribution.ts";
+import { makeEmptyOutput } from "../hooks.ts";
+import { stopPipelineReady } from "../stop-schema.ts";
+import { applyMirrorSlices, attributeTranscript } from "../stop-feedback.ts";
+import { monoNow, deadlineAfter, duration } from "../clock.ts";
+import { resolveStopBudgetMs } from "../causal-writer.ts";
 
-// =============================================================================
-// Handler
-// =============================================================================
+export type FeedbackLoopOptions = {
+  /** The named vaults whose mirror rows take their slice of the verdict (default: every configured vault). */
+  vaults?: { name: string; store: Store }[];
+};
 
 export async function feedbackLoop(
   store: Store,
-  input: HookInput
+  input: HookInput,
+  opts?: FeedbackLoopOptions,
 ): Promise<HookOutput> {
-  const transcriptPath = validateTranscriptPath(input.transcriptPath);
   const sessionId = input.sessionId;
-  if (!transcriptPath || !sessionId) return makeEmptyOutput("feedback-loop");
+  // D10: on a vault whose stop-pipeline migration is not verified, counter work is skipped (fail closed).
+  if (!sessionId || !input.transcriptPath || !stopPipelineReady(store.db)) return makeEmptyOutput("feedback-loop");
 
-  // Get all notes injected during this session
-  const usages = store.getUsageForSession(sessionId);
-  if (usages.length === 0) return makeEmptyOutput("feedback-loop");
+  try {
+    attributeTranscript(store, {
+      sessionId,
+      transcriptPath: input.transcriptPath,
+      host: input.host,
+      sessionKey: input.sessionKey,
+      atStop: true,
+      deadline: deadlineAfter(monoNow(), duration(resolveStopBudgetMs().budgetMs)),
+    });
+  } catch (err) {
+    process.stderr.write(`[feedback-loop] attribution failed: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
 
-  // Collect all injected paths
-  const injectedPaths = new Set<string>();
-  for (const u of usages) {
+  const vaults = opts?.vaults ?? configuredVaults();
+  for (const v of vaults) {
     try {
-      const paths = JSON.parse(u.injectedPaths) as string[];
-      for (const p of paths) injectedPaths.add(p);
-    } catch {
-      // Skip malformed
-    }
-  }
-
-  if (injectedPaths.size === 0) return makeEmptyOutput("feedback-loop");
-
-  // Read assistant messages from transcript
-  const assistantMessages = readTranscript(transcriptPath, 200, "assistant");
-  if (assistantMessages.length === 0) return makeEmptyOutput("feedback-loop");
-
-  // Build full assistant text for reference detection
-  const assistantText = assistantMessages.map(m => m.content).join("\n");
-
-  // Detect references: check if the assistant mentioned any injected path or title
-  const referencedPaths: string[] = [];
-
-  for (const path of injectedPaths) {
-    // Check for path reference
-    if (assistantText.includes(path)) {
-      referencedPaths.push(path);
-      continue;
-    }
-
-    // Check for filename reference
-    const filename = path.split("/").pop()?.replace(/\.(md|txt)$/i, "");
-    if (filename && filename.length > 3 && assistantText.toLowerCase().includes(filename.toLowerCase())) {
-      referencedPaths.push(path);
-      continue;
-    }
-
-    // Check for title reference (look up from DB)
-    const titleMatch = checkTitleReference(store, path, assistantText);
-    if (titleMatch) {
-      referencedPaths.push(path);
-    }
-  }
-
-  // Boost access counts for referenced notes
-  if (referencedPaths.length > 0) {
-    store.incrementAccessCount(referencedPaths);
-
-    // Mark usage records as referenced
-    for (const u of usages) {
-      try {
-        const paths = JSON.parse(u.injectedPaths) as string[];
-        if (paths.some(p => referencedPaths.includes(p))) {
-          store.markUsageReferenced(u.id);
-        }
-      } catch {
-        // Skip
-      }
-    }
-
-    // Record usage relations between co-referenced documents
-    if (referencedPaths.length >= 2) {
-      try {
-        const docIds = new Map<string, number>();
-        for (const path of referencedPaths) {
-          const parts = path.split("/");
-          if (parts.length < 2) continue;
-          const collection = parts[0]!;
-          const docPath = parts.slice(1).join("/");
-          const doc = store.findActiveDocument(collection, docPath);
-          if (doc) docIds.set(path, doc.id);
-        }
-        const ids = [...docIds.values()];
-        for (let i = 0; i < ids.length; i++) {
-          for (let j = i + 1; j < ids.length; j++) {
-            store.insertRelation(ids[i]!, ids[j]!, "usage");
-          }
-        }
-      } catch {
-        // Non-critical — don't block feedback loop on relation errors
-      }
-    }
-
-    // Record co-activations for the referenced paths
-    if (referencedPaths.length >= 2) {
-      store.recordCoActivation(referencedPaths);
-    }
-  }
-
-  // Utility tracking: detect pin/snooze candidates based on usage patterns
-  try {
-    trackUtilitySignals(store, injectedPaths, referencedPaths);
-  } catch {
-    // Non-critical — don't block feedback loop on utility tracking errors
-  }
-
-  // Recall tracking: per-turn attribution using transcript segmentation.
-  // Reads full transcript, segments into turns, zips with context_usage rows,
-  // checks references per-turn rather than session-globally.
-  try {
-    const allMessages = readTranscript(transcriptPath, 500);
-    const turns = segmentTranscriptIntoTurns(allMessages);
-    const usages = store.getUsageForSession(sessionId);
-
-    // General vault attribution
-    attributeRecallReferences(store, sessionId, usages, turns);
-
-    // Cross-vault: attribute recall events in any configured named vaults.
-    // Each vault has its own context_usage rows (mirrored during context-surfacing).
-    const vaultNames = listVaults();
-    for (const vaultName of vaultNames) {
-      try {
-        const vaultStore = resolveStore(vaultName);
-        const vaultUsages = vaultStore.getUsageForSession(sessionId);
-        if (vaultUsages.length > 0) {
-          attributeRecallReferences(vaultStore, sessionId, vaultUsages, turns);
-        }
-      } catch { /* vault unavailable — skip */ }
-    }
-  } catch {
-    // Non-critical — don't block feedback loop on recall tracking errors
+      applyMirrorSlices(store, v.store, v.name, { sessionId });
+    } catch { /* vault unavailable — its mirrors stay pending for the next Stop or the worker */ }
   }
 
   // Silent return — feedback loop doesn't inject context
   return makeEmptyOutput("feedback-loop");
 }
 
-// =============================================================================
-// Utility Signal Tracking
-// =============================================================================
-
-/**
- * Track utility signals for lifecycle automation (ReMe-inspired u/f ratio).
- *
- * For each injected path, records whether it was referenced (useful) or not (noise).
- * Over time this builds a utility profile per document:
- * - High utility (referenced often) → pin candidate
- * - Low utility (surfaced often, never referenced) → snooze candidate
- *
- * Writes to `utility_signals` table (created lazily).
- */
-function trackUtilitySignals(
-  store: Store,
-  injectedPaths: Set<string>,
-  referencedPaths: string[]
-): void {
-  store.db.exec(`
-    CREATE TABLE IF NOT EXISTS utility_signals (
-      path TEXT NOT NULL,
-      surfaced_count INTEGER NOT NULL DEFAULT 0,
-      referenced_count INTEGER NOT NULL DEFAULT 0,
-      last_surfaced TEXT,
-      last_referenced TEXT,
-      PRIMARY KEY (path)
-    )
-  `);
-
-  const referencedSet = new Set(referencedPaths);
-  const now = isoNow();
-
-  const upsert = store.db.prepare(`
-    INSERT INTO utility_signals (path, surfaced_count, referenced_count, last_surfaced, last_referenced)
-    VALUES (?, 1, ?, ?, ?)
-    ON CONFLICT(path) DO UPDATE SET
-      surfaced_count = surfaced_count + 1,
-      referenced_count = referenced_count + ?,
-      last_surfaced = ?,
-      last_referenced = CASE WHEN ? > 0 THEN ? ELSE last_referenced END
-  `);
-
-  for (const path of injectedPaths) {
-    const wasReferenced = referencedSet.has(path) ? 1 : 0;
-    upsert.run(
-      path,
-      wasReferenced,
-      now,
-      wasReferenced > 0 ? now : null,
-      wasReferenced,
-      now,
-      wasReferenced,
-      now
-    );
+function configuredVaults(): { name: string; store: Store }[] {
+  const out: { name: string; store: Store }[] = [];
+  for (const name of listVaults()) {
+    try { out.push({ name, store: resolveStore(name) }); } catch { /* unavailable — skipped this Stop */ }
   }
-}
-
-// =============================================================================
-// Reference Detection
-// =============================================================================
-
-// Recall attribution logic is in src/recall-attribution.ts
-// (attributeRecallReferences, segmentTranscriptIntoTurns)
-
-// =============================================================================
-// Reference Detection
-// =============================================================================
-
-function checkTitleReference(store: Store, path: string, text: string): boolean {
-  try {
-    const parts = path.split("/");
-    if (parts.length < 2) return false;
-    const collection = parts[0]!;
-    const docPath = parts.slice(1).join("/");
-    const doc = store.findActiveDocument(collection, docPath);
-    if (!doc?.title) return false;
-
-    // Skip generic titles
-    if (doc.title.length < 5) return false;
-
-    return text.toLowerCase().includes(doc.title.toLowerCase());
-  } catch {
-    return false;
-  }
+  return out;
 }

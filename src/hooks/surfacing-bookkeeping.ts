@@ -50,6 +50,14 @@ import { dirname, join } from "node:path";
 import type { Store } from "../store.ts";
 import { resolveStore } from "../store.ts";
 import { writeRecallEvents } from "../recall-buffer.ts";
+import { stopPipelineReady } from "../stop-schema.ts";
+import {
+  markLegacyUsageRow,
+  reconcileReferencedEvents,
+  writeGeneralMembership,
+  writeMirrorMembership,
+  type ManifestItem,
+} from "../stop-feedback.ts";
 
 export type SurfacingBookkeepingVaultGroup = {
   /** null = the general store the hook ran against; string = named vault (resolveStore). */
@@ -74,6 +82,15 @@ export type SurfacingBookkeepingJob = {
   completedUnits?: string[];
   /** t62 (codex F61-1): outcome of the guarded alignment-row UPDATE, persisted by the drainer once the "update" unit completes. true = the row matched its session/turn identity, recall events may link to usageId; false = deterministic absence — events are written UNLINKED. Absent until the update unit has run. */
   usageLinked?: boolean;
+  /** 62.1 D1: the turn's identity (prompt hash, transcript key, host, session key), copied onto each mirror row. Absent on a job from a pre-upgrade hook, or from a vault whose migration was not verified. */
+  promptSha?: string;
+  transcriptKey?: string;
+  host?: string;
+  sessionKey?: string;
+  /** 62.1 D6 (rev 17/18): the turn's injection manifest — exactly the results the renderer accepted into the context,
+   * each with its vault (null = the general store), display path and the title as displayed. Absent on a job from a
+   * pre-upgrade or older hook: such a job applies today's units only and its row is never attributed (rev 20). */
+  manifest?: ManifestItem[];
 };
 
 /**
@@ -140,6 +157,22 @@ export function validateSurfacingBookkeepingJob(x: unknown): x is SurfacingBookk
     }
   }
   if (j.usageLinked !== undefined && typeof j.usageLinked !== "boolean") return false;
+  // 62.1 D1: optional identity strings, bounded like the other identifiers.
+  for (const k of ["promptSha", "transcriptKey", "host", "sessionKey"] as const) {
+    if (j[k] !== undefined && (!isNonEmptyString(j[k]) || (j[k] as string).length > 512)) return false;
+  }
+  // 62.1 D6: the manifest, bounded like the vault groups.
+  if (j.manifest !== undefined) {
+    if (!Array.isArray(j.manifest) || (j.manifest as unknown[]).length > 200) return false;
+    for (const m of j.manifest as unknown[]) {
+      if (typeof m !== "object" || m === null) return false;
+      const e = m as Record<string, unknown>;
+      if (e.vault !== null && (!isNonEmptyString(e.vault) || e.vault.length > 512)) return false;
+      if (!isNonEmptyString(e.displayPath) || e.displayPath.length > 1024) return false;
+      if (typeof e.displayedTitle !== "string" || e.displayedTitle.length > 2048) return false;
+      if (e.docId !== undefined && e.docId !== null && !(Number.isSafeInteger(e.docId) && (e.docId as number) > 0)) return false;
+    }
+  }
   // t63/t64 (codex F62-2 + F63-1): the checkpoint state relation —
   // usageLinked exists IFF the update unit has completed, AND every
   // completed EVENT unit implies the update unit completed first. The
@@ -237,12 +270,43 @@ export function applySurfacingBookkeeping(
   // the bare id. Persisted (ApplyResult → retained claim) so retries in a
   // later drainer still link per the real row state.
   let usageLinked: boolean | undefined = job.usageLinked;
+  // 62.1 D6: a job carrying a manifest, on a vault whose stop-pipeline migration is verified, applies its general
+  // membership in ONE transaction — the guarded fill-in, the manifest, the surfaced counts, the pending row and the
+  // general recall events — and completes the "update" and "general" units together. A job WITHOUT the manifest takes
+  // today's units; a linked row without a manifest is never attributed (rev 20). A manifest job on a vault whose
+  // migration is NOT verified on this connection fails its unit and is retained (T23 #5): the legacy path would
+  // consume it for good, and its membership, pending row and surfaced counts would never land.
+  const hasManifest = Array.isArray(job.manifest);
+  const withManifest = hasManifest && stopPipelineReady(store.db);
+  const generalUnit = unitKeyForVault(null);
+  const generalGroup = job.vaults.find(g => g.vault === null);
   run("update", () => {
-    usageLinked = job.usageId > 0 && store.updateUsageInjection(job.usageId, job.injectedPaths, job.estimatedTokens, {
-      sessionId: job.sessionId,
-      turnIndex: job.turnIndex,
-    });
+    if (hasManifest && !withManifest) throw new Error("stop-pipeline migration not verified on this connection — the manifest job waits");
+    if (!withManifest) {
+      usageLinked = job.usageId > 0 && store.updateUsageInjection(job.usageId, job.injectedPaths, job.estimatedTokens, {
+        sessionId: job.sessionId,
+        turnIndex: job.turnIndex,
+      });
+      return;
+    }
+    let linked = false;
+    store.db.transaction(() => {
+      linked = job.usageId > 0 && store.updateUsageInjection(job.usageId, job.injectedPaths, job.estimatedTokens, {
+        sessionId: job.sessionId,
+        turnIndex: job.turnIndex,
+      });
+      if (linked) writeGeneralMembership(store.db, job.usageId, job.manifest!);
+      if (generalGroup && !done.has(generalUnit)) {
+        writeRecallEvents(store, job.sessionId, job.queryHash, generalGroup.docs, linked ? job.usageId : undefined, job.turnIndex, { dedupeKeyBase: `${job.jobId}:${generalUnit}` });
+        if (linked) reconcileReferencedEvents(store.db, job.usageId);
+      }
+    }).immediate();
+    usageLinked = linked;   // assigned only after the commit
+    if (generalGroup) done.add(generalUnit);
   });
+  if (!withManifest && usageLinked === true && stopPipelineReady(store.db)) {
+    try { markLegacyUsageRow(store.db, job.usageId); } catch { /* retried with the job */ }
+  }
 
   // t63 (codex F62-1): event units DEPEND on a settled update outcome. A
   // THROWN update leaves usageLinked undefined — running events then would
@@ -266,23 +330,43 @@ export function applySurfacingBookkeeping(
       const vault = group.vault;
       run(unit, () => {
         const vaultStore = opts?.resolveVaultStore ? opts.resolveVaultStore(vault) : resolveStore(vault, { busyTimeout: opts?.vaultBusyTimeout ?? 5000 });
+        const vaultReady = stopPipelineReady(vaultStore.db);
+        if (hasManifest && !vaultReady) throw new Error(`vault ${vault}: stop-pipeline migration not verified — the manifest unit waits`);
+        const dedupeKey = `${job.jobId}:${unit}:mirror`;
         // Mirror context_usage row into the named vault for correct FK +
         // attribution. t62 (F61-4): the dedupe key makes this idempotent —
         // a reclaim after a crash-mid-unit gets the EXISTING mirror row's
         // id back instead of inserting a second one. (t63: keys carry the
         // TAGGED unit name so vault names can never collide with reserved
-        // units in the dedupe namespace either.)
-        const vaultUsageId = vaultStore.insertUsage({
-          dedupeKey: `${job.jobId}:${unit}:mirror`,
-          sessionId: job.sessionId,
-          timestamp: isoNow(),
-          hookName: "context-surfacing",
-          injectedPaths: group.docs.map(d => d.displayPath),
-          estimatedTokens: 0,
-          wasReferenced: 0,
-          turnIndex: job.turnIndex,
-        });
-        writeRecallEvents(vaultStore, job.sessionId, job.queryHash, group.docs, vaultUsageId > 0 ? vaultUsageId : undefined, job.turnIndex, { dedupeKeyBase: `${job.jobId}:${unit}` });
+        // units in the dedupe namespace either.) 62.1 D6: the mirror, its own
+        // membership and its recall events commit together in the vault.
+        vaultStore.db.transaction(() => {
+          const existed = !!vaultStore.db.prepare(`SELECT 1 FROM context_usage WHERE dedupe_key = ?`).get(dedupeKey);
+          const vaultUsageId = vaultStore.insertUsage({
+            dedupeKey,
+            sessionId: job.sessionId,
+            timestamp: isoNow(),
+            hookName: "context-surfacing",
+            injectedPaths: group.docs.map(d => d.displayPath),
+            estimatedTokens: 0,
+            wasReferenced: 0,
+            turnIndex: job.turnIndex,
+            promptSha: job.promptSha ?? null,
+            transcriptKey: job.transcriptKey ?? null,
+            host: job.host ?? null,
+            sessionKey: job.sessionKey ?? null,
+            sourceUsageId: usageLinked === true ? job.usageId : null,
+          });
+          if (vaultReady && !existed && vaultUsageId > 0) {
+            if (Array.isArray(job.manifest)) {
+              writeMirrorMembership(vaultStore.db, vaultUsageId, job.manifest.filter(m => m.vault === vault), usageLinked === true);
+            } else {
+              markLegacyUsageRow(vaultStore.db, vaultUsageId);
+            }
+          }
+          writeRecallEvents(vaultStore, job.sessionId, job.queryHash, group.docs, vaultUsageId > 0 ? vaultUsageId : undefined, job.turnIndex, { dedupeKeyBase: `${job.jobId}:${unit}` });
+          if (vaultReady && vaultUsageId > 0) reconcileReferencedEvents(vaultStore.db, vaultUsageId);
+        }).immediate();
       });
     }
   }

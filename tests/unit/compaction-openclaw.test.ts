@@ -37,6 +37,7 @@ describe("62.2 — OpenClaw before_compaction fallback session id", () => {
       input: {
         session_id: "8f2c1a90-aaaa-4bbb-8ccc-0123456789ab",
         transcript_path: "/state/agents/main/sessions/8f2c1a90-aaaa-4bbb-8ccc-0123456789ab.jsonl",
+        host: "openclaw",   // 62.1 D1 (rev 11): every hook OpenClaw spawns names its host
       },
     }]);
   });
