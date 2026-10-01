@@ -93,8 +93,11 @@ In this order:
    OpenClaw and Hermes plugins — then upgrade them all. The first writable open installs a fence:
    an older ClawMem still running afterwards cannot write feedback counters, co-activations, `usage`
    relations, utility signals or the Stop hooks' documents (each write is skipped and counted), and
-   its `context-surfacing` hook injects nothing, because its usage-row insert fails. `clawmem doctor`
-   fails while the fence has caught such a write in the last 24 h.
+   its `context-surfacing` hook injects nothing, because its usage-row insert fails. An older MCP
+   server's `memory_pin`, `memory_snooze` and `memory_forget` still make their change, then report an
+   error, because the usage row each writes afterwards fails the same way: reconnect the session
+   (`/mcp`) instead of retrying. `clawmem doctor` fails while the fence has caught such a write in
+   the last 24 h.
 2. **Re-run `clawmem setup hooks`.** It adds a SessionEnd group running `handoff-generator` (timeout
    2 s), which renders the handoff's latest turns when a session ends. Without it, the watcher renders
    them later, and `clawmem doctor` warns. Other tools' hooks in the same groups are kept.
