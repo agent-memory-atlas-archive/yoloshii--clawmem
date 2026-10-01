@@ -90,17 +90,18 @@ If you set `CLAWMEM_EMBED_API_KEY` but your `CLAWMEM_EMBED_URL` points to localh
 
 ## Mixing local and cloud
 
-The LLM (query expansion) and reranker use local `llama-server` or the in-process
-`node-llama-cpp` fallback. Two roles support cloud providers: **embedding** (this guide) and,
-since v0.29.0, the **contradiction judge** (`CLAWMEM_JUDGE_*` — its own task-scoped endpoint,
-never the global LLM vars; see [inference services](inference-services.md#contradiction-judge)).
-This means:
+The LLM (query expansion, A-MEM, the Stop hooks' observer) and the reranker default to local
+`llama-server` or the in-process `node-llama-cpp` fallback. `CLAWMEM_LLM_URL` (with
+`CLAWMEM_LLM_API_KEY`) can also point at any OpenAI-compatible endpoint, a cloud one included, and the
+Stop hooks' observer then sends session transcripts to it. Since v0.29.0 the **contradiction judge**
+has its own task-scoped endpoint (`CLAWMEM_JUDGE_*`, never the global LLM vars; see
+[inference services](inference-services.md#contradiction-judge)). This means:
 
 - **Embedding** — local GPU, cloud API, or in-process via `node-llama-cpp` (Metal/Vulkan/CPU — fast with GPU acceleration, slow on CPU-only)
-- **LLM** — local GPU, falls back to in-process `node-llama-cpp`
+- **LLM** — local GPU or an OpenAI-compatible endpoint (cloud included), falls back to in-process `node-llama-cpp`
 - **Reranker** — local GPU, falls back to in-process `node-llama-cpp`
 
-**Note:** In-process fallback is silent — if a GPU server crashes, there is no warning. With Metal/Vulkan the fallback is fast; on CPU-only it is significantly slower. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead, or use [systemd services](systemd-services.md) to keep servers running.
+**Note:** If a local server crashes, ClawMem falls back to in-process inference where it can; [inference services](inference-services.md) says for which services and calls, and a paused embedding or LLM endpoint is logged once (stderr). With Metal/Vulkan the fallback is fast; on CPU-only it is significantly slower. Set `CLAWMEM_NO_LOCAL_MODELS=true` to fail fast instead, or use [systemd services](systemd-services.md) to keep servers running.
 
 ## Model recommendations
 

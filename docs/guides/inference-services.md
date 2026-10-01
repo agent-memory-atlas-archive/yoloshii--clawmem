@@ -1,8 +1,8 @@
 # Inference services — choosing and running your stack
 
-ClawMem uses three inference services: **embedding**, **LLM** (query expansion / intent classification / A-MEM enrichment), and **reranker** (cross-encoder). In the **default** stack all three run as `llama-server` (llama.cpp) instances, each with an in-process `node-llama-cpp` fallback that auto-downloads on first use — so ClawMem works with no manual setup and no dedicated GPU. The `bin/clawmem` wrapper points the three endpoint vars at `localhost:8088` (embedding), `localhost:8089` (LLM), `localhost:8090` (reranker) by default.
+ClawMem uses three inference services: **embedding**, **LLM** (query expansion / intent classification / A-MEM enrichment / the Stop hooks' observer), and **reranker** (cross-encoder). In the **default** stack all three run as `llama-server` (llama.cpp) instances, each with an in-process `node-llama-cpp` fallback that auto-downloads on first use — so ClawMem works with no manual setup and no dedicated GPU. The `bin/clawmem` wrapper points the three endpoint vars at `localhost:8088` (embedding), `localhost:8089` (LLM), `localhost:8090` (reranker) by default.
 
-> **Always run ClawMem via the `bin/clawmem` wrapper.** It exports the endpoint defaults. Invoking `bun run src/clawmem.ts` directly skips them and silently falls back to in-process CPU inference (slow). For remote GPU, add the same vars to your systemd units — see [systemd-services.md](systemd-services.md).
+> **Always run ClawMem via the `bin/clawmem` wrapper.** It exports the endpoint defaults. Invoking `bun run src/clawmem.ts` directly skips them and silently falls back to in-process inference through `node-llama-cpp` (slow without a GPU it can use). For remote GPU, add the same vars to your systemd units — see [systemd-services.md](systemd-services.md).
 
 ## Choosing your inference stack
 
@@ -21,7 +21,7 @@ Three stacks, picked by hardware, license, and quality needs. This is the decisi
 - **The zerank-2 GGUF is deprecated and inert.** llama.cpp's converter drops zerank's CrossEncoder/LogitScore head, so under `--reranking` it returns HTTP 200 with near-zero, non-discriminating scores — the final ordering silently collapses to RRF. Serve the SOTA reranker via the **seq-cls sidecar** (`extras/rerankers/zerank-2-seq/`), never as a GGUF. Run `clawmem rerank-health` to confirm a reranker actually discriminates (liveness ≠ correctness). Since v0.38.0 a passing probe also **attests the served provider's behavioral fingerprint**, which is what enables remote rerank-score caching (`CLAWMEM_RERANK_PROVIDER_ID` optionally refines the identity; attestations expire after 7 days, and a failed or unfingerprintable probe revokes them — see [configuration](../reference/configuration.md)).
 - **`-ub` must equal `-b`** for embedding/reranking models (non-causal attention) or `llama-server` asserts (`non-causal attention requires n_ubatch >= n_tokens`). The zerank-2 sidecar is transformers-served and exempt; the qwen3-reranker GGUF does not need it. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 - **Changing embedding dimensions requires a full re-embed:** `clawmem embed --force` (idempotent, safe to interrupt/resume).
-- **Set `CLAWMEM_NO_LOCAL_MODELS=true`** for remote-only / dedicated-server setups to fail fast on an unreachable endpoint instead of silently auto-downloading multi-GB GGUFs and running CPU inference.
+- **Set `CLAWMEM_NO_LOCAL_MODELS=true`** for remote-only / dedicated-server setups to fail fast on an unreachable endpoint instead of silently auto-downloading multi-GB GGUFs and running them in-process.
 - **A squatted port is not a healthy endpoint.** If an unrelated service occupies a configured port (the default range 8088–8090 is popular), it answers HTTP while serving nothing — through v0.36.0 that disabled enrichment silently and permanently. Since v0.37.0 persistent HTTP errors trip the same 60s cooldown as transport failures (405/501 instantly, other non-2xx after 3 consecutive), and `clawmem doctor` POSTs a real completion to `CLAWMEM_LLM_URL` and validates the response shape — reachability is not correctness.
 
 ## Default stack — QMD native (any GPU or in-process)
@@ -31,7 +31,7 @@ Total ~4 GB VRAM, or runs in-process via `node-llama-cpp` (Metal on Apple Silico
 | Service | Port | Model | VRAM | Purpose |
 |---|---|---|---|---|
 | Embedding | 8088 | [EmbeddingGemma-300M-Q8_0](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) (314 MB, 768d, 2K ctx) | ~400 MB | Vector search, indexing, context-surfacing |
-| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) (~1.1 GB) | ~2.2 GB | Intent classification, query expansion, A-MEM |
+| LLM | 8089 | [qmd-query-expansion-1.7B-q4_k_m](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) (~1.1 GB) | ~2.2 GB | Intent classification, query expansion, A-MEM, Stop-hook observer |
 | Reranker | 8090 | [qwen3-reranker-0.6B-Q8_0](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) (~600 MB) | ~1.3 GB | Cross-encoder reranking |
 
 ```bash
@@ -48,7 +48,7 @@ llama-server -m Qwen3-Reranker-0.6B-Q8_0.gguf \
   --reranking --port 8090 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 512
 ```
 
-On CPU, omit `-ngl 99`. If a server is unreachable (ECONNREFUSED/ETIMEDOUT), ClawMem sets a 60-second cooldown and falls back to in-process inference; HTTP 4xx/5xx and user-cancelled requests do not trigger cooldown.
+On CPU, omit `-ngl 99`. If the LLM endpoint (self-hosted or cloud) or the self-hosted embedding server is unreachable (ECONNREFUSED/ETIMEDOUT), or keeps answering HTTP errors (405 or 501 at once; any other non-2xx except 429 after three in a row, since v0.37.0), ClawMem pauses that endpoint for 60 seconds and uses in-process inference meanwhile, except with `CLAWMEM_NO_LOCAL_MODELS=true` and for a query-path embedding or expansion that carries its own deadline. A user-cancelled request does not start a pause, and the reranker has no such pause.
 
 ## SOTA stack — z models (16 GB+ GPU, CC-BY-NC-4.0, non-commercial only)
 
@@ -99,11 +99,12 @@ curl $CLAWMEM_EMBED_URL/v1/embeddings \
 
 ## LLM server
 
-Intent classification, query expansion, and A-MEM extraction use [qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) — a Qwen3-1.7B finetuned by QMD for generating search-expansion terms (hyde, lexical, vector variants). ~1.1 GB at q4_k_m, served on port 8089. If `CLAWMEM_LLM_URL` is unset, `node-llama-cpp` auto-downloads it.
+Intent classification, query expansion, A-MEM extraction and the Stop hooks' observer (`decision-extractor`'s observations, `handoff-generator`'s summary) use [qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) — a Qwen3-1.7B finetuned by QMD for generating search-expansion terms (hyde, lexical, vector variants). ~1.1 GB at q4_k_m, served on port 8089. If `CLAWMEM_LLM_URL` is unset, `node-llama-cpp` auto-downloads it.
 
 - **Performance (RTX 3090):** intent classification ~27 ms; query expansion ~333 tok/s; VRAM ~2.2–2.8 GB.
 - **Qwen3 `/no_think`:** Qwen3 emits thinking tokens by default; ClawMem appends `/no_think` to all prompts automatically for structured output.
 - **Dual-path intent:** a heuristic regex classifier handles strong why/when/who signals instantly (0.8+ confidence); the LLM refines only ambiguous queries below that threshold.
+- **Context size (`-c`):** `decision-extractor`'s observation prompt holds at most 8,000 characters of transcript and context, a retry's error feedback included (v0.41.1). That is a bound in characters, not tokens. Counted by this model's server, the largest such prompt on English prose from these docs was 2,403 tokens, and one real Claude Code turn's was 1,473. Text that tokenizes more densely (long paths, Chinese, Japanese, Korean) needs more tokens for the same characters, and a prompt near 4,096 tokens leaves the model less than the 2,000 tokens the observer allows for its answer. Raise `-c` (to 8192, say) when the server refuses requests with `the request exceeds the available context size` (HTTP 400; ClawMem logs `[generate] Remote LLM HTTP 400`). On v0.41.0 the observer's own prompt reached 5,382 tokens on that prose, and raising `-c` avoids those refusals there too.
 
 ```bash
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.41.0**.
+Guide for upgrading between released versions. Current: **v0.41.1**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,26 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.41.1: the observer's prompt fits its documented context again
+
+**No vault migration.** Upgrade every process that runs the Stop hooks, and restart the watcher
+(`systemctl --user restart clawmem-watcher.service`, or restart `clawmem watch`): its stop worker
+replays quarantined ranges.
+
+- **From v0.41.0 only.** v0.41.0's observer prompt could exceed the 4,096-token context the docs
+  prescribe for the observer model (`-c 4096`); the server refused it with HTTP 400 and the batch
+  was quarantined as `model unavailable`. Each of those ranges is due again at most 12 hours after
+  its last attempt and replays when the watcher or a later Stop next runs; `clawmem repair
+  stop-queue` shows how many are queued. See [troubleshooting](../troubleshooting.md#hooks).
+- **A developer machine that ran v0.41.0's test suite** with a named vault configured in
+  `~/.config/clawmem/config.yaml` may have had that vault migrated to the v0.41 schema by
+  `tests/unit/stop-feedback.test.ts`. That is what any v0.41 process opening it does. Before an older
+  ClawMem uses the vault again, stop every v0.41 or later process that shares it (an upgraded process
+  reinstalls the fence at its next writable open), then run `clawmem repair counters --remove-fence`.
+  The suite no longer reads your configuration.
 
 ---
 

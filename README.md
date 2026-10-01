@@ -313,7 +313,7 @@ vault_sync(vault="work", content_root="~/work/docs")
 
 ### Inference services (GPU, in-process, or cloud)
 
-ClawMem uses three inference services — **embedding**, **LLM** (query expansion / intent / A-MEM), and **reranker**. In the **default** stack all three run as `llama-server` instances, each with an in-process `node-llama-cpp` fallback that auto-downloads on first use, so ClawMem works without a dedicated GPU (Metal on Apple Silicon, Vulkan where available, CPU as last resort). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`. **Always run via `bin/clawmem`** — it sets the endpoints.
+ClawMem uses three inference services — **embedding**, **LLM** (query expansion / intent / A-MEM / the Stop hooks' observer), and **reranker**. In the **default** stack all three run as `llama-server` instances, each with an in-process `node-llama-cpp` fallback that auto-downloads on first use, so ClawMem works without a dedicated GPU (Metal on Apple Silicon, Vulkan where available, CPU as last resort). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`. **Always run via `bin/clawmem`** — it sets the endpoints.
 
 **Choose a stack:**
 
@@ -405,7 +405,7 @@ curl -X POST http://localhost:7438/search \
 ```bash
 ./bin/clawmem doctor   # Full health check
 ./bin/clawmem status   # Quick index status
-bun test               # Run test suite
+bun test               # Run test suite (from the repository root)
 ```
 
 ## Agent Instructions
@@ -749,7 +749,7 @@ Documents are split into semantic fragments (sections, lists, code blocks, front
 
 ### Local Observer Agent
 
-Uses the LLM server (shared with query expansion and intent classification) to extract structured observations from session transcripts. Observation types: `decision`, `bugfix`, `feature`, `refactor`, `discovery`, `change`, `preference`, `milestone`, `problem`. Each observation includes title, facts, narrative, concepts, and files read/modified. Preferences, milestones, and problems get first-class content_type treatment with dedicated confidence baselines and half-lives instead of being flattened to generic "observation". Falls back to regex patterns if the model is unavailable.
+Uses the LLM server (shared with query expansion and intent classification) to extract structured observations from session transcripts. Observation types: `decision`, `bugfix`, `feature`, `refactor`, `discovery`, `change`, `preference`, `milestone`, `problem`. Each observation includes title, facts, narrative, concepts, and files read/modified. Preferences, milestones, and problems get first-class content_type treatment with dedicated confidence baselines and half-lives instead of being flattened to generic "observation". Regex patterns find decisions and antipatterns beside the model. A batch the model cannot answer (unavailable, or refusing the request) is quarantined and replayed later, never committed as empty; its regex finds are committed when the replay succeeds (v0.41.0). Each prompt holds at most 8,000 characters of transcript and context (v0.41.1); [inference services](docs/guides/inference-services.md#llm-server) covers the server's context size.
 
 ### Recall Tracking
 
@@ -802,7 +802,7 @@ A surfaced note gets `access_count + 1` when a turn it was injected into names i
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud providers (e.g. `jina-embeddings-v5-text-small`). |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). |
-| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM. Without it, falls to `node-llama-cpp` (if allowed). |
+| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM and the Stop hooks' observer. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_LLM_API_KEY` | (none) | Bearer token for an authenticated remote LLM endpoint. Independent of the embed and rerank keys. |
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent to the configured LLM endpoint. Override this for OpenAI-compatible proxies such as `gpt-5.4-mini`. |
 | `CLAWMEM_LLM_REASONING_EFFORT` | (none) | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless your serving stack explicitly accepts that field. |

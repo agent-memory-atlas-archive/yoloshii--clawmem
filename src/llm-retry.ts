@@ -41,6 +41,11 @@ const DEADLINE_EXPIRED = Symbol("llm-retry-deadline-expired");
 
 export async function withRetryAndFeedback<T>(params: {
   initialPrompt: string;
+  /**
+   * A retry's prompt from its feedback block (default: the initial prompt, a blank line, then the block). v0.41.1: a
+   * caller whose prompt has a size bound rebuilds it here, so the feedback stays inside that bound.
+   */
+  retryPrompt?: (feedback: string) => string;
   parse: (text: string) => ParseOutcome<T>;
   llm: RetryLlm;
   maxTokens: number;
@@ -105,9 +110,7 @@ export async function withRetryAndFeedback<T>(params: {
       if (attempt >= maxAttempts) break;
 
       // Reconstruct the retry prompt with error context — stateless, fresh call.
-      prompt = [
-        params.initialPrompt,
-        "",
+      const feedback = [
         "The previous response did not match the expected structure.",
         "Error:",
         lastError,
@@ -117,6 +120,7 @@ export async function withRetryAndFeedback<T>(params: {
         "",
         "Return only the expected structure this time.",
       ].join("\n");
+      prompt = params.retryPrompt ? params.retryPrompt(feedback) : `${params.initialPrompt}\n\n${feedback}`;
     } catch (err) {
       // Abort or transport error — retry with the same prompt (there is no
       // model output to feed back); the loop-top deadline check bounds it.

@@ -204,6 +204,11 @@ builders operate on — so archiving documents legitimately lowers the total.
 - "N overwritten antipattern bodies preserved": review them with `clawmem recover antipatterns`.
 - "! Claude Code hooks: the SessionEnd handoff flush is not installed": re-run `clawmem setup hooks`.
 
+**Stop-hook ranges pile up as `model unavailable` while the LLM server is up (v0.41.0)**
+- Symptom: `clawmem repair stop-queue` shows quarantined ranges that keep coming back; the hook or watcher log shows `[generate] Remote LLM HTTP 400` and `[llm-retry] observer.extractObservations: exhausted after 3 attempt(s)`; the server answers `the request exceeds the available context size, try increasing it`. The observer model runs with `-c 4096`, as the docs prescribe.
+- Cause: v0.41.0's observer prompt carried a CONTEXT section as large as its transcript, up to about 5,400 tokens. The server refused it, and three refusals in a row also put the process's LLM endpoint into its 60-second cooldown (in-process generation meanwhile, or none with `CLAWMEM_NO_LOCAL_MODELS=true`).
+- **Fixed in v0.41.1:** the section and the transcript, with a retry's error feedback, stay within the 8,000 characters v0.40's transcript could take. That is a bound in characters: text that tokenizes very densely can still pass 4,096 tokens, as in v0.40. Upgrade the hooks and restart the watcher; each queued range is due again at most 12 hours after its last attempt and replays when the watcher or a later Stop next runs. Raising the server's `-c` also works on v0.41.0.
+
 **Access counts and co-activations dropped after upgrading to v0.41.0**
 - Expected. The one-time recompute set each document's `access_count` to its verified references since the upgrade (near zero at first) and rebuilt co-activations and `usage` relations the same way; through v0.40.3 every Stop counted the whole session again. Documents whose old access fell inside their archive window got a staggered archive grace (`clawmem doctor` projects the expiries per week). `clawmem repair counters --restore <op>` reverses the recompute; the op id is in the watcher log.
 

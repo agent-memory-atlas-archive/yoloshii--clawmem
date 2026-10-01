@@ -181,7 +181,8 @@ The Stop-event hooks do not deduplicate by content window (through v0.40.3 they 
 ## What the Stop hooks write
 
 - **`decision-extractor`** sends the turns after its cursor to the observer in batches, with the two
-  turns before them and the session's recorded observation titles as context. A batch with no
+  turns before them and the session's recorded observation titles as context (at most 2,000
+  characters of the observer's 8,000-character input, v0.41.1). A batch with no
   assistant message of 40 characters or more and no tool call is skipped. A batch whose model call
   fails is quarantined and retried later (1 minute, 5 minutes, 30 minutes, 2 hours, then every 12
   hours) by later Stops and the watcher; its turns are never committed as empty.

@@ -8,7 +8,7 @@ This file is the **lean root SSOT** — agent-facing essentials only. Deep refer
 
 ## Inference at a glance
 
-Three services — **embedding**, **LLM** (query expansion / intent / A-MEM), **reranker**. Default: all three as `llama-server` with an in-process `node-llama-cpp` fallback that auto-downloads on first use (works with no GPU). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`. **Always run via `bin/clawmem`** — it sets the endpoints.
+Three services — **embedding**, **LLM** (query expansion / intent / A-MEM / Stop-hook observer), **reranker**. Default: all three as `llama-server` with an in-process `node-llama-cpp` fallback that auto-downloads on first use (works with no GPU). The `bin/clawmem` wrapper points at `localhost:8088/8089/8090`. **Always run via `bin/clawmem`** — it sets the endpoints.
 
 **Choose a stack:**
 - **native** (default) — EmbeddingGemma-300M + qmd-query-expansion-1.7B + qwen3-reranker-0.6B · ~4 GB or in-process · **permissive, commercial OK** · zero-config.
@@ -183,7 +183,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 
 ## Operational gotchas
 
-- **Stop pipeline (v0.41.0)** → `decision-extractor` and `handoff-generator` keep a cursor per transcript and `feedback-loop` decides each surfaced turn once, so a turn is extracted, digested and credited once; `clawmem watch` runs the worker that finishes what a missing Stop left, and its FIRST start recomputes the feedback counters from verified references (access counts start near zero; documents recently accessed get a staggered archive grace). Upgrade EVERY process that shares the vault: the fence skips an older ClawMem's Stop-hook writes and its surfacing hook injects nothing (`clawmem doctor` ✗ for 24 h after the last caught write). Re-run `clawmem setup hooks` for the SessionEnd flush; Hermes: copy the plugin again. Queues older than 24 h → `clawmem repair stop-queue --run`. → [upgrading](docs/guides/upgrading.md), [architecture](docs/concepts/architecture.md#stop-pipeline).
+- **Stop pipeline (v0.41.0)** → `decision-extractor` and `handoff-generator` keep a cursor per transcript and `feedback-loop` decides each surfaced turn once, so a turn is extracted, digested and credited once; `clawmem watch` runs the worker that finishes what a missing Stop left, and its FIRST start recomputes the feedback counters from verified references (access counts start near zero; documents recently accessed get a staggered archive grace). Upgrade EVERY process that shares the vault: the fence skips an older ClawMem's Stop-hook writes and its surfacing hook injects nothing (`clawmem doctor` ✗ for 24 h after the last caught write). Re-run `clawmem setup hooks` for the SessionEnd flush; Hermes: copy the plugin again. Queues older than 24 h → `clawmem repair stop-queue --run`. v0.41.0's observer prompt could pass the prescribed `-c 4096` (HTTP 400, ranges quarantined as `model unavailable`); v0.41.1 bounds it. → [upgrading](docs/guides/upgrading.md), [architecture](docs/concepts/architecture.md#stop-pipeline).
 - **Empty `context-surfacing`** → prompt < 20 chars (short memory-intent queries like "what did I say?" are exempt — they force retrieval), starts with `/`, or nothing scored above threshold. Check `clawmem status` + embedding coverage.
 - **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed`.
 - **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs`. Don't run it after every reindex (A-MEM links per-doc automatically).

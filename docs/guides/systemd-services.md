@@ -1,6 +1,6 @@
 # Systemd services for ClawMem
 
-Keep ClawMem's AI agent memory services running automatically with systemd user units. This is important for GPU setups — if a llama-server crashes, ClawMem silently falls back to in-process inference via `node-llama-cpp` (Metal on Apple Silicon, Vulkan where available, CPU as last resort). With GPU acceleration (Metal/Vulkan) the fallback is fast; on CPU-only systems it is significantly slower. Systemd's `Restart=on-failure` ensures servers come back up automatically. To disable silent fallback entirely, set `CLAWMEM_NO_LOCAL_MODELS=true`.
+Keep ClawMem's AI agent memory services running automatically with systemd user units. This is important for GPU setups: if a llama-server crashes, ClawMem falls back to in-process inference via `node-llama-cpp` where it can (Metal on Apple Silicon, Vulkan where available, CPU as last resort; [inference services](inference-services.md) says for which services and calls). With GPU acceleration (Metal/Vulkan) the fallback is fast; on CPU-only systems it is significantly slower. Systemd's `Restart=on-failure` ensures servers come back up automatically. To disable the fallback entirely, set `CLAWMEM_NO_LOCAL_MODELS=true`.
 
 ## Watcher service
 

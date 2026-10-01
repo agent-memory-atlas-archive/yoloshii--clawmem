@@ -187,9 +187,12 @@ export function classifyMessages(messages: TranscriptMessage[]): PrioritizedMess
   return classified;
 }
 
-export function prepareTranscript(messages: TranscriptMessage[]): string {
+/**
+ * The transcript as the observer reads it, at most `charBudget` characters (~4 per token). v0.41.1: the budget is
+ * the caller's — the observer gives its transcript what the CONTEXT section leaves of the render budget.
+ */
+export function prepareTranscript(messages: TranscriptMessage[], charBudget: number = MAX_TRANSCRIPT_TOKENS * 4): string {
   const recent = messages.slice(-MAX_TRANSCRIPT_MESSAGES);
-  const charBudget = MAX_TRANSCRIPT_TOKENS * 4; // ~4 chars per token
 
   const classified = classifyMessages(recent);
 
@@ -238,8 +241,16 @@ export function prepareTranscript(messages: TranscriptMessage[]): string {
   const all = [...criticalLines, ...toolLines, ...convLines];
   all.sort((a, b) => a.index - b.index);
 
-  return all.map(l => l.formatted).join("\n");
+  // Phase 1 is kept whatever the budget; under a budget smaller than it (the CONTEXT's share), the latest text is.
+  const out = all.map(l => l.formatted).join("\n");
+  if (out.length <= charBudget) return out;
+  const tail = out.slice(out.length - charBudget + 1);
+  return "…" + (LOW_SURROGATE_FIRST.test(tail) ? tail.slice(1) : tail);
 }
+
+/** A cut must not leave half of a surrogate pair: llama-server refuses a lone surrogate in the request (HTTP 500). */
+const LOW_SURROGATE_FIRST = /^[\uDC00-\uDFFF]/;
+const HIGH_SURROGATE_LAST = /[\uD800-\uDBFF]$/;
 
 // =============================================================================
 // XML Parsers
@@ -407,11 +418,41 @@ const EMPTY_COMPLETION = "\u0000observer:empty-completion\u0000";
 /** A reply with no observation blocks and no markup, short enough to be a plain "nothing" rather than lost output. */
 const PLAIN_NOTHING_MAX_CHARS = 300;
 
+/**
+ * The CONTEXT section's share of the render budget (v0.41.1). The section is at most this long, the transcript gets the
+ * rest, and batches are packed to leave it (stop-extract.ts), so CONTEXT + transcript stay within
+ * OBSERVER_MAX_RENDER_CHARS — the prompt v0.40 sent at its largest, which the documented `-c 4096` was sized for.
+ */
+export const OBSERVER_CONTEXT_MAX_CHARS = 2_000;
+/**
+ * A retry's feedback block (llm-retry.ts: its fixed lines, the parse error, up to 500 characters of the response) and
+ * the blank line before it, at most (805 with the observer's longest error). A retry takes it out of the transcript's
+ * budget, so every attempt stays within OBSERVER_MAX_RENDER_CHARS (v0.41.1).
+ */
+export const OBSERVER_RETRY_FEEDBACK_MAX_CHARS = 850;
+/** What a batch leaves of the render budget: the CONTEXT and a retry's feedback, so it reaches the model whole on every attempt. */
+export const OBSERVER_BATCH_RESERVED_CHARS = OBSERVER_CONTEXT_MAX_CHARS + OBSERVER_RETRY_FEEDBACK_MAX_CHARS;
+/** Within it: the prior turns' text, the titles' lines, and one title's length. Headers take ~100 more (1,901 at most in all). */
+const CONTEXT_PRIOR_CHARS = 1_100;
+const CONTEXT_TITLES_CHARS = 700;
+const CONTEXT_TITLE_CHARS = 100;
+
 function renderContextSection(ctx: ObservationContext | undefined): string {
   if (!ctx || (ctx.priorMessages.length === 0 && ctx.recordedTitles.length === 0)) return "";
   const lines = ["--- CONTEXT (already recorded — do not extract) ---"];
-  if (ctx.priorMessages.length > 0) lines.push(prepareTranscript(ctx.priorMessages));
-  if (ctx.recordedTitles.length > 0) lines.push("Already recorded observations:", ...ctx.recordedTitles.map(t => `- ${t}`));
+  if (ctx.priorMessages.length > 0) lines.push(prepareTranscript(ctx.priorMessages, CONTEXT_PRIOR_CHARS));
+  // The newest titles that fit (the list is oldest first), kept in that order.
+  const titles: string[] = [];
+  let used = 0;
+  for (let i = ctx.recordedTitles.length - 1; i >= 0; i--) {
+    const t = ctx.recordedTitles[i]!;
+    const head = t.slice(0, CONTEXT_TITLE_CHARS - 1);
+    const line = `- ${t.length > CONTEXT_TITLE_CHARS ? (HIGH_SURROGATE_LAST.test(head) ? head.slice(0, -1) : head) + "…" : t}`;
+    if (used + line.length + 1 > CONTEXT_TITLES_CHARS) break;
+    titles.unshift(line);
+    used += line.length + 1;
+  }
+  if (titles.length > 0) lines.push("Already recorded observations:", ...titles);
   lines.push("--- END CONTEXT ---", "");
   return lines.join("\n") + "\n";
 }
@@ -425,8 +466,10 @@ export async function extractObservationsResult(
   messages: TranscriptMessage[],
   opts?: { timeoutMs?: DurationMs; context?: ObservationContext },
 ): Promise<ObservationResult> {
-  const transcript = prepareTranscript(messages);
-  const prompt = `${OBSERVATION_SYSTEM_PROMPT}\n\n${renderContextSection(opts?.context)}--- TRANSCRIPT ---\n${transcript}\n--- END TRANSCRIPT ---\n\nExtract observations:`;
+  const context = renderContextSection(opts?.context);
+  const budget = OBSERVER_MAX_RENDER_CHARS - context.length;
+  const promptWithin = (transcriptBudget: number) =>
+    `${OBSERVATION_SYSTEM_PROMPT}\n\n${context}--- TRANSCRIPT ---\n${prepareTranscript(messages, transcriptBudget)}\n--- END TRANSCRIPT ---\n\nExtract observations:`;
 
   const inner = getDefaultLlamaCpp();
   let unavailable = false;
@@ -438,7 +481,9 @@ export async function extractObservationsResult(
     },
   };
   const parsed = await withRetryAndFeedback<Observation[]>({
-    initialPrompt: prompt,
+    initialPrompt: promptWithin(budget),
+    // A retry's feedback comes out of the transcript's budget (v0.41.1), so every attempt stays inside the bound.
+    retryPrompt: (feedback) => `${promptWithin(budget - feedback.length - 2)}\n\n${feedback}`,
     llm,
     maxTokens: GENERATION_MAX_TOKENS,
     temperature: GENERATION_TEMPERATURE,

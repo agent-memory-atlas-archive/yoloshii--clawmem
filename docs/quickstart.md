@@ -61,7 +61,7 @@ ClawMem uses three llama-server instances for best performance. All three models
 llama-server -m embeddinggemma-300M-Q8_0.gguf \
   --embeddings --port 8088 --host 0.0.0.0 -ngl 99 -c 2048 --batch-size 2048
 
-# LLM — query expansion (falls back to in-process if unavailable)
+# LLM — query expansion, A-MEM notes, the Stop hooks' observer (falls back to in-process if unavailable)
 llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
   --port 8089 --host 0.0.0.0 -ngl 99 -c 4096
 
@@ -81,7 +81,7 @@ No GPU? See [cloud embedding](guides/cloud-embedding.md) for OpenAI, Voyage, Jin
 ```bash
 clawmem doctor    # Full health check
 clawmem status    # Quick index status
-bun test                # Run test suite
+bun test                # Run test suite (from the repository root)
 ```
 
 ## Build out your collections

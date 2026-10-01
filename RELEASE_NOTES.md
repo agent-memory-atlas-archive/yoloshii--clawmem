@@ -4,6 +4,133 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.41.1 — the observer's prompt fits its documented context again
+
+v0.41.0 gave the observer a CONTEXT section: the two turns before the batch and the session's recorded
+observation titles, marked as already recorded. The section rendered those turns through
+`prepareTranscript` with that function's whole budget, 8,000 characters, and listed up to 30 titles,
+while the batch's own transcript kept its 8,000. At its largest the prompt grew from about 10,900
+characters to about 23,600: from 2,470 tokens to 5,382 on the observer model the docs prescribe
+(qmd-query-expansion-1.7B, counted by its server with the chat template, on prose from this
+repository's docs). The docs run that model with `-c 4096`, and the server refuses a longer prompt
+with HTTP 400. The observer retries a failed call twice, so such a batch went to the server three
+times and was refused three times. The third refusal in a row put the process's LLM endpoint into
+its 60-second cooldown: that attempt, and the process's other LLM calls for the next minute, ran
+in-process through node-llama-cpp (downloading the model on first use), or not at all with
+`CLAWMEM_NO_LOCAL_MODELS=true`. A batch left without an answer was quarantined in `stop_retries` as
+`model unavailable`, and every replay sent the same prompt again. A prompt under the limit could
+still leave the model little room: on one real Claude Code turn the prompt was 3,875 tokens, which
+left 221 of the 4,096 for an answer the observer allows 2,000 tokens.
+
+The section now has a bound of its own, and the transcript gets what the section leaves of the
+render budget, so the two together, with a retry's error feedback when there is one, stay within the
+8,000 characters v0.40's transcript alone could take. The bound is in characters, not tokens. On the
+same prose the largest prompt is now 2,403 tokens, and the real turn above is 1,473; text that
+tokenizes more densely (Chinese, Japanese or Korean, for instance) can still pass 4,096 tokens within
+it, as it could in v0.40.
+
+Separately, the test suite read the developer's own ClawMem configuration. `loadVaultConfig()`
+reads `~/.config/clawmem/config.yaml` unless `CLAWMEM_CONFIG_DIR` is set, and the test-mode guard in
+`getDefaultDbPath` covers only the general vault. A test that runs `feedbackLoop` without explicit
+vaults opens every configured named vault, so on a machine with a skill vault configured,
+`bun test tests/unit/stop-feedback.test.ts` opened that real vault writable, and the v0.41 migration
+installed the stop-pipeline schema and its fence triggers on it (it wrote no stop-pipeline rows).
+Every test file runs in one process, and one of them deleted `CLAWMEM_CONFIG_DIR` after each of its
+tests, so even a run that set the variable exposed the real configuration to every test after that
+file. Every run now starts from an empty scratch configuration and keeps it, and so do the processes the
+tests start. A vault migrated that way keeps the v0.41 schema, as any v0.41 process opening it would
+leave it. Before an older ClawMem uses it again, stop every v0.41 or later process that shares it,
+then drop the fence with `clawmem repair counters --remove-fence`: an upgraded process reinstalls the
+fence at its next writable open.
+
+### What changed
+
+- `src/observer.ts`: the CONTEXT section is at most `OBSERVER_CONTEXT_MAX_CHARS` (2,000) characters.
+  The prior turns get 1,100 of them, cut from the front when the turns' first request and final
+  response alone are longer, so the latest text stays. The titles get 700: the newest that fit, in
+  order, each at most 100 characters. Neither cut leaves half of a surrogate pair (an emoji cut in
+  two makes llama-server refuse the request with HTTP 500). The transcript gets
+  `OBSERVER_MAX_RENDER_CHARS` (8,000) less the section's length, and on a retry less the retry's
+  error feedback too (`OBSERVER_RETRY_FEEDBACK_MAX_CHARS`, 850: the parse error and up to 500
+  characters of the answer), through a new `retryPrompt` option of `withRetryAndFeedback`
+  (`src/llm-retry.ts`); its other callers keep their retry prompt, byte for byte.
+  `prepareTranscript` takes its budget as a parameter and never returns more than it; at its
+  default, 8,000, its output is unchanged.
+- `src/stop-extract.ts`: turns are packed into batches that leave 2,850 characters free
+  (`OBSERVER_BATCH_RESERVED_CHARS`: the section's 2,000 and a retry's 850; `packTurnBatches` had the
+  `reservedChars` bound, and nothing passed it), so a packed batch reaches the model whole on every
+  attempt. A single turn larger than a batch is cut to its budget, as before, now 8,000 less the
+  section (and on a retry, the feedback) instead of 8,000.
+- `tests/preload.ts`, loaded before every test file through `bunfig.toml` (Bun reads `bunfig.toml`
+  only from the directory it runs in, so run `bun test` from the repository root): points
+  `CLAWMEM_CONFIG_DIR` at an empty scratch directory, and back at it before and after every test
+  that leaves it unset, and clears `CLAWMEM_VAULTS` and `INDEX_PATH`, which a launcher may export
+  with the real paths. A test that needs a configuration, a named vault or an index path sets its
+  own, as before. Two tests that start the CLI with a cleaned environment
+  (`tests/hooks/eval-vector-daemon.integration.test.ts`, `tests/hooks/hook-replay.integration.test.ts`)
+  dropped `CLAWMEM_CONFIG_DIR` with the rest, so the child read the real configuration; they now give
+  it a scratch one.
+- Docs: `docs/concepts/architecture.md` and `docs/guides/setup-hooks.md` (the section's bound),
+  `docs/guides/inference-services.md` (the observer runs on the LLM server; what `-c 4096` fits and
+  when to raise it; which HTTP errors trip the cooldown, stale since v0.37.0),
+  `docs/reference/configuration.md`, `README.md`, `AGENTS.md`, `docs/quickstart.md`,
+  `docs/guides/cloud-embedding.md` and `docs/internals/entity-resolution.md` (the LLM server also
+  serves the observer; `cloud-embedding.md` also says the LLM can be a cloud endpoint, which then
+  receives session transcripts, and, with `docs/guides/systemd-services.md`, that a fallback is logged), `README.md`'s observer section (a batch the model cannot answer is
+  quarantined and replayed, not a regex fallback, since v0.41.0; the prompt's bound),
+  `docs/troubleshooting.md` (a new *Hooks* entry), `docs/guides/upgrading.md`, `CONTRIBUTING.md`,
+  `docs/contributing.md`, `docs/quickstart.md` and the pull-request template (the isolated suite,
+  `tests/preload.ts`, run from the repository root), `SKILL.md`.
+
+### Verification
+
+`tests/unit/stop-observer.test.ts` adds six tests at the observer: the largest CONTEXT beside a batch that
+fills the budget (CONTEXT and transcript within 8,000 characters), the section's own bound and its
+latest material (the last prior message, the newest titles), a retry after the longest parse error
+the observer reports and a long answer (within the bound, its feedback within 850 characters), a
+batch at the packing bound (whole on the first attempt and on the retry), the section's cuts through
+emoji (no lone surrogate), and `prepareTranscript` under a small budget.
+`tests/unit/stop-extract.test.ts` adds two at the Stop hook: a 40-turn backlog packed into several
+batches (every prompt within the bound, every turn sent whole exactly once), and the same backlog when
+every batch's first answer fails to parse (every retry within the bound, every turn whole in a
+retry). `tests/unit/llm-retry.test.ts` adds two: the default retry prompt, byte for byte, and a
+caller's `retryPrompt`. Nine of these ten fail against v0.41.0's source; the tenth pins the default
+retry prompt, which did not change. `tests/unit/test-isolation.test.ts` adds four: the preload's
+scratch configuration, a test that deletes `CLAWMEM_CONFIG_DIR` and the test after it (still on the
+scratch directory, seeing only scratch vaults), and a child process started with the suite's
+environment (the same scratch configuration). Three of them fail without the preload; the fourth is
+the deleting step. Eleven mutants of the fix (no batch reserve, the transcript's full budget, the
+prior turns' full budget, the oldest titles, no final cut, no preload, no repair hooks, a front cut or
+a title clip that splits a surrogate pair, no retry hook, a reserve without the retry's share) each
+fail at least one of these tests.
+
+Measured with the observer server's own tokenizer and chat template (qmd-query-expansion-1.7B,
+`-c 4096`): on prose from the docs the largest prompt is 2,403 tokens (v0.41.0: 5,382; v0.40's
+shape: 2,470), and the second Stop's prompt on a real Claude Code transcript 1,473 (v0.41.0: 3,875).
+Full suite: 3354 pass / 0 fail on Bun 1.3.14. On Bun 1.4.2, 3353 pass and 1 fail: Issue #13's
+concurrent first-open test (`SQLITE_BUSY` at `PRAGMA journal_mode = WAL`), which fails now and then
+on an unmodified v0.40.3 as well, and passed five reruns. tsc unchanged. Cross-model
+adversarial review (codex / GPT-6, one pinned session): turn 1 raised five findings, four Medium (a
+retry's feedback could push the prompt past the bound; two test subprocesses read the developer's
+configuration; the notes promised a token guarantee the character bound does not give; the
+downgrade step lacked its precondition) and one Low (when a quarantined range replays); turn 2 one
+Low (the fallback is not necessarily on the CPU). All were fixed. Turns 4 to 7, on the docs audit
+that followed, raised eleven more, six Medium and five Low: a token guarantee the docs still implied,
+the scope of the fallback and cooldown statements, the LLM's cloud option (which then receives
+session transcripts), and stale role lists and test instructions. All were fixed. It cleared at
+turn 8 with zero remaining findings.
+
+### What didn't change
+
+- The render budget and the output budget: 8,000 characters of CONTEXT and transcript, and up to
+  2,000 tokens of answer. On dense text a prompt at the bound still leaves the model less than 2,000
+  tokens of a 4,096-token context to answer in, as v0.40's did.
+- Ranges v0.41.0 quarantined are due again at most 12 hours after their last attempt, and replay
+  when the watcher or a later Stop next runs; `clawmem repair stop-queue` shows how many are queued.
+  No migration.
+
+---
+
 ## v0.41.0 — the Stop hooks process each turn once, and feedback counts only verified references
 
 Claude Code runs the Stop hooks after every response, and through v0.40.3 each run started over.

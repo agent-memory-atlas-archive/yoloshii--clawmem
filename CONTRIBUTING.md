@@ -34,6 +34,8 @@ bun test
 bun test tests/unit/some-file.test.ts
 ```
 
+Run them from the repository root: `bunfig.toml` loads `tests/preload.ts`, which keeps the suite away from your own ClawMem configuration and vaults.
+
 ## Project Structure
 
 ```
@@ -43,6 +45,7 @@ tests/
   unit/        # Unit tests (no GPU needed)
   fixtures/    # Test data
   helpers/     # Shared test utilities
+  preload.ts   # Loaded before every test (bunfig.toml): a scratch config, no inherited vault paths
 config.yaml    # Default configuration
 ```
 

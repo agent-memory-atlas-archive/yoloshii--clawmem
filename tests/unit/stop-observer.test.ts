@@ -77,6 +77,125 @@ describe("D3 extractObservationsResult", () => {
   });
 });
 
+/**
+ * v0.41.1: the prompt fits the context the observer is documented to run with (`-c 4096`).
+ *
+ * Baseline (v0.41.0): the CONTEXT section rendered its prior turns through `prepareTranscript` with that function's
+ * whole 8,000-character budget and listed up to 30 titles, on top of the batch's own 8,000 — about 6,600 tokens at
+ * worst against v0.40's 3,400. On the prescribed 4,096-token model the server answered HTTP 400, the range was
+ * quarantined, and every replay sent the same prompt again.
+ */
+describe("v0.41.1 the observer prompt stays inside its input bound", () => {
+  const between = (p: string, from: string, to: string) => {
+    const i = p.indexOf(from);
+    return i < 0 ? "" : p.slice(i, p.indexOf(to, i));
+  };
+  /** The CONTEXT section (from its header to the transcript header). */
+  const contextOf = (p: string) => between(p, "--- CONTEXT", "--- TRANSCRIPT ---");
+  /** The transcript body (between its markers). */
+  const transcriptOf = (p: string) => between(p, "--- TRANSCRIPT ---\n", "\n--- END TRANSCRIPT ---").slice("--- TRANSCRIPT ---\n".length);
+  const filled = (tag: string, i: number) => `${tag} ${i} ` + "w".repeat(2000);
+  const msgs = (tag: string, n: number) =>
+    Array.from({ length: n }, (_, i) => ({ role: (i % 2 ? "assistant" : "user") as "assistant" | "user", content: filled(tag, i) }));
+  // Every part at its largest: a batch that alone fills the render budget, long prior turns, 30 long titles.
+  const bigContext = {
+    priorMessages: msgs("prior message", 40),
+    recordedTitles: Array.from({ length: 30 }, (_, i) => `Recorded title ${i} ` + "t".repeat(150)),
+  };
+
+  it("CONTEXT plus transcript never exceed OBSERVER_MAX_RENDER_CHARS, the budget v0.40's prompt was sized by", async () => {
+    const { extractObservationsResult, OBSERVER_MAX_RENDER_CHARS } = await obsMod();
+    const prompts = fakeLlm([""]);
+    await extractObservationsResult(msgs("batch message", 100), { context: bigContext });
+    const p = prompts[0]!;
+    expect(contextOf(p).length + transcriptOf(p).length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+  });
+
+  it("the CONTEXT keeps its bound and its latest material: the last prior message and the newest titles", async () => {
+    const { extractObservationsResult, OBSERVER_CONTEXT_MAX_CHARS } = await obsMod();
+    expect(typeof OBSERVER_CONTEXT_MAX_CHARS).toBe("number");
+    const prompts = fakeLlm([""]);
+    await extractObservationsResult(msgs("batch message", 100), { context: bigContext });
+    const ctx = contextOf(prompts[0]!);
+    expect(ctx.length).toBeLessThanOrEqual(OBSERVER_CONTEXT_MAX_CHARS);
+    expect(ctx).toContain("CONTEXT (already recorded — do not extract)");
+    expect(ctx).toContain("--- END CONTEXT ---");
+    expect(ctx).toContain("prior message 39");
+    expect(ctx).toContain("Recorded title 29");
+    expect(ctx).not.toContain("Recorded title 0 ");
+  });
+
+  // A parse failure with the longest error the observer reports and a response longer than the excerpt the retry
+  // quotes: the largest retry feedback block.
+  const UNPARSEABLE = "<observation><type>bogus</type></observation>" + "j".repeat(700);
+  /** Everything after "Extract observations:" — a retry's feedback block and the blank line before it. */
+  const feedbackOf = (p: string) => p.slice(p.indexOf("Extract observations:") + "Extract observations:".length);
+
+  it("a retry's prompt stays inside the bound too: its feedback comes out of the transcript's budget", async () => {
+    const { extractObservationsResult, OBSERVER_MAX_RENDER_CHARS, OBSERVER_RETRY_FEEDBACK_MAX_CHARS } = await obsMod();
+    expect(typeof OBSERVER_RETRY_FEEDBACK_MAX_CHARS).toBe("number");
+    const prompts = fakeLlm([UNPARSEABLE, ""]);
+    await extractObservationsResult(msgs("batch message", 100), { context: bigContext });
+    expect(prompts.length).toBe(2);
+    const retry = prompts[1]!;
+    expect(retry).toContain("did not match the expected structure");
+    expect(feedbackOf(retry).length).toBeLessThanOrEqual(OBSERVER_RETRY_FEEDBACK_MAX_CHARS);
+    expect(contextOf(retry).length + transcriptOf(retry).length + feedbackOf(retry).length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+  });
+
+  it("a batch within the packing bound (render budget less OBSERVER_BATCH_RESERVED_CHARS) reaches the model whole, on a retry too", async () => {
+    const { extractObservationsResult, observerRenderChars, OBSERVER_MAX_RENDER_CHARS, OBSERVER_BATCH_RESERVED_CHARS } = await obsMod();
+    expect(typeof OBSERVER_BATCH_RESERVED_CHARS).toBe("number");
+    const batch: { role: "user" | "assistant"; content: string }[] = [];
+    for (let i = 0; i < 200; i++) {
+      const turn = [
+        { role: "user" as const, content: `question ${i}` },
+        { role: "assistant" as const, content: `answer ${i} ` + "a".repeat(460) + ` (end ${i})` },
+      ];
+      if (observerRenderChars([...batch, ...turn]) > OBSERVER_MAX_RENDER_CHARS - OBSERVER_BATCH_RESERVED_CHARS) break;
+      batch.push(...turn);
+    }
+    const prompts = fakeLlm([UNPARSEABLE, ""]);
+    await extractObservationsResult(batch, { context: bigContext });
+    expect(prompts.length).toBe(2);
+    for (const p of prompts) {
+      const tr = transcriptOf(p);
+      for (let i = 0; i < batch.length / 2; i++) expect(tr).toContain(`(end ${i})`);
+    }
+  });
+
+  it("the CONTEXT's own cuts never leave half a surrogate pair (llama-server refuses a lone surrogate: HTTP 500)", async () => {
+    const { extractObservationsResult } = await obsMod();
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    // Messages under their per-message caps, so the only cuts are the section's: the front cut of the prior turns
+    // (their first request and final response alone exceed its share; it lands in the request's emoji) and the title
+    // clip. Both parities of each.
+    for (const pad of ["", "x"]) {
+      const prompts = fakeLlm([""]);
+      await extractObservationsResult([{ role: "user", content: "q" }], {
+        context: {
+          priorMessages: [{ role: "user", content: "🔴".repeat(195) }, { role: "assistant", content: pad + "a".repeat(990) }],
+          recordedTitles: [pad + "🟢".repeat(60)],
+        },
+      });
+      const ctx = contextOf(prompts[0]!);
+      expect(ctx).toContain("…🔴");   // the front cut happened, inside the emoji
+      expect(lone.test(ctx)).toBe(false);
+    }
+  });
+
+  it("prepareTranscript never returns more than the budget it is given, keeping the latest text", async () => {
+    const { prepareTranscript } = await obsMod();
+    // The first request and the final response alone exceed 300 characters: the render is cut from the front.
+    const out = prepareTranscript(msgs("m", 4), 300);
+    expect(out.length).toBeLessThanOrEqual(300);
+    expect(out.startsWith("…")).toBe(true);
+    expect(out).not.toContain("[user]: m 0");
+    expect(out.endsWith("w...")).toBe(true);   // the final response's capped end
+    expect(prepareTranscript([{ role: "user", content: "short" }], 300)).toBe("[user]: short");
+  });
+});
+
 describe("D4 observerRenderChars (batch packing)", () => {
   it("measures a batch the way the observer renders it: per-message caps, one line each", async () => {
     const { observerRenderChars } = await obsMod();

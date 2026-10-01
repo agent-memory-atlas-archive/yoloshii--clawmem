@@ -17,7 +17,7 @@ bun test              # All tests
 bun test tests/unit   # Unit tests only
 ```
 
-Tests use in-memory SQLite databases and don't require GPU services.
+Tests use in-memory SQLite databases and don't require GPU services. They never read your own ClawMem configuration or open your vaults: `tests/preload.ts` (loaded through `bunfig.toml`) points `CLAWMEM_CONFIG_DIR` at an empty scratch directory before any test loads (and back at it whenever a test leaves it unset), and clears `CLAWMEM_VAULTS` and `INDEX_PATH`. Run `bun test` from the repository root: Bun reads `bunfig.toml` only from the directory it runs in. Give a test that needs a configuration, a named vault or an index path its own scratch copy.
 
 ## Type checking
 
@@ -98,6 +98,7 @@ src/
 tests/
   unit/               Unit tests
   integration/        Integration tests (when present)
+  preload.ts          Loaded before every test (bunfig.toml): a scratch config, no inherited vault or index path
 docs/                 Documentation (this folder)
 scripts/              Tooling, including the O1 clock and seam audits
 bin/

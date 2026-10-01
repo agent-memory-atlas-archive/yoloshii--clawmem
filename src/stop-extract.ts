@@ -33,7 +33,7 @@ import {
   STOP_READ_MAX_BYTES, type StopCursor, type TranscriptLine, type FileIdentity, type StreamEnd,
 } from "./stop-cursor.ts";
 import {
-  extractObservationsResult, observerRenderChars, OBSERVER_MAX_MESSAGES, OBSERVER_MAX_RENDER_CHARS,
+  extractObservationsResult, observerRenderChars, OBSERVER_MAX_MESSAGES, OBSERVER_MAX_RENDER_CHARS, OBSERVER_BATCH_RESERVED_CHARS,
   type Observation, type ObservationResult,
 } from "./observer.ts";
 import { insertStopItem, itemFingerprint, reconcileSessionDocs } from "./stop-session-docs.ts";
@@ -499,7 +499,8 @@ export async function runDecisionExtraction(store: Store, args: ExtractionArgs):
   } else {
     const turns: Turn[] = segs.map(s => ({ lines: s.lines, messages: toObserverMessages(s.lines), start: s.start, end: s.end }));
     if (turns.length === 0) return run;
-    units = packTurnBatches(turns, { maxMessages: OBSERVER_MAX_MESSAGES, maxChars: OBSERVER_MAX_RENDER_CHARS })
+    // Each batch leaves the CONTEXT's and a retry's share of the render budget (v0.41.1): the observer renders it whole.
+    units = packTurnBatches(turns, { maxMessages: OBSERVER_MAX_MESSAGES, maxChars: OBSERVER_MAX_RENDER_CHARS, reservedChars: OBSERVER_BATCH_RESERVED_CHARS })
       .map(batch => unitOfBatch(path, start.anchorEpoch, batch));
   }
 

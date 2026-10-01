@@ -53,6 +53,38 @@ describe("withRetryAndFeedback", () => {
     expect(retryPrompt).toContain("not json at all");
   });
 
+  const FEEDBACK = [
+    "The previous response did not match the expected structure.",
+    "Error:",
+    "Invalid JSON.",
+    "",
+    "Previous response (first 500 chars):",
+    "not json at all",
+    "",
+    "Return only the expected structure this time.",
+  ].join("\n");
+
+  it("the default retry prompt is the initial prompt, a blank line, then the feedback block, byte for byte", async () => {
+    const llm = makeLlm(["not json at all", '["ok"]']);
+    await withRetryAndFeedback({ initialPrompt: "ORIGINAL PROMPT", llm, maxTokens: 100, parse: parseJsonArray });
+    expect(llm.generate.mock.calls[1]?.[0]).toBe(`ORIGINAL PROMPT\n\n${FEEDBACK}`);
+  });
+
+  it("v0.41.1: a caller's retryPrompt builds the retry around the same feedback block", async () => {
+    const llm = makeLlm(["not json at all", '["ok"]']);
+    const seen: string[] = [];
+    const result = await withRetryAndFeedback({
+      initialPrompt: "ORIGINAL PROMPT",
+      retryPrompt: (feedback) => { seen.push(feedback); return `SMALLER PROMPT\n\n${feedback}`; },
+      llm,
+      maxTokens: 100,
+      parse: parseJsonArray,
+    });
+    expect(result).toEqual(["ok"]);
+    expect(seen).toEqual([FEEDBACK]);
+    expect(llm.generate.mock.calls[1]?.[0]).toBe(`SMALLER PROMPT\n\n${FEEDBACK}`);
+  });
+
   it("fails open to null after maxAttempts parse failures", async () => {
     const llm = makeLlm(["bad", "worse", "worst"]);
     const result = await withRetryAndFeedback({

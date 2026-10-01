@@ -13,7 +13,7 @@
 ## Testing
 
 - [ ] Unit tests added/updated
-- [ ] All tests pass (`bun test`)
+- [ ] All tests pass (`bun test`, from the repository root)
 - [ ] Manual testing done with `bin/clawmem`
 
 ## Notes

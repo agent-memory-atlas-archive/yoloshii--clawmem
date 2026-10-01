@@ -107,7 +107,7 @@ function writeGold(dir: string, lines: unknown[]): string {
 const BALANCED_CASE = { id: "b1", prompt: OAUTH_PROMPT, profile: "balanced", labels: { must_include: [OAUTH_DOC] }, split: "tuning" };
 const SPEED_CASE = { id: "s1", prompt: OAUTH_PROMPT, profile: "speed", labels: { must_include: [OAUTH_DOC] }, split: "tuning" };
 
-/** Env for a spawned CLI: no CLAWMEM_* inheritance, unreachable inference endpoints, private TMPDIR + socket dir. */
+/** Env for a spawned CLI: no CLAWMEM_* inheritance, unreachable inference endpoints, private TMPDIR + socket dir + config dir. */
 function cliEnv(scratch: string, extra: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -115,12 +115,15 @@ function cliEnv(scratch: string, extra: Record<string, string>): Record<string, 
   }
   const childTmp = join(scratch, "child-tmp");
   const sockDir = join(scratch, "xdg");
+  const configDir = join(scratch, "config");   // dropping CLAWMEM_CONFIG_DIR alone would read ~/.config/clawmem
   mkdirSync(childTmp, { recursive: true });
   mkdirSync(sockDir, { recursive: true });
+  mkdirSync(configDir, { recursive: true });
   return {
     ...env,
     TMPDIR: childTmp,
     XDG_RUNTIME_DIR: sockDir,
+    CLAWMEM_CONFIG_DIR: configDir,
     CLAWMEM_EMBED_URL: "http://127.0.0.1:1",
     CLAWMEM_LLM_URL: "http://127.0.0.1:1",
     CLAWMEM_RERANK_URL: "http://127.0.0.1:1",

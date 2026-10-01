@@ -709,6 +709,8 @@ describe("hook replay-eval — end-to-end on the real handler", () => {
       if (v !== undefined && !k.startsWith("CLAWMEM_")) env[k] = v;
     }
     env.TMPDIR = childTmp;
+    env.CLAWMEM_CONFIG_DIR = join(scratch, "child-config");   // dropping it alone would read ~/.config/clawmem
+    mkdirSync(env.CLAWMEM_CONFIG_DIR);
     const child = Bun.spawnSync({
       cmd: ["bun", "src/clawmem.ts", "eval", "hook-run", "--gold", badGold, "--db", snapPath, "--min-examples", "1"],
       cwd: repoRoot,

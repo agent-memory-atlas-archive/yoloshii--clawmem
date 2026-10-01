@@ -102,7 +102,7 @@ Entity extraction quality scales directly with LLM capability. The default QMD q
 
 ### Option 1: Use a larger local model
 
-Point `CLAWMEM_LLM_URL` at a more capable model for all LLM tasks (query expansion + entity extraction + A-MEM notes):
+Point `CLAWMEM_LLM_URL` at a more capable model for all LLM tasks (query expansion + entity extraction + A-MEM notes + the Stop hooks' observations and handoff summary):
 
 ```bash
 # Example: use a 7B+ model instead of QMD 1.7B

@@ -240,6 +240,83 @@ describe("D4 batches fit the observer's input bounds (test 9)", () => {
   });
 });
 
+/**
+ * v0.41.1: batches leave room for the CONTEXT. Baseline (v0.41.0): turns were packed up to the whole render budget
+ * and the CONTEXT came on top, so every batch after the first overflowed the observer's bound.
+ */
+describe("v0.41.1 a backlog's batches fit the observer's bound with their CONTEXT", () => {
+  it("every prompt stays inside OBSERVER_MAX_RENDER_CHARS, and every turn reaches the model whole exactly once", async () => {
+    const { OBSERVER_MAX_RENDER_CHARS } = await import("../../src/observer.ts");
+    const calls = fakeObserver();
+    const store = createTestStore();
+    const path = writeTranscriptFile(tmp(), "s1.jsonl", turn(0, 50));   // the first Stop anchors at its current turn
+    await decisionExtractor(store, { sessionId: "sess0001-a", transcriptPath: path });
+    const pad = "p".repeat(420);
+    appendEntries(path, Array.from({ length: 40 }, (_, k) => k + 1).flatMap(n => [
+      human(`question for turn ${n}`, n * 100),
+      assistant(`For turn ${n} we decided to ship feature ${n}: ${pad} (end of turn ${n})`, n * 100 + 5),
+    ]));
+    const before = calls.length;
+    await decisionExtractor(store, { sessionId: "sess0001-a", transcriptPath: path });
+    const prompts = calls.slice(before);
+    expect(prompts.length).toBeGreaterThan(1);
+    const seen: number[] = [];
+    for (const p of prompts) {
+      const ctx = p.indexOf("--- CONTEXT");
+      const tr = p.indexOf("--- TRANSCRIPT ---\n");
+      const body = p.slice(tr + "--- TRANSCRIPT ---\n".length, p.indexOf("\n--- END TRANSCRIPT ---", tr));
+      expect((ctx >= 0 ? tr - ctx : 0) + body.length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+      for (const m of body.matchAll(/\(end of turn (\d+)\)/g)) seen.push(Number(m[1]));
+    }
+    expect(seen.sort((a, b) => a - b)).toEqual(Array.from({ length: 40 }, (_, k) => k + 1));
+    expect(cursorOf(store, "sess0001-a", path)!.byte_offset).toBe(readFileSync(path).length);
+  });
+
+  it("when every batch's first answer fails to parse, each retry still fits the bound and carries its whole batch", async () => {
+    const { OBSERVER_MAX_RENDER_CHARS } = await import("../../src/observer.ts");
+    const retries: string[] = [];
+    setDefaultLlamaCpp({
+      generate: async (prompt: string) => {
+        if (!prompt.includes("Extract observations:")) return { text: "", model: "fake", done: true };
+        if (!prompt.includes("did not match the expected structure")) {
+          return { text: "<observation><type>bogus</type></observation>" + "j".repeat(700), model: "fake", done: true };
+        }
+        retries.push(prompt);
+        const section = prompt.slice(prompt.indexOf("--- TRANSCRIPT ---"), prompt.indexOf("--- END TRANSCRIPT ---"));
+        const turns = [...new Set([...section.matchAll(/question for turn (\d+)/g)].map(m => m[1]))];
+        return {
+          text: turns.map(n => `<observation><type>decision</type><title>Decision for turn ${n}</title><facts><fact>Turn ${n} decided to ship feature ${n}</fact></facts><narrative>Turn ${n} needed it.</narrative></observation>`).join("\n"),
+          model: "fake", done: true,
+        };
+      },
+      embed: async () => ({ embedding: new Float32Array([1, 0, 0, 0]), model: "fake" }),
+    } as any);
+    const store = createTestStore();
+    const path = writeTranscriptFile(tmp(), "s1.jsonl", turn(0, 50));
+    await decisionExtractor(store, { sessionId: "sess0001-a", transcriptPath: path });
+    const pad = "p".repeat(420);
+    appendEntries(path, Array.from({ length: 40 }, (_, k) => k + 1).flatMap(n => [
+      human(`question for turn ${n}`, n * 100),
+      assistant(`For turn ${n} we decided to ship feature ${n}: ${pad} (end of turn ${n})`, n * 100 + 5),
+    ]));
+    const before = retries.length;
+    await decisionExtractor(store, { sessionId: "sess0001-a", transcriptPath: path });
+    const got = retries.slice(before);
+    expect(got.length).toBeGreaterThan(1);
+    const seen: number[] = [];
+    for (const p of got) {
+      const ctx = p.indexOf("--- CONTEXT");
+      const tr = p.indexOf("--- TRANSCRIPT ---\n");
+      const body = p.slice(tr + "--- TRANSCRIPT ---\n".length, p.indexOf("\n--- END TRANSCRIPT ---", tr));
+      const feedback = p.slice(p.indexOf("Extract observations:") + "Extract observations:".length);
+      expect((ctx >= 0 ? tr - ctx : 0) + body.length + feedback.length).toBeLessThanOrEqual(OBSERVER_MAX_RENDER_CHARS);
+      for (const m of body.matchAll(/\(end of turn (\d+)\)/g)) seen.push(Number(m[1]));
+    }
+    expect(seen.sort((a, b) => a - b)).toEqual(Array.from({ length: 40 }, (_, k) => k + 1));
+    expect(observationDocs(store)).toContain("Decision for turn 40");
+  });
+});
+
 describe("D3 a stale failure is discarded (test 8, interleaving)", () => {
   it("an observer failure whose range another Stop committed meanwhile records nothing", async () => {
     fakeObserver({ fail: () => true });
