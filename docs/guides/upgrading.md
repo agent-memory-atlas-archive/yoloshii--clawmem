@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.43.2**.
+Guide for upgrading between released versions. Current: **v0.43.3**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -61,6 +61,24 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details. zerank-2 has been Apache-2.0 since 2026-07-24, so commercial use is allowed.
 
 ---
+
+## v0.43.3: an index pass waits for the write lock instead of failing with `database is locked`
+
+No action needed beyond the usual upgrade of every process that indexes the vault: restart `clawmem watch` and any
+running `clawmem serve`, and reconnect open agent sessions (`/mcp` in Claude Code) so that their MCP server's `reindex`
+and `vault_sync` run the new code. Nothing migrates.
+
+- **Run `clawmem update` once** if the watcher logged `Watch error: database is locked` before the upgrade: each such
+  line is a pass that rolled back, and the file it was indexing kept its previous version in the vault until it changed
+  again ([troubleshooting](../troubleshooting.md#indexing)).
+- **A pass holds the write lock for its whole length**, also when no file changed: it reads and hashes the collection's
+  files under the lock, so other writers wait for it within their `busy_timeout`. Measured with a copy of a vault on a
+  RAM disk: 42–47 ms for a collection of 815 unchanged files, 209 ms with 16 new ones; slower storage, or pages not yet in
+  memory, lengthen it.
+- **A pass waits for another writer's lock** up to `busy_timeout` (5 s by default), and past it fails as before; a pass
+  with nothing to write, which took no write lock before, now waits and can fail the same way. While the watcher's pass
+  waits, the watcher answers no vector searches; a hook whose vector search runs out of time falls back to keyword
+  search for that prompt.
 
 ## v0.43.2: names that differ only in a number stay separate entities, and kg_query returns the named entity's facts
 

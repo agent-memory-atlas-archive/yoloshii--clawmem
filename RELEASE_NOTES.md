@@ -4,6 +4,70 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.43.3 — an index pass waits for the write lock instead of failing with `database is locked`
+
+`indexCollection` (`src/indexer.ts`) runs each index pass in one transaction, opened with a plain `BEGIN`. SQLite starts
+such a transaction deferred: the pass read the stored rows and content hashes first and asked for the write lock only at
+its first write, for a new or changed file. SQLite does not call the busy handler when a connection that already holds
+a read transaction asks for the write lock. So when another process was writing to the vault (a hook, the MCP server,
+`clawmem embed`), or had committed since the pass began reading, the pass's first write failed at once with `database is
+locked`, and `busy_timeout` never applied. The pass rolled back whole. The watcher logged `Watch error: database is
+locked` and dropped the change, so the vault kept the file's previous version until the file changed again or `clawmem
+update` ran. `clawmem update`, `clawmem reindex`, `clawmem mine`, the MCP tools `reindex` and `vault_sync`, and the REST
+server's `POST /reindex` run the same pass and could fail the same way.
+
+### What changed
+
+- **The pass takes the write lock first** (`indexCollection`, `src/indexer.ts`): it opens with `BEGIN IMMEDIATE`, so
+  while another connection writes, it waits up to `busy_timeout` (5 s by default) like any other writer, then reads,
+  writes and commits as before. A-MEM enrichment and its model calls still run after the commit.
+- **The cost:** the pass holds the write lock for its whole length, also when no file changed, because it reads and
+  hashes the collection's files under the lock; other writers wait for it within their `busy_timeout`. Measured with a
+  copy of a vault on a RAM disk (models off): 42–47 ms for a collection of 815 unchanged files, 209 ms with 16 new ones;
+  slower storage, or pages not yet in memory, lengthen it. While the
+  watcher's pass waits for another writer's lock, the watcher answers no vector searches, and a hook whose vector search
+  runs out of time falls back to keyword search for that prompt.
+- **Tests:** `tests/unit/indexer-write-lock.test.ts` (new). A second process holds the vault's write lock for 0.5 s
+  while a pass indexes a new file: the pass waits and indexes it. A pass with nothing to write completes under the same
+  contention.
+- **Docs:** `docs/troubleshooting.md` (Indexing), `docs/guides/upgrading.md`.
+
+### Upgrading
+
+No action needed beyond upgrading every process that indexes the vault: restart `clawmem watch` and any running `clawmem
+serve`, and reconnect open agent sessions so that their MCP servers' `reindex` and `vault_sync` run the new code.
+Nothing migrates. If the watcher logged
+`Watch error: database is locked` before the upgrade, run `clawmem update` once to index anything a failed pass left
+behind. See [upgrading](docs/guides/upgrading.md).
+
+### Verification
+
+The new test runs a second process that holds the vault's write lock for 0.5 s while a pass runs, and times the pass's
+own `BEGIN`: an attempt counts only when that `BEGIN` was called while the lock was held, returned after the holder let
+go, and blocked for at least 20 ms (up to three attempts per case). On v0.43.2 the new-file case fails with
+`SQLITE_BUSY` at the pass's first write. The case with nothing to write fails on v0.43.2 too, but not because of the
+bug: its pass took no write lock there, so it had nothing to wait for; the case pins the new waiting behaviour. With the
+fix both pass, in five consecutive runs. Full suite on Bun 1.3.14: 3,719 pass / 0 fail across 191 files (3 todo). On
+Bun 1.4.2, of three full runs, the first two each failed one test, `tests/integration/store-concurrent-init.test.ts`
+(three processes initializing one new vault file at once), a timing-dependent failure seen before this release
+(3,718 pass / 1 fail), and the third passed (3,719 / 0); three full runs of v0.43.2 passed (3,717 / 0). None of the 21
+files that test loads changed; three tests that run before it in the same run index through the change, each
+on its own vault. In nine alternating runs of
+`tests/integration` per version (where that test runs, in the same order as in the full suite), with other processes
+held under one CPU core while it ran, it failed once on each version; a tenth v0.43.2 run, made while other work loaded
+the machine, was set aside (it passed). Run alone, the test failed 1 time in 25 here and 0 times in 100 on v0.43.2.
+tsc unchanged. The cross-model adversarial pass (codex) cleared the release at its third turn, after 3 findings, all in
+the test: an elapsed-time assertion that could fail on correct code, a holder process that could escape cleanup, then
+an overlap check that could accept a run without contention at the pass's `BEGIN`.
+
+### What didn't change
+
+What a pass reads and writes, its rollback on any error, enrichment after the commit, the `busy_timeout` values, and the
+schema. A pass still fails when another process holds the write lock for longer than `busy_timeout`, now after the wait,
+and so can a pass with nothing to write, which before took no write lock and never waited.
+
+---
+
 ## v0.43.2 — names that differ only in a number stay separate entities, and kg_query returns the named entity's facts
 
 The entity resolver joins a new name to an existing entity when the two are similar enough: a Levenshtein ratio of 0.75

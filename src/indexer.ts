@@ -314,8 +314,13 @@ export async function indexCollection(
   // Collect doc IDs that need post-index enrichment (deferred until after commit)
   const enrichQueue: { docId: number; isNew: boolean }[] = [];
 
-  // Wrap all DB writes in a transaction for atomicity
-  store.db.exec("BEGIN");
+  // Wrap all DB writes in a transaction for atomicity. IMMEDIATE takes the write lock up front
+  // (75.1): the pass reads before it writes, and SQLite never runs the busy handler when a
+  // connection that already holds a read transaction asks for the write lock — a deferred BEGIN
+  // failed with `database is locked` at once whenever another connection was writing, instead
+  // of waiting on busy_timeout. The lock is held while the files are read and hashed; A-MEM
+  // enrichment (model calls) stays after the commit.
+  store.db.exec("BEGIN IMMEDIATE");
   try {
     for (const relativePath of allEntries) {
       if (shouldExclude(relativePath)) continue;
